@@ -1,6 +1,7 @@
 {
   "ably": {
-    "enabled": true
+    "enabled": true,
+    "keys_file": ".working/ably-centrifugo-poc/harness/static-app.json"
   },
   "http_server": {
     "port": 8049

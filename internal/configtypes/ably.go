@@ -6,5 +6,6 @@ package configtypes
 // HTTP server because Ably SDKs construct root-relative paths (/time,
 // /channels/..., realtime WebSocket at /) which cannot be prefixed. EXPERIMENTAL.
 type Ably struct {
-	Enabled bool `mapstructure:"enabled" json:"enabled" envconfig:"enabled" yaml:"enabled" toml:"enabled" doc:"Enables the Ably protocol adapter (experimental). Serves Ably REST and realtime WebSocket endpoints at the web root of the external HTTP server."`
+	Enabled  bool   `mapstructure:"enabled" json:"enabled" envconfig:"enabled" yaml:"enabled" toml:"enabled" doc:"Enables the Ably protocol adapter (experimental). Serves Ably REST and realtime WebSocket endpoints at the web root of the external HTTP server."`
+	KeysFile string `mapstructure:"keys_file" json:"keys_file" envconfig:"keys_file" yaml:"keys_file" toml:"keys_file" doc:"Path to a static Ably app fixture JSON file providing the app's API keys and capabilities for the Ably protocol adapter (experimental, PoC-only)."`
 }

@@ -1,0 +1,47 @@
+{
+  "_comment": "Trimmed copy of .working/ably-centrifugo-poc/harness/static-app.json for keystore tests: three keys with distinct capabilities; namespaces/channels/cipher retained in shape to prove the loader ignores them.",
+  "accountId": "poc-account",
+  "appId": "poc",
+  "keys": [
+    {
+      "id": "key0",
+      "keyName": "poc.key0",
+      "keySecret": "secret_key0_0123456789abcdef",
+      "keyStr": "poc.key0:secret_key0_0123456789abcdef",
+      "capability": "{\"*\":[\"*\"]}"
+    },
+    {
+      "id": "key1",
+      "keyName": "poc.key1",
+      "keySecret": "secret_key1_0123456789abcdef",
+      "keyStr": "poc.key1:secret_key1_0123456789abcdef",
+      "capability": "{\"cansubscribe:*\":[\"subscribe\"],\"canpublish:*\":[\"publish\"],\"canpublish:andpresence\":[\"presence\",\"publish\"],\"pushenabled:*\":[\"publish\",\"subscribe\",\"push-subscribe\"],\"pushenabled:admin:*\":[\"publish\",\"subscribe\",\"push-admin\"]}"
+    },
+    {
+      "id": "key2",
+      "keyName": "poc.key2",
+      "keySecret": "secret_key2_0123456789abcdef",
+      "keyStr": "poc.key2:secret_key2_0123456789abcdef",
+      "capability": "{\"channel0\":[\"publish\"],\"channel1\":[\"publish\"],\"channel2\":[\"publish\",\"subscribe\"],\"channel3\":[\"subscribe\"],\"channel4\":[\"presence\",\"publish\",\"subscribe\"],\"channel5\":[\"presence\"],\"channel6\":[\"*\"]}"
+    }
+  ],
+  "namespaces": [
+    {
+      "id": "persisted",
+      "persisted": true
+    }
+  ],
+  "limits": {
+    "presence": {
+      "maxMembers": 250
+    }
+  },
+  "channels": [],
+  "cipher": {
+    "algorithm": "aes",
+    "mode": "cbc",
+    "keylength": 128,
+    "key": "WUP6u0K7MXI5Zeo0VppPwg==",
+    "iv": "HO4cYSP8LybPYBPZPHQOtg=="
+  }
+}
