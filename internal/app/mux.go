@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/centrifugal/centrifugo/v6/internal/ably"
 	"github.com/centrifugal/centrifugo/v6/internal/admin"
 	"github.com/centrifugal/centrifugo/v6/internal/api"
 	"github.com/centrifugal/centrifugo/v6/internal/config"
@@ -70,6 +71,9 @@ const (
 	HandlerSwagger
 	// HandlerDev handles development page.
 	HandlerDev
+	// HandlerAbly enables the Ably protocol adapter endpoints (REST + realtime
+	// WebSocket) at the web root. EXPERIMENTAL.
+	HandlerAbly
 )
 
 var handlerText = map[HandlerFlag]string{
@@ -89,10 +93,11 @@ var handlerText = map[HandlerFlag]string{
 	HandlerInit:          "init",
 	HandlerSwagger:       "swagger",
 	HandlerDev:           "dev",
+	HandlerAbly:          "ably",
 }
 
 func (flags HandlerFlag) String() string {
-	flagsOrdered := []HandlerFlag{HandlerWebsocket, HandlerWebtransport, HandlerHTTPStream, HandlerSSE, HandlerEmulation, HandlerAPI, HandlerAdmin, HandlerPrometheus, HandlerDebug, HandlerHealth, HandlerUniWebsocket, HandlerUniSSE, HandlerUniHTTPStream, HandlerSwagger, HandlerDev, HandlerInit}
+	flagsOrdered := []HandlerFlag{HandlerWebsocket, HandlerWebtransport, HandlerHTTPStream, HandlerSSE, HandlerEmulation, HandlerAPI, HandlerAdmin, HandlerPrometheus, HandlerDebug, HandlerHealth, HandlerUniWebsocket, HandlerUniSSE, HandlerUniHTTPStream, HandlerSwagger, HandlerDev, HandlerInit, HandlerAbly}
 	var endpoints []string
 	for _, flag := range flagsOrdered {
 		text, ok := handlerText[flag]
@@ -188,6 +193,18 @@ func Mux(
 			connInitPrefix = "/"
 		}
 		mux.Handle(connInitPrefix, middleware.Method(http.MethodGet, connChain.Then(conninit.NewHandler())))
+	}
+
+	if flags&HandlerAbly != 0 {
+		// register Ably protocol adapter at the web root — Ably SDKs construct
+		// root-relative paths (/time, /channels/..., realtime WebSocket at /)
+		// which cannot be prefixed. Any other handler claiming "/" on the same
+		// port would make http.ServeMux panic; the only default-config case is
+		// the admin UI, so fail fast with a clear message.
+		if flags&HandlerAdmin != 0 && strings.TrimRight(cfg.Admin.HandlerPrefix, "/") == "" {
+			log.Fatal().Msg("ably adapter claims the web root and conflicts with admin on the same port: set admin.handler_prefix or serve admin on a separate internal port")
+		}
+		mux.Handle("/", connChain.Then(ably.NewHandler(n, cfg.Ably, getCheckOrigin(cfg))))
 	}
 
 	if flags&HandlerHTTPStream != 0 {
@@ -449,6 +466,9 @@ func runHTTPServers(
 	}
 	if useConnInit {
 		portFlags |= HandlerInit
+	}
+	if cfg.Ably.Enabled {
+		portFlags |= HandlerAbly
 	}
 	addrToHandlerFlags[externalAddr] = portFlags
 

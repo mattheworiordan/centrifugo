@@ -4,6 +4,8 @@ centrifugo
 /config.*.yaml
 /config.json
 /config.*.json
+# The Ably adapter dev profile is part of the repo (used by `make ably-dev`).
+!/config.ably-dev.json
 /config.toml
 /config.*.toml
 BUILDS

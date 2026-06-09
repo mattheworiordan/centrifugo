@@ -84,3 +84,6 @@ vuln:
 build:
 	CGO_ENABLED=0 go build
 
+ably-dev:
+	go run . --config config.ably-dev.json
+

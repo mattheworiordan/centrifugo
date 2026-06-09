@@ -1,0 +1,18 @@
+{
+  "ably": {
+    "enabled": true
+  },
+  "http_server": {
+    "port": 8049
+  },
+  "channel": {
+    "without_namespace": {
+      "presence": true,
+      "history_size": 100,
+      "history_ttl": "300s"
+    }
+  },
+  "log": {
+    "level": "debug"
+  }
+}

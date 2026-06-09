@@ -88,6 +88,8 @@ type Config struct {
 	UniWS configtypes.UniWebSocket `mapstructure:"uni_websocket" json:"uni_websocket" envconfig:"uni_websocket" toml:"uni_websocket" yaml:"uni_websocket" doc:"Configures the unidirectional WebSocket transport. Disabled by default."`
 	// UniGRPC is a configuration for unidirectional gRPC transport.
 	UniGRPC configtypes.UniGRPC `mapstructure:"uni_grpc" json:"uni_grpc" envconfig:"uni_grpc" toml:"uni_grpc" yaml:"uni_grpc" doc:"Configures the unidirectional gRPC transport: enable flag, port, and TLS. Disabled by default."`
+	// Ably is a configuration for the Ably protocol adapter. EXPERIMENTAL.
+	Ably configtypes.Ably `mapstructure:"ably" json:"ably" envconfig:"ably" toml:"ably" yaml:"ably" doc:"Configures the Ably protocol adapter (experimental, disabled by default). When enabled, unmodified Ably SDKs can connect to Centrifugo."`
 	// Emulation endpoint is enabled automatically when at least one bidirectional emulation transport
 	// is configured (SSE or HTTP Stream).
 	Emulation configtypes.Emulation `mapstructure:"emulation" json:"emulation" envconfig:"emulation" toml:"emulation" yaml:"emulation" doc:"Configures the emulation endpoint used by bidirectional SSE and HTTP-streaming transports. Enabled automatically when one of those transports is enabled."`
