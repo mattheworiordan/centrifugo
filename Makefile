@@ -87,3 +87,22 @@ build:
 ably-dev:
 	go run . --config config.ably-dev.json
 
+# Run the ably-go conformance smoke (internal/ably/conformance, a standalone
+# module) against a freshly built binary serving the ably dev profile. The
+# trap kills the server on success and failure alike.
+ably-conformance:
+	mkdir -p tmp
+	go build -o tmp/centrifugo-ably .
+	@set -e; \
+	./tmp/centrifugo-ably --config config.ably-dev.json > tmp/ably-conformance-server.log 2>&1 & \
+	SERVER_PID=$$!; \
+	trap 'kill $$SERVER_PID 2>/dev/null || true' EXIT; \
+	echo "waiting for adapter on :8049 (pid $$SERVER_PID)"; \
+	for i in $$(seq 1 50); do \
+		curl -fsS -o /dev/null http://localhost:8049/time 2>/dev/null && break; \
+		kill -0 $$SERVER_PID 2>/dev/null || { echo "server exited early; tail of log:"; tail -20 tmp/ably-conformance-server.log; exit 1; }; \
+		sleep 0.2; \
+	done; \
+	curl -fsS -o /dev/null http://localhost:8049/time; \
+	cd internal/ably/conformance && ABLY_CONFORMANCE_URL=localhost:8049 go test -count=1 -timeout 120s -v ./...
+

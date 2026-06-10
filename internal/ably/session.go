@@ -16,19 +16,30 @@ package ably
 // back to structs and calls handleReply here for translation to Ably
 // frames.
 //
-// Frame flow served this milestone (publish/MESSAGE lands in M1.2):
+// Frame flow served:
 //
 //	WS upgrade   → CONNECTED(4) + connectionDetails (RTN6, TR4o, CD1)
 //	HEARTBEAT(0) → HEARTBEAT(0) echo                (RTN13a)
 //	ATTACH(10)   → ATTACHED(11)                     (RTL4c)
 //	DETACH(12)   → DETACHED(13)                     (RTL5d)
+//	MESSAGE(15)  → ACK(1) / NACK(2)                 (RTN7a)
+//	publication  → MESSAGE(15) to subscribed conns  (RTL7)
 //	CLOSE(7)     → CLOSED(8) + connection close     (RTN12a)
 //
 // plus a server heartbeat ticker backing the advertised maxIdleInterval
 // (RTN23a).
+//
+// The publish leg does NOT go through the session's centrifuge client
+// (decision D3): the session builds the full Ably message envelope, then
+// calls node.Publish directly. Delivery rides the per-connection client:
+// subscribed clients receive the publication and handleReply translates
+// push.Pub back into Ably MESSAGE frames — including to the publisher
+// itself via its own subscription (the RTC1a echo-on default; echo=false
+// filtering, RTL7f, is M1.3).
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -60,6 +71,7 @@ const (
 // Ably error codes used by the adapter, verified against the Ably error
 // code registry (github.com/ably/ably-common protocol/errors.json).
 const (
+	errCodeBadRequest             = 40000 // bad request
 	errCodeInvalidClientID        = 40012 // invalid client id
 	errCodeInvalidCredentials     = 40101 // invalid credentials
 	errCodeOperationNotPermitted  = 40160 // operation not permitted with provided capability
@@ -73,6 +85,12 @@ const (
 // write-timeout discipline).
 const writeTimeout = 5 * time.Second
 
+// pubTagOrigin is the publication tag carrying the publisher's Ably
+// connectionId. Set on every adapter publish; M1.3 synthesizes a
+// SubscribeRequest.Tf filter NOT(o == own connectionId) from it for
+// echo=false connections (RTL7f).
+const pubTagOrigin = "o"
+
 // sessionParams carries the per-connection parameters extracted from the
 // upgrade request querystring (RTN2) and authentication.
 type sessionParams struct {
@@ -82,8 +100,9 @@ type sessionParams struct {
 	// clientID is the clientId query param (RTN2d), echoed back in
 	// connectionDetails.clientId (CD2a) when set.
 	clientID string
-	// echo is the echo query param (RTN2b). Stored now; honored when
-	// MESSAGE fan-out lands (M1.2/M1.3).
+	// echo is the echo query param (RTN2b). Stored now; echo=false
+	// filtering lands in M1.3 (fan-out currently always echoes, the
+	// echo=true default).
 	echo bool
 	// protocolVersion is the v query param (RTN2f). Stored, not yet acted
 	// on.
@@ -266,17 +285,130 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 		// centrifuge Unsubscribe (reply mapped in handleReply).
 		s.detach(m.Channel)
 		return true
+	case protocol.ActionMessage:
+		// RTL6: an inbound MESSAGE is a publish request; it is confirmed
+		// with ACK or failed with NACK (RTN7a).
+		s.publish(m)
+		return true
 	case protocol.ActionClose:
 		// RTN12a: confirm the close request with CLOSED, then drop the
 		// connection.
 		_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionClosed})
 		return false
 	default:
-		// MESSAGE (publish/ACK) handling lands in M1.2; PRESENCE, SYNC and
-		// AUTH in later milestones.
+		// PRESENCE, SYNC and AUTH handling lands in later milestones.
 		log.Warn().Int("action", int(m.Action)).Str("transport", transportName).Msg("unhandled inbound action")
 		return true
 	}
+}
+
+// publish serves one inbound MESSAGE frame. Inbound publishes do not go
+// through the session's centrifuge client: the session builds the full
+// Ably message envelope server-side, then calls node.Publish directly
+// (decision D3). No prior ATTACH is required — with the connection
+// CONNECTED the messages are published immediately (RTL6c1), which is what
+// makes transient publishing natural on this path.
+func (s *session) publish(m *protocol.ProtocolMessage) {
+	if m.Channel == "" {
+		s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "publish failed: channel attribute missing")
+		return
+	}
+	connectionID := s.client.ID()
+	now := time.Now().UnixMilli()
+
+	// Envelope every Message in full BEFORE any publish, so subscribers
+	// never depend on SDK-side inheritance from the enclosing
+	// ProtocolMessage, and so a rejected frame publishes nothing.
+	for idx, msg := range m.Messages {
+		if msg == nil {
+			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "publish failed: null message")
+			return
+		}
+		if msg.ClientID != "" && s.params.clientID != "" && msg.ClientID != s.params.clientID {
+			// RTL6g: an identified connection can only publish messages
+			// carrying its own clientId; an incompatible explicit clientId
+			// is rejected by the service (the server-side reject expected
+			// by RTL6g4's test). The connection stays usable. Full
+			// capability semantics are M4.
+			s.writeNack(m.MsgSerial, errCodeInvalidClientID, 400,
+				fmt.Sprintf("publish failed: message clientId %q is incompatible with connection clientId %q", msg.ClientID, s.params.clientID))
+			return
+		}
+		if msg.ID == "" {
+			// Server-assigned unique id of the form
+			// <connectionId>:<msgSerial>:<index> — the shape TM2a expects
+			// SDKs to derive for realtime messages (the ProtocolMessage id
+			// is connectionId:msgSerial per TR4n). A client-supplied id is
+			// preserved; idempotency mapping is M3.
+			msg.ID = fmt.Sprintf("%s:%d:%d", connectionID, m.MsgSerial, idx)
+		}
+		if msg.ClientID == "" {
+			// RTL6g1b: the service assigns the connection's clientId to
+			// messages published without one (no-op for unidentified
+			// connections).
+			msg.ClientID = s.params.clientID
+		}
+		// TM2c: the message is attributed to the publishing connection.
+		msg.ConnectionID = connectionID
+		if msg.Timestamp == 0 {
+			// Stamp the server receipt time. SDKs never send a timestamp
+			// on publish (they back-fill from the enclosing frame per
+			// TM2f), so this is what subscribers observe.
+			msg.Timestamp = now
+		}
+	}
+
+	// Publish sequentially in frame order. Each Message becomes one
+	// centrifuge Publication; order preservation is what M1.2 guarantees —
+	// atomic batch semantics and server-assigned serials land with
+	// channelSerial in M6/M8. Until then a mid-frame publish failure
+	// NACKs the whole frame with the already-published prefix NOT rolled
+	// back: NACK is the honest verdict (an ACK would falsely confirm the
+	// tail), and an SDK retry (RTN19a) may duplicate the prefix until
+	// idempotent dedup lands in M3.
+	for _, msg := range m.Messages {
+		data, err := json.Marshal(msg)
+		if err != nil {
+			s.writeNack(m.MsgSerial, errCodeInternal, 500, fmt.Sprintf("publish failed: %s", err))
+			return
+		}
+		_, err = s.node.Publish(m.Channel, data,
+			centrifuge.WithTags(map[string]string{pubTagOrigin: connectionID}))
+		if err != nil {
+			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("publish failed")
+			s.writeNack(m.MsgSerial, errCodeInternal, 500, "publish failed")
+			return
+		}
+	}
+	s.writeAck(m.MsgSerial)
+}
+
+// writeAck confirms one inbound MESSAGE frame (RTN7a). msgSerial
+// round-trips exactly — the first publish on a connection is msgSerial 0
+// (RTN7b); the omitempty consequence (an ACK for serial 0 omits the field,
+// read back as 0) is documented in protocol/message.go. count is 1: one
+// inbound frame is one serial (RTN7b).
+func (s *session) writeAck(msgSerial int64) {
+	_ = s.writeFrame(&protocol.ProtocolMessage{
+		Action:    protocol.ActionAck,
+		MsgSerial: msgSerial,
+		Count:     1,
+	})
+}
+
+// writeNack fails one inbound MESSAGE frame (RTN7a), consuming its
+// msgSerial.
+func (s *session) writeNack(msgSerial int64, code int, statusCode int, message string) {
+	_ = s.writeFrame(&protocol.ProtocolMessage{
+		Action:    protocol.ActionNack,
+		MsgSerial: msgSerial,
+		Count:     1,
+		Error: &protocol.ErrorInfo{
+			Code:       code,
+			StatusCode: statusCode,
+			Message:    message,
+		},
+	})
 }
 
 func (s *session) attach(channel string) {
@@ -344,15 +476,46 @@ func (s *session) handleReply(reply *cproto.Reply) {
 	}
 
 	if reply.Push != nil {
-		// Publication delivery (push.Pub → MESSAGE) lands in M1.2;
+		if reply.Push.Pub != nil {
+			// RTL7: deliver the publication as a MESSAGE frame. The channel
+			// lives on Push.Channel: centrifuge sets it on every
+			// subscription push unless the client requested channel
+			// compression via a SubscribeRequest flag this adapter never
+			// sets (Publication.Channel is only populated for wildcard
+			// subscriptions).
+			s.deliverPublication(reply.Push.Channel, reply.Push.Pub)
+			return
+		}
 		// Join/Leave (presence, M5), Unsubscribe and Refresh pushes are
-		// translated in later milestones. Until then pushes are dropped.
+		// translated in later milestones. Until then they are dropped.
 		log.Debug().Str("channel", reply.Push.Channel).Str("transport", transportName).Msg("push dropped (translation lands in a later milestone)")
 		return
 	}
 	// An empty reply is a centrifuge server ping — disabled via
 	// PingPongConfig{PingInterval: -1}; Ably liveness is the HEARTBEAT
 	// ticker.
+}
+
+// deliverPublication translates one centrifuge Publication into an Ably
+// MESSAGE frame. The publication data is one fully-enveloped Ably Message
+// JSON document, built by the publishing session before node.Publish, so
+// delivery is a decode and re-frame — no field synthesis happens here. A
+// payload that does not decode is logged and dropped; it must not kill the
+// session.
+func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
+	var msg protocol.Message
+	if err := json.Unmarshal(pub.Data, &msg); err != nil {
+		log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("dropping publication with undecodable payload")
+		return
+	}
+	// The frame timestamp doubles as the TM2f inheritance source for SDKs;
+	// the enveloped message carries its own timestamp anyway.
+	_ = s.writeFrame(&protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   channel,
+		Messages:  []*protocol.Message{&msg},
+		Timestamp: time.Now().UnixMilli(),
+	})
 }
 
 // writeAttachError fails an ATTACH on the client. RTL14: an ERROR

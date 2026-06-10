@@ -161,6 +161,9 @@ func newRealtimeServer(t *testing.T) *realtimeTestServer {
 	node, err := centrifuge.New(centrifuge.Config{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+	// Run registers the node as the broker's event handler — without it
+	// node.Publish (the adapter publish path) has no delivery pipeline.
+	require.NoError(t, node.Run())
 
 	var mu sync.Mutex
 	var lastUser string
@@ -229,6 +232,19 @@ func writeFrame(t *testing.T, conn *websocket.Conn, m *protocol.ProtocolMessage)
 	data, err := protocol.Marshal(m, protocol.FormatJSON)
 	require.NoError(t, err)
 	require.NoError(t, conn.WriteMessage(websocket.TextMessage, data))
+}
+
+// readNonHeartbeatFrame reads frames until one that is not a server
+// heartbeat arrives — the 10s heartbeat ticker (RTN23a) may interleave
+// with any read.
+func readNonHeartbeatFrame(t *testing.T, conn *websocket.Conn) *protocol.ProtocolMessage {
+	t.Helper()
+	for {
+		m := readFrame(t, conn)
+		if m.Action != protocol.ActionHeartbeat {
+			return m
+		}
+	}
 }
 
 // connectRealtime dials and consumes the initial CONNECTED frame.
@@ -440,6 +456,219 @@ func TestRealtimeServerInitiatedClose(t *testing.T) {
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
 	requireServerClosed(t, err)
+}
+
+// RTN7a/RTN7b: every inbound MESSAGE is confirmed with an ACK carrying the
+// exact inbound msgSerial (first publish on a connection is serial 0) and
+// count 1 (one frame = one serial). No ATTACH precedes the publishes: with
+// the connection CONNECTED the messages are published immediately (RTL6c1).
+func TestRealtimePublishAck_RTN7(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	for serial := int64(0); serial < 2; serial++ {
+		writeFrame(t, conn, &protocol.ProtocolMessage{
+			Action:    protocol.ActionMessage,
+			Channel:   "ack-test",
+			MsgSerial: serial,
+			Messages:  []*protocol.Message{{Name: "greeting", Data: "hello"}},
+		})
+		ack := readNonHeartbeatFrame(t, conn)
+		require.Equal(t, protocol.ActionAck, ack.Action)
+		require.Equal(t, serial, ack.MsgSerial) // RTN7b: exact round trip
+		require.Equal(t, 1, ack.Count)
+		require.Nil(t, ack.Error)
+	}
+}
+
+// RTL6/RTL7: a transient publish (no prior ATTACH on the publisher,
+// RTL6c1) fans out to an attached connection as a MESSAGE frame whose
+// Message carries the full server-built envelope: generated id, the
+// publisher's clientId (RTL6g1b) and connectionId (TM2c), and a server
+// timestamp (TM2f). The publisher gets its ACK (RTN7a).
+func TestRealtimePublishFanOut_RTL6_RTL7(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	// A: subscriber, attached to the channel.
+	connA := connectRealtime(t, ts)
+	writeFrame(t, connA, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "fanout-test"})
+	attached := readNonHeartbeatFrame(t, connA)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+
+	// B: identified publisher, never attaches.
+	paramsB := defaultDialParams()
+	paramsB.Set("clientId", "bob")
+	connB := dialRealtime(t, ts.wsURL, paramsB)
+	connectedB := readFrame(t, connB)
+	require.Equal(t, protocol.ActionConnected, connectedB.Action)
+	publisherConnID := connectedB.ConnectionID
+
+	writeFrame(t, connB, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "fanout-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "greeting", Data: "hello"}},
+	})
+
+	ack := readNonHeartbeatFrame(t, connB)
+	require.Equal(t, protocol.ActionAck, ack.Action)
+	require.Equal(t, int64(0), ack.MsgSerial)
+	require.Equal(t, 1, ack.Count)
+
+	delivered := readNonHeartbeatFrame(t, connA)
+	require.Equal(t, protocol.ActionMessage, delivered.Action)
+	require.Equal(t, "fanout-test", delivered.Channel)
+	requireTimeWithinSkew(t, delivered.Timestamp)
+	require.Len(t, delivered.Messages, 1)
+	msg := delivered.Messages[0]
+	require.Equal(t, "greeting", msg.Name)
+	require.Equal(t, "hello", msg.Data)
+	require.Equal(t, publisherConnID+":0:0", msg.ID) // generated <connectionId>:<msgSerial>:<idx>
+	require.Equal(t, "bob", msg.ClientID)            // RTL6g1b
+	require.Equal(t, publisherConnID, msg.ConnectionID)
+	requireTimeWithinSkew(t, msg.Timestamp) // TM2f
+}
+
+// RTC1a: echoMessages is on by default, so an attached publisher receives
+// its own message back via its subscription, alongside the ACK. (RTL7f —
+// the echo=false suppression test — is M1.3.) The two frames originate
+// from different goroutines, so order is not asserted.
+func TestRealtimePublishEcho_RTC1a(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "echo-test"})
+	attached := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "echo-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "greeting", Data: "hello"}},
+	})
+
+	var ack, delivered *protocol.ProtocolMessage
+	for range 2 {
+		switch m := readNonHeartbeatFrame(t, conn); m.Action {
+		case protocol.ActionAck:
+			ack = m
+		case protocol.ActionMessage:
+			delivered = m
+		default:
+			t.Fatalf("unexpected frame action %d", m.Action)
+		}
+	}
+	require.NotNil(t, ack)
+	require.Equal(t, int64(0), ack.MsgSerial)
+	require.Equal(t, 1, ack.Count)
+	require.NotNil(t, delivered)
+	require.Equal(t, "echo-test", delivered.Channel)
+	require.Len(t, delivered.Messages, 1)
+	require.Equal(t, "hello", delivered.Messages[0].Data)
+}
+
+// RTL6g: an identified connection publishing a Message with an
+// incompatible explicit clientId is rejected by the service with a NACK
+// carrying 40012 (invalid client id) — the server-side reject expected by
+// RTL6g4's test — and the connection remains usable for further publishes
+// (the rejected frame still consumed its msgSerial).
+func TestRealtimePublishClientIDMismatch_RTL6g(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	params := defaultDialParams()
+	params.Set("clientId", "bob")
+	conn := dialRealtime(t, ts.wsURL, params)
+	connected := readFrame(t, conn)
+	require.Equal(t, protocol.ActionConnected, connected.Action)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "clientid-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "greeting", Data: "hello", ClientID: "alice"}},
+	})
+	nack := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionNack, nack.Action)
+	require.Equal(t, int64(0), nack.MsgSerial)
+	require.Equal(t, 1, nack.Count)
+	require.NotNil(t, nack.Error)
+	require.Equal(t, errCodeInvalidClientID, nack.Error.Code)
+	require.Equal(t, http.StatusBadRequest, nack.Error.StatusCode)
+
+	// Matching explicit clientId is accepted (RTL6g2); serial advanced.
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "clientid-test",
+		MsgSerial: 1,
+		Messages:  []*protocol.Message{{Name: "greeting", Data: "hello", ClientID: "bob"}},
+	})
+	ack := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionAck, ack.Action)
+	require.Equal(t, int64(1), ack.MsgSerial)
+	require.Equal(t, 1, ack.Count)
+}
+
+// RTL6g4 (first half): an UNidentified connection may publish a Message
+// carrying any explicit clientId — the mismatch reject only applies to
+// identified connections — and the explicit clientId survives to
+// subscribers verbatim.
+func TestRealtimePublishExplicitClientIDUnidentified_RTL6g4(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts) // no clientId param: unidentified
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "explicit-test"})
+	attached := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "explicit-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "greeting", Data: "hello", ClientID: "carol"}},
+	})
+
+	var ack, delivered *protocol.ProtocolMessage
+	for range 2 {
+		switch m := readNonHeartbeatFrame(t, conn); m.Action {
+		case protocol.ActionAck:
+			ack = m
+		case protocol.ActionMessage:
+			delivered = m
+		default:
+			t.Fatalf("unexpected frame action %d", m.Action)
+		}
+	}
+	require.NotNil(t, ack)
+	require.NotNil(t, delivered)
+	require.Len(t, delivered.Messages, 1)
+	require.Equal(t, "carol", delivered.Messages[0].ClientID)
+}
+
+// A MESSAGE frame without a channel attribute cannot be published: NACK
+// with 40000 (bad request), consuming the msgSerial (RTN7a).
+func TestRealtimePublishEmptyChannel(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "greeting", Data: "hello"}},
+	})
+	nack := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionNack, nack.Action)
+	require.Equal(t, int64(0), nack.MsgSerial)
+	require.Equal(t, 1, nack.Count)
+	require.NotNil(t, nack.Error)
+	require.Equal(t, errCodeBadRequest, nack.Error.Code)
+	require.Equal(t, http.StatusBadRequest, nack.Error.StatusCode)
 }
 
 // RSA7c: the literal '*' clientId value is reserved (the wildcard
