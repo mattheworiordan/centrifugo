@@ -73,9 +73,11 @@ func (h *Handler) serveChannels(rw http.ResponseWriter, r *http.Request) {
 	case sub == "messages" && r.Method == http.MethodPost:
 		h.serveRESTPublish(rw, r, channel, identity)
 	case sub == "messages" && r.Method == http.MethodGet:
-		h.serveRESTHistory(rw, r, channel, identity)
+		h.serveRESTHistory(rw, r, channel, identity, historyKindMessages)
 	case sub == "presence" && r.Method == http.MethodGet:
 		h.serveRESTPresence(rw, r, channel, identity)
+	case sub == "presence/history" && r.Method == http.MethodGet:
+		h.serveRESTHistory(rw, r, channel, identity, historyKindPresence)
 	case sub == "" && r.Method == http.MethodGet:
 		h.serveChannelDetails(rw, r, channel)
 	default:
@@ -258,7 +260,17 @@ func statusOf(p *publishProblem) int {
 // dense and monotonic, so the page below offset L is exactly the window
 // [L-limit, L-1], fetchable forward via WithSince and reversed for
 // backwards responses.
-func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, channel string, identity authResult) {
+// historyKind selects what a history read returns: message envelopes from
+// the live channel, or presence events from the shadow channel
+// (RSL3-adjacent GET .../presence/history).
+type historyKind int
+
+const (
+	historyKindMessages historyKind = iota
+	historyKindPresence
+)
+
+func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, channel string, identity authResult, kind historyKind) {
 	if !validChannelName(channel) {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidChannelName, "invalid channel name")
 		return
@@ -267,6 +279,10 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 	if !identity.capability.Allows(auth.OpHistory, channel) {
 		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit history")
 		return
+	}
+	readChannel := channel
+	if kind == historyKindPresence {
+		readChannel = presenceHistoryChannel(channel)
 	}
 	q := r.URL.Query()
 
@@ -331,7 +347,7 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 			// Window [cursor-limit, cursor-1], fetched forward from
 			// since=cursor-limit-1 then reversed for delivery order.
 			if cursor <= 1 {
-				h.writeHistoryPage(rw, r, channel, nil, limit, backwards, false, 0, "")
+				h.writeHistoryPage(rw, r, kind, nil, limit, backwards, false, 0, "")
 				return
 			}
 			low := uint64(1)
@@ -339,15 +355,15 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 				low = cursor - uint64(limit)
 			}
 			count := int(cursor - low)
-			pubs, epoch, err = h.historyPubs(channel, centrifuge.WithLimit(count),
+			pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(count),
 				centrifuge.WithSince(&centrifuge.StreamPosition{Offset: low - 1, Epoch: cursorEpoch}))
 			reversePubs(pubs)
 		} else {
-			pubs, epoch, err = h.historyPubs(channel, centrifuge.WithLimit(limit),
+			pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(limit),
 				centrifuge.WithSince(&centrifuge.StreamPosition{Offset: cursor, Epoch: cursorEpoch}))
 		}
 	} else {
-		pubs, epoch, err = h.historyPubs(channel, centrifuge.WithLimit(limit), centrifuge.WithReverse(backwards))
+		pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(limit), centrifuge.WithReverse(backwards))
 	}
 	if err != nil {
 		log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("history read failed")
@@ -369,24 +385,41 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 	}
 
 	format := responseFormat(r)
-	items := make([]*protocol.Message, 0, len(pubs))
+	items := make([]any, 0, len(pubs))
 	for _, pub := range pubs {
-		var msg protocol.Message
-		if err := json.Unmarshal(pub.Data, &msg); err != nil {
-			// Not a canonical envelope (e.g. a native centrifugo publish on
-			// a shared channel): skip rather than corrupt the page.
-			log.Warn().Str("channel", channel).Str("transport", transportName).Msg("skipping non-envelope publication in history")
+		var ts int64
+		var item any
+		if kind == historyKindPresence {
+			var pm protocol.PresenceMessage
+			if err := json.Unmarshal(pub.Data, &pm); err != nil {
+				log.Warn().Str("channel", channel).Str("transport", transportName).Msg("skipping non-envelope presence publication in history")
+				continue
+			}
+			ts = pm.Timestamp
+			if format == protocol.FormatMsgpack {
+				denormalizePresenceData(&pm)
+			}
+			item = &pm
+		} else {
+			var msg protocol.Message
+			if err := json.Unmarshal(pub.Data, &msg); err != nil {
+				// Not a canonical envelope (e.g. a native centrifugo publish
+				// on a shared channel): skip rather than corrupt the page.
+				log.Warn().Str("channel", channel).Str("transport", transportName).Msg("skipping non-envelope publication in history")
+				continue
+			}
+			ts = msg.Timestamp
+			if format == protocol.FormatMsgpack {
+				// RSL4c1: binary payloads in msgpack response bodies are the
+				// msgpack binary type; pop the canonical transport "base64".
+				denormalizeMessageData(&msg)
+			}
+			item = &msg
+		}
+		if (hasStart && ts < startMS) || (hasEnd && ts > endMS) {
 			continue
 		}
-		if (hasStart && msg.Timestamp < startMS) || (hasEnd && msg.Timestamp > endMS) {
-			continue
-		}
-		if format == protocol.FormatMsgpack {
-			// RSL4c1: binary payloads in msgpack response bodies are the
-			// msgpack binary type; pop the canonical transport "base64".
-			denormalizeMessageData(&msg)
-		}
-		items = append(items, &msg)
+		items = append(items, item)
 	}
 
 	// Dense per-channel offsets (memory broker) make "older messages may
@@ -401,7 +434,7 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 		hasNext = len(pubs) == limit
 		nextCursor = highestOffset
 	}
-	h.writeHistoryPage(rw, r, channel, items, limit, backwards, hasNext, nextCursor, epoch)
+	h.writeHistoryPage(rw, r, kind, items, limit, backwards, hasNext, nextCursor, epoch)
 }
 
 func (h *Handler) historyPubs(channel string, opts ...centrifuge.HistoryOption) ([]*centrifuge.Publication, string, error) {
@@ -421,18 +454,23 @@ func reversePubs(pubs []*centrifuge.Publication) {
 // writeHistoryPage writes one history page: a bare message array (RSL2)
 // plus Link pagination headers (rel="first" and, when a further page may
 // exist, rel="next") that SDK paginated resources follow as opaque URLs.
-func (h *Handler) writeHistoryPage(rw http.ResponseWriter, r *http.Request, channel string, items []*protocol.Message, limit int, backwards bool, hasNext bool, nextCursor uint64, epoch string) {
+func (h *Handler) writeHistoryPage(rw http.ResponseWriter, r *http.Request, kind historyKind, items []any, limit int, backwards bool, hasNext bool, nextCursor uint64, epoch string) {
 	if items == nil {
-		items = []*protocol.Message{}
+		items = []any{}
 	}
 	direction := "forwards"
 	if backwards {
 		direction = "backwards"
 	}
-	// The link URL must be the relative form `./messages?<query>`: ably-js
+	// The link URL must be the relative form `./<word>?<query>`: ably-js
 	// getRelParams only matches /^\.\/(\w+)\?(.*)$/ (paginatedresource.ts)
-	// and re-issues the request on the original path with the parsed query.
-	const base = "./messages"
+	// — only the parsed QUERY is reused (the request path stays the
+	// resource's own), so the word is cosmetic but must be one \w+ token:
+	// presence history uses "./history".
+	base := "./messages"
+	if kind == historyKindPresence {
+		base = "./history"
+	}
 	// start/end bounds must survive into the page links, or page 2+ of a
 	// time-bounded query would return out-of-range items.
 	bounds := ""

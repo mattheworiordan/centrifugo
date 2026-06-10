@@ -30,6 +30,14 @@ const (
 	pubTagKindPresence = "p"
 )
 
+// presenceHistoryChannel is the shadow channel retaining presence events
+// for GET .../presence/history. The ":" prefix makes it unreachable by
+// clients: the adapter rejects ':'-prefixed channel names (40010), so no
+// Ably client can attach, publish or read it directly.
+func presenceHistoryChannel(channel string) string {
+	return ":presence:" + channel
+}
+
 // defaultPresenceGrace is how long an abruptly-disconnected connection's
 // members remain present before synthesized LEAVEs fan out — the
 // advertised ~15s window that prevents presence flicker across client

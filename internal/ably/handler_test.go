@@ -42,6 +42,9 @@ func newTestHandler(t *testing.T) *Handler {
 	node, err := centrifuge.New(centrifuge.Config{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+	// Production ordering: node.Run() precedes handler construction, and
+	// fixture seeding publishes presence history at startup.
+	require.NoError(t, node.Run())
 	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, func(r *http.Request) bool { return true })
 	require.NoError(t, err)
 	return h

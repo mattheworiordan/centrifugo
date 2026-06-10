@@ -25,7 +25,10 @@ type Message struct {
 	Name          string `json:"name,omitempty"          msgpack:"name,omitempty"`
 	Data          any    `json:"data,omitempty"          msgpack:"data,omitempty"`
 	Encoding      string `json:"encoding,omitempty"      msgpack:"encoding,omitempty"`
-	Timestamp     int64  `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
+	// Extras passes through verbatim (TM2i): headers, push metadata and —
+	// in M8 — the AIT ai transport/codec blocks.
+	Extras    any   `json:"extras,omitempty"    msgpack:"extras,omitempty"`
+	Timestamp int64 `json:"timestamp,omitempty" msgpack:"timestamp,omitempty"`
 }
 
 // ChannelMessage is one atomic publish on a channel: a server-assigned
@@ -90,7 +93,9 @@ type PresenceMessage struct {
 	ConnectionID string         `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
 	Data         any            `json:"data,omitempty"         msgpack:"data,omitempty"`
 	Encoding     string         `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
-	Timestamp    int64          `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+	// Extras passes through verbatim (TP3i-territory: headers etc.).
+	Extras    any   `json:"extras,omitempty"    msgpack:"extras,omitempty"`
+	Timestamp int64 `json:"timestamp,omitempty" msgpack:"timestamp,omitempty"`
 }
 
 // PresenceAction is the wire enum of presence event kinds (TP2).

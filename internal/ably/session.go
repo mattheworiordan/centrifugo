@@ -612,8 +612,15 @@ func publishPresenceEvent(node *centrifuge.Node, channel string, entry *protocol
 	if err != nil {
 		return err
 	}
-	_, err = node.Publish(channel, data,
-		centrifuge.WithTags(map[string]string{pubTagKind: pubTagKindPresence}))
+	if _, err = node.Publish(channel, data,
+		centrifuge.WithTags(map[string]string{pubTagKind: pubTagKindPresence})); err != nil {
+		return err
+	}
+	// Presence history lives on the client-unreachable shadow channel with
+	// the live channel's retention tier — the live publication above stays
+	// history-free so message history is never polluted.
+	historyOpts := publishOptions(channel, "")
+	_, err = node.Publish(presenceHistoryChannel(channel), data, historyOpts...)
 	return err
 }
 

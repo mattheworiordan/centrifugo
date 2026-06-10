@@ -100,7 +100,7 @@ func (h *Handler) seedPresenceFixtures(path string) error {
 	now := time.Now().UnixMilli()
 	for _, ch := range fixture.Channels {
 		for i, m := range ch.Presence {
-			h.presence.set(ch.Name, &protocol.PresenceMessage{
+			member := &protocol.PresenceMessage{
 				ID:           fmt.Sprintf("fixture:%d", i),
 				Action:       protocol.PresencePresent,
 				ClientID:     m.ClientID,
@@ -108,7 +108,22 @@ func (h *Handler) seedPresenceFixtures(path string) error {
 				Data:         m.Data,
 				Encoding:     m.Encoding,
 				Timestamp:    now,
-			})
+			}
+			h.presence.set(ch.Name, member)
+			// The sandbox records the seeded members' ENTERs in presence
+			// history too (pinned by rest/presence "Presence history
+			// simple": six items expected). node.Run() precedes handler
+			// construction (internal/app/run.go), so publishing here is
+			// safe; only the client-unreachable shadow channel is written.
+			enter := *member
+			enter.Action = protocol.PresenceEnter
+			data, err := json.Marshal(&enter)
+			if err != nil {
+				return fmt.Errorf("ably presence fixtures: %w", err)
+			}
+			if _, err := h.node.Publish(presenceHistoryChannel(ch.Name), data, publishOptions(ch.Name, "")...); err != nil {
+				return fmt.Errorf("ably presence fixtures: %w", err)
+			}
 		}
 	}
 	return nil
