@@ -7,6 +7,8 @@ package ably
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/url"
 	"testing"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
@@ -69,12 +71,16 @@ func TestMaterializedStoreSemantics(t *testing.T) {
 	state, _ = store.get("ch", "s1")
 	require.Equal(t, protocol.MessageActionDelete, state.Action)
 
-	// Version snapshots accumulated oldest-first.
+	// Version snapshots accumulated oldest-first — the CREATE is itself
+	// the first version (RSL14: getMessageVersions returns the create
+	// alongside the ops, action message.create).
 	versions, ok := store.versions("ch", "s1")
 	require.True(t, ok)
-	require.Len(t, versions, 7)
-	require.Equal(t, "v1", versions[0].Version.Serial)
-	require.Equal(t, "v4", versions[6].Version.Serial)
+	require.Len(t, versions, 8)
+	require.Equal(t, protocol.MessageActionCreate, versions[0].Action)
+	require.Nil(t, versions[0].Version)
+	require.Equal(t, "v1", versions[1].Version.Serial)
+	require.Equal(t, "v4", versions[7].Version.Serial)
 
 	// Unknown serial: not found.
 	_, prob = store.mutate("ch", "nope", protocol.MessageActionUpdate, "x", "", nil, &protocol.MessageVersion{})
@@ -249,4 +255,70 @@ func TestMutableRewindServesMaterialized(t *testing.T) {
 	require.Equal(t, protocol.MessageActionUpdate, got.Action)
 	require.Equal(t, "orig", got.Name)
 	require.NotNil(t, got.Version)
+}
+
+// RSL11/RSL14/RSL15 REST surface: PATCH mutates by URL-encoded serial and
+// responds {versionSerial}; GET returns the latest materialized state;
+// /versions lists the create plus each op oldest-first; non-mutable
+// channels refuse with 93002.
+func TestRESTMutationSurface_RSL15(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	// Create via REST and take the serial.
+	resp := restRequest(t, ts, http.MethodPost, "/channels/mutable:rest-surface/messages",
+		[]byte(`{"name":"orig","data":"Hello"}`), map[string]string{"Content-Type": "application/json"})
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	var pub struct {
+		Serials []string `json:"serials"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&pub))
+	require.Len(t, pub.Serials, 1)
+	serial := pub.Serials[0]
+	escaped := url.PathEscape(serial)
+
+	// PATCH append.
+	resp = restRequest(t, ts, http.MethodPatch, "/channels/mutable:rest-surface/messages/"+escaped,
+		[]byte(`{"action":5,"data":" World","version":{"clientId":"op","description":"d"}}`),
+		map[string]string{"Content-Type": "application/json"})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var patched struct {
+		VersionSerial string `json:"versionSerial"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&patched))
+	require.NotEmpty(t, patched.VersionSerial)
+	require.Greater(t, patched.VersionSerial, serial, "versionSerial sorts above the message serial")
+
+	// GET latest: concatenated, action update, version present.
+	resp = restRequest(t, ts, http.MethodGet, "/channels/mutable:rest-surface/messages/"+escaped, nil, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got protocol.Message
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Equal(t, "Hello World", got.Data)
+	require.Equal(t, protocol.MessageActionUpdate, got.Action)
+	require.Equal(t, patched.VersionSerial, got.Version.Serial)
+	require.Equal(t, "op", got.Version.ClientID)
+
+	// Versions: create + append, oldest first.
+	resp = restRequest(t, ts, http.MethodGet, "/channels/mutable:rest-surface/messages/"+escaped+"/versions", nil, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var versions []protocol.Message
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&versions))
+	require.Len(t, versions, 2)
+	require.Equal(t, protocol.MessageActionCreate, versions[0].Action)
+	require.Equal(t, protocol.MessageActionUpdate, versions[1].Action)
+
+	// Unknown serial: 404/40400. Non-mutable channel: 93002.
+	resp = restRequest(t, ts, http.MethodGet, "/channels/mutable:rest-surface/messages/nope%3A000", nil, nil)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	resp = restRequest(t, ts, http.MethodPatch, "/channels/plain-surface/messages/"+escaped,
+		[]byte(`{"action":1,"data":"x"}`), map[string]string{"Content-Type": "application/json"})
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var errBody struct {
+		Error struct {
+			Code int `json:"code"`
+		} `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&errBody))
+	require.Equal(t, errCodeMutableRequired, errBody.Error.Code)
 }

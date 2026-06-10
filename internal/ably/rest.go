@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
@@ -62,6 +63,30 @@ func (h *Handler) serveChannels(rw http.ResponseWriter, r *http.Request) {
 	identity, authErr := h.authenticate(r)
 	if authErr != nil {
 		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
+		return
+	}
+	// messages/{serial} and messages/{serial}/versions (RSL11/RSL14/RSL15):
+	// the serial segment is percent-encoded by SDKs (it contains ':').
+	if serialSub, found := strings.CutPrefix(sub, "messages/"); found && serialSub != "" {
+		versions := false
+		if v, cut := strings.CutSuffix(serialSub, "/versions"); cut {
+			serialSub, versions = v, true
+		}
+		serial, err := url.PathUnescape(serialSub)
+		if err != nil || serial == "" || strings.ContainsRune(serial, '/') {
+			h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "not found")
+			return
+		}
+		switch {
+		case versions && r.Method == http.MethodGet:
+			h.serveMessageVersions(rw, r, channel, identity, serial)
+		case !versions && r.Method == http.MethodGet:
+			h.serveGetMessage(rw, r, channel, identity, serial)
+		case !versions && r.Method == http.MethodPatch:
+			h.serveMutateMessage(rw, r, channel, identity, serial)
+		default:
+			h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "not found")
+		}
 		return
 	}
 	switch {
@@ -253,6 +278,117 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		return
 	}
 	h.writeDocument(rw, r, http.StatusCreated, map[string]any{})
+}
+
+// serveGetMessage implements GET /channels/{ch}/messages/{serial}
+// (RSL11): the latest materialized state of one mutable message.
+func (h *Handler) serveGetMessage(rw http.ResponseWriter, r *http.Request, channel string, identity authResult, serial string) {
+	if !mutableChannel(channel) {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeMutableRequired, "this operation can only be performed on a channel with mutable messages enabled")
+		return
+	}
+	if !identity.capability.Allows(auth.OpHistory, channel) {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit history")
+		return
+	}
+	msg, ok := h.materialized.get(channel, serial)
+	if !ok {
+		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "message not found")
+		return
+	}
+	if responseFormat(r) == protocol.FormatMsgpack {
+		denormalizeMessageData(&msg)
+	}
+	h.writeDocument(rw, r, http.StatusOK, &msg)
+}
+
+// serveMessageVersions implements GET /channels/{ch}/messages/{serial}/
+// versions (RSL14): every version of a mutable message, oldest first —
+// the create plus each subsequent op. PoC: a single page (version counts
+// are small; Link pagination omitted like REST presence, noted for M9).
+func (h *Handler) serveMessageVersions(rw http.ResponseWriter, r *http.Request, channel string, identity authResult, serial string) {
+	if !mutableChannel(channel) {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeMutableRequired, "this operation can only be performed on a channel with mutable messages enabled")
+		return
+	}
+	if !identity.capability.Allows(auth.OpHistory, channel) {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit history")
+		return
+	}
+	versions, ok := h.materialized.versions(channel, serial)
+	if !ok {
+		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "message not found")
+		return
+	}
+	format := responseFormat(r)
+	items := make([]any, 0, len(versions))
+	for i := range versions {
+		v := versions[i]
+		if format == protocol.FormatMsgpack {
+			denormalizeMessageData(&v)
+		}
+		items = append(items, &v)
+	}
+	h.writeDocument(rw, r, http.StatusOK, items)
+}
+
+// serveMutateMessage implements PATCH /channels/{ch}/messages/{serial}
+// (RSL15): the body is ONE encoded message carrying the numeric action
+// (1=update, 2=delete, 5=append), the new data/extras, and the mutator's
+// MessageOperation in version. Responds {versionSerial}.
+func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, channel string, identity authResult, serial string) {
+	if !mutableChannel(channel) {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeMutableRequired, "this operation can only be performed on a channel with mutable messages enabled")
+		return
+	}
+	// Mutating is publishing (RSL15 rides the publish capability).
+	if !identity.capability.Allows(auth.OpPublish, channel) {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit publish")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxMessageSize+1))
+	if err != nil || len(body) > maxMessageSize {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid request body")
+		return
+	}
+	var msg protocol.Message
+	if err := protocol.UnmarshalAny(body, requestBodyFormat(r), &msg); err != nil {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid message body")
+		return
+	}
+	switch msg.Action {
+	case protocol.MessageActionUpdate, protocol.MessageActionDelete, protocol.MessageActionAppend:
+	default:
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "unsupported message action")
+		return
+	}
+	version := msg.Version
+	if version == nil {
+		version = &protocol.MessageVersion{}
+	}
+	version.Serial = h.mint.Mint(channel)
+	version.Timestamp = time.Now().UnixMilli()
+	normalizeMessageData(&msg)
+
+	op, prob := h.materialized.mutate(channel, serial, msg.Action, msg.Data, msg.Encoding, msg.Extras, version)
+	if prob != nil {
+		h.writeError(rw, r, prob.statusCode, prob.code, prob.message)
+		return
+	}
+	op.ID = version.Serial + ":0"
+	data, err := json.Marshal(op)
+	if err != nil {
+		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "mutation failed")
+		return
+	}
+	// REST mutations have no connection identity: no origin tag, like
+	// REST publishes.
+	if _, err := h.node.Publish(channel, data, publishOptions(channel, "", version.Serial)...); err != nil {
+		log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("rest mutation publish failed")
+		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "mutation failed")
+		return
+	}
+	h.writeDocument(rw, r, http.StatusOK, map[string]any{"versionSerial": version.Serial})
 }
 
 func statusOf(p *publishProblem) int {

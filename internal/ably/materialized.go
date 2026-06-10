@@ -65,7 +65,9 @@ func (s *materializedStore) create(channel string, msg *protocol.Message) {
 	if _, exists := entries[msg.Serial]; exists {
 		return
 	}
-	entries[msg.Serial] = &materializedEntry{state: *msg}
+	// The create is itself the first version (RSL14: getMessageVersions
+	// returns the create alongside subsequent ops — action message.create).
+	entries[msg.Serial] = &materializedEntry{state: *msg, versions: []protocol.Message{*msg}}
 	s.order[channel] = append(s.order[channel], msg.Serial)
 }
 
