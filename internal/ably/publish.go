@@ -55,6 +55,16 @@ type publishProblem struct {
 	message    string
 }
 
+// mutableChannel reports whether the channel has mutable-messages
+// semantics (the mutableMessages channel rule): publishes return serials
+// (TR4s/RSL1n) and per-serial mutation is allowed. PoC convention: the
+// "mutable:" namespace (ably-js updates-deletes tests) and the "ai:"
+// namespace (AIT's default) — a provisioning shim would set the flag per
+// channel rule (M9).
+func mutableChannel(name string) bool {
+	return strings.HasPrefix(name, "mutable:") || strings.HasPrefix(name, "ai:")
+}
+
 // validChannelName reports whether name is acceptable as an Ably channel
 // name. Empty names and names beginning with ':' are invalid (error code
 // 40010; pinned by ably-js channelattachempty/channelattachinvalid). The

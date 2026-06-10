@@ -38,6 +38,7 @@ func TestAckFrameMsgpackWireShape(t *testing.T) {
 	require.Contains(t, fields, "count")
 	require.EqualValues(t, 1, fields["count"])
 	require.NotContains(t, fields, "error", "error stays omitempty on ACK")
+	require.NotContains(t, fields, "res", "bare ACKs (non-mutable channels) omit res — TR4s serials are mutable-only")
 
 	// Interop: the shared ProtocolMessage decoder reads the frame back.
 	var m protocol.ProtocolMessage

@@ -237,8 +237,19 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		}
 	}
 	// RSL1: a successful publish is 201 with an empty document body; SDKs
-	// key off the status (the response body only matters once
-	// PublishResult.serials lands in M8).
+	// key off the status; mutableMessages channels return the assigned
+	// serials (RSL1n PublishResult) — ably-js restchannel._publish decodes
+	// the body and AIT requires serials[0].
+	if mutableChannel(channel) {
+		// The MESSAGE serials ("<channelSerial>:<idx>"), matching the
+		// realtime ACK res — the identity mutation ops key off.
+		msgSerials := make([]string, len(messages))
+		for i, msg := range messages {
+			msgSerials[i] = msg.Serial
+		}
+		h.writeDocument(rw, r, http.StatusCreated, map[string]any{"serials": msgSerials})
+		return
+	}
 	h.writeDocument(rw, r, http.StatusCreated, map[string]any{})
 }
 

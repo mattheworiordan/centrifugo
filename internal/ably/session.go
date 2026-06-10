@@ -470,6 +470,16 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 			return
 		}
 	}
+	if mutableChannel(m.Channel) {
+		// TR4s: mutableMessages publishes acknowledge with the assigned
+		// message serials.
+		msgSerials := make([]string, len(m.Messages))
+		for i, msg := range m.Messages {
+			msgSerials[i] = msg.Serial
+		}
+		s.writeAckRes(m.MsgSerial, msgSerials)
+		return
+	}
 	s.writeAck(m.MsgSerial)
 }
 
@@ -488,6 +498,16 @@ type ackFrame struct {
 	MsgSerial int64               `json:"msgSerial"       msgpack:"msgSerial"`
 	Count     int                 `json:"count"           msgpack:"count"`
 	Error     *protocol.ErrorInfo `json:"error,omitempty" msgpack:"error,omitempty"`
+	// Res carries one PublishResult per acknowledged frame (TR4s) on
+	// mutableMessages channels: serials 1:1 with the frame's messages —
+	// ably-js completes each pending publish with res[i]
+	// (messagequeue.ts) and AIT hard-fails without serials[0].
+	Res []publishResult `json:"res,omitempty" msgpack:"res,omitempty"`
+}
+
+// publishResult is the TR4s/RSL1n PublishResult document.
+type publishResult struct {
+	Serials []string `json:"serials" msgpack:"serials"`
 }
 
 // writeConnected sends the CONNECTED frame (RTN6 at connect; RTC8a-ack
@@ -637,6 +657,18 @@ func (s *session) writeAck(msgSerial int64) {
 		Action:    protocol.ActionAck,
 		MsgSerial: msgSerial,
 		Count:     1,
+	})
+}
+
+// writeAckRes confirms one inbound MESSAGE frame on a mutableMessages
+// channel, carrying the assigned serials (TR4s): one PublishResult for
+// the one acknowledged frame, serials 1:1 with its messages.
+func (s *session) writeAckRes(msgSerial int64, serials []string) {
+	s.writeWire(&ackFrame{
+		Action:    protocol.ActionAck,
+		MsgSerial: msgSerial,
+		Count:     1,
+		Res:       []publishResult{{Serials: serials}},
 	})
 }
 
