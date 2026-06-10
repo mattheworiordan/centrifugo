@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 
 	"github.com/centrifugal/centrifuge"
@@ -72,7 +73,7 @@ func (h *Handler) serveChannels(rw http.ResponseWriter, r *http.Request) {
 	case sub == "messages" && r.Method == http.MethodPost:
 		h.serveRESTPublish(rw, r, channel, identity)
 	case sub == "messages" && r.Method == http.MethodGet:
-		h.serveRESTHistory(rw, r, channel)
+		h.serveRESTHistory(rw, r, channel, identity)
 	case sub == "" && r.Method == http.MethodGet:
 		h.serveChannelDetails(rw, r, channel)
 	default:
@@ -124,6 +125,11 @@ func decodeMessageBody(body []byte, format protocol.Format) ([]*protocol.Message
 func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, channel string, identity authResult) {
 	if !validChannelName(channel) {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidChannelName, "invalid channel name")
+		return
+	}
+	// Publishing requires the publish operation (40160).
+	if !identity.capability.Allows(auth.OpPublish, channel) {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit publish")
 		return
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, maxFrameSize))
@@ -250,9 +256,14 @@ func statusOf(p *publishProblem) int {
 // dense and monotonic, so the page below offset L is exactly the window
 // [L-limit, L-1], fetchable forward via WithSince and reversed for
 // backwards responses.
-func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, channel string) {
+func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, channel string, identity authResult) {
 	if !validChannelName(channel) {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidChannelName, "invalid channel name")
+		return
+	}
+	// History reads require the history operation (40160).
+	if !identity.capability.Allows(auth.OpHistory, channel) {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit history")
 		return
 	}
 	q := r.URL.Query()

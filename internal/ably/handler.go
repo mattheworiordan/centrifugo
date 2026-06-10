@@ -163,6 +163,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		userID:           userID,
 		clientID:         clientID,
 		wildcardClientID: identity.wildcardClientID && clientID == "",
+		capability:       identity.capability,
 		echo:             q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
 		protocolVersion:  q.Get("v"),               // RTN2f
 		format:           format,                   // RTN2a

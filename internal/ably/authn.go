@@ -26,10 +26,11 @@ type authResult struct {
 	// wildcardClientID reports a token whose clientId is the literal "*"
 	// (RSA7b4): the caller has no identity but may assume any.
 	wildcardClientID bool
-	// capability is the verbatim capability JSON governing the caller:
-	// the key's capability for Basic auth, the x-ably-capability claim
-	// for token auth. Enforced from M4.3.
-	capability string
+	// capability governs the caller: the key's capability for Basic auth,
+	// the x-ably-capability claim for token auth (falling back to the
+	// signing key's capability when the claim is absent — Ably-JWT
+	// semantics). Enforced on attach, publish and history.
+	capability auth.Capability
 	// keyName is the authenticating key (Basic) or signing key (token).
 	keyName string
 }
@@ -60,9 +61,21 @@ func (h *Handler) authenticate(r *http.Request) (authResult, *authProblem) {
 		case err != nil:
 			return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: "invalid token"}
 		}
+		capabilityJSON := claims.Capability
+		if capabilityJSON == "" {
+			// A token without an x-ably-capability claim inherits the
+			// signing key's capability.
+			if key, ok := h.keys.Lookup(claims.KeyName); ok {
+				capabilityJSON = key.Capability
+			}
+		}
+		capability, err := auth.ParseCapability(capabilityJSON)
+		if err != nil {
+			return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: "invalid token capability"}
+		}
 		res := authResult{
 			viaToken:   true,
-			capability: claims.Capability,
+			capability: capability,
 			keyName:    claims.KeyName,
 		}
 		if claims.ClientID == "*" {
@@ -81,8 +94,14 @@ func (h *Handler) authenticate(r *http.Request) (authResult, *authProblem) {
 		}
 		return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: message}
 	}
+	capability, err := auth.ParseCapability(key.Capability)
+	if err != nil {
+		// The store validates capability JSON at load, so this is a
+		// programming error rather than a caller problem.
+		return authResult{}, &authProblem{code: errCodeInternal, statusCode: http.StatusInternalServerError, message: "invalid key capability"}
+	}
 	return authResult{
-		capability: key.Capability,
+		capability: capability,
 		keyName:    key.APIKey.AppID + "." + key.APIKey.KeyID,
 	}, nil
 }

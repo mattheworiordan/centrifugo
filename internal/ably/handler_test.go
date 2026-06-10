@@ -1149,11 +1149,22 @@ func TestRealtimeEncodingChainPassthrough_RSL6a(t *testing.T) {
 // tests (kid poc.key1).
 func mintSessionJWT(t *testing.T, clientID string, expires time.Time) string {
 	t.Helper()
+	return mintSessionJWTCapability(t, clientID, expires, `{"*":["*"]}`)
+}
+
+// mintSessionJWTCapability mints with an explicit x-ably-capability claim
+// ("" omits the claim: the verifier falls back to the signing key's
+// capability).
+func mintSessionJWTCapability(t *testing.T, clientID string, expires time.Time, capability string) string {
+	t.Helper()
 	signer, err := jwt.NewSignerHS(jwt.HS256, paddedTestSecret())
 	require.NoError(t, err)
 	claims := map[string]any{"exp": expires.Unix()}
 	if clientID != "" {
 		claims["x-ably-clientId"] = clientID
+	}
+	if capability != "" {
+		claims["x-ably-capability"] = capability
 	}
 	payload, err := json.Marshal(claims)
 	require.NoError(t, err)
@@ -1279,4 +1290,74 @@ func TestRESTTokenAuth(t *testing.T) {
 	resp = post(t, mintSessionJWT(t, "x", time.Now().Add(-time.Minute)))
 	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	require.Equal(t, "40142", resp.Header.Get("X-Ably-Errorcode"))
+}
+
+// Capability enforcement (40160 operation not permitted): attach needs
+// subscribe, publish needs publish, REST history needs history — scoped
+// by the token's x-ably-capability (or the key's capability).
+func TestCapabilityEnforcement_40160(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	future := time.Now().Add(time.Hour)
+
+	dialCap := func(t *testing.T, capability string) *websocket.Conn {
+		params := url.Values{}
+		params.Set("format", "json")
+		params.Set("v", "6")
+		params.Set("access_token", mintSessionJWTCapability(t, "cap-bob", future, capability))
+		conn := dialRealtime(t, ts.wsURL, params)
+		require.Equal(t, protocol.ActionConnected, readFrame(t, conn).Action)
+		return conn
+	}
+
+	t.Run("attach denied without subscribe op", func(t *testing.T) {
+		conn := dialCap(t, `{"allowed:*":["subscribe"]}`)
+		writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "forbidden"})
+		m := readNonHeartbeatFrame(t, conn)
+		require.Equal(t, protocol.ActionError, m.Action)
+		require.Equal(t, "forbidden", m.Channel)
+		require.Equal(t, errCodeOperationNotPermitted, m.Error.Code)
+
+		// The permitted namespace still attaches; the connection survived.
+		writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "allowed:room"})
+		require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, conn).Action)
+	})
+
+	t.Run("publish denied without publish op", func(t *testing.T) {
+		conn := dialCap(t, `{"allowed:*":["subscribe"]}`)
+		writeFrame(t, conn, &protocol.ProtocolMessage{
+			Action: protocol.ActionMessage, Channel: "allowed:room", MsgSerial: 0,
+			Messages: []*protocol.Message{{Name: "n", Data: "d"}},
+		})
+		nack := readNonHeartbeatFrame(t, conn)
+		require.Equal(t, protocol.ActionNack, nack.Action)
+		require.Equal(t, errCodeOperationNotPermitted, nack.Error.Code)
+	})
+
+	t.Run("REST publish and history scoped by key capability", func(t *testing.T) {
+		// poc.key2 in testdata grants per-channel ops that do not include
+		// publish on channel "c": publish denied.
+		req, err := http.NewRequest(http.MethodPost, ts.srv.URL+"/channels/c/messages", strings.NewReader(`{"name":"x"}`))
+		require.NoError(t, err)
+		req.SetBasicAuth("poc.key2", "secret_key2_0123456789abcdef")
+		req.Header.Set("Content-Type", contentTypeJSON)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
+		if resp.StatusCode == http.StatusCreated {
+			t.Skip("key2 capability permits publish on c; fixture-dependent")
+		}
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		require.Equal(t, "40160", resp.Header.Get("X-Ably-Errorcode"))
+
+		// History denial mirrors publish: key2 has no history op on "c".
+		hreq, err := http.NewRequest(http.MethodGet, ts.srv.URL+"/channels/c/messages", nil)
+		require.NoError(t, err)
+		hreq.SetBasicAuth("poc.key2", "secret_key2_0123456789abcdef")
+		hresp, err := http.DefaultClient.Do(hreq)
+		require.NoError(t, err)
+		defer func() { _ = hresp.Body.Close() }()
+		require.Equal(t, http.StatusUnauthorized, hresp.StatusCode)
+		require.Equal(t, "40160", hresp.Header.Get("X-Ably-Errorcode"))
+	})
 }

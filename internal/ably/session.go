@@ -47,6 +47,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 
@@ -118,6 +119,9 @@ type sessionParams struct {
 	// protocolVersion is the v query param (RTN2f). Stored, not yet acted
 	// on.
 	protocolVersion string
+	// capability governs this connection (see authResult.capability),
+	// enforced on attach and publish.
+	capability auth.Capability
 	// format is the wire encoding selected by the format query param
 	// (RTN2a): every outbound frame is marshaled in it (msgpack frames
 	// travel as WS binary messages, JSON as text) and every inbound frame
@@ -345,6 +349,11 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeInvalidChannelName, 400, "publish failed: invalid channel name")
 		return
 	}
+	// Publishing requires the publish operation on the channel (40160).
+	if !s.params.capability.Allows(auth.OpPublish, m.Channel) {
+		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "publish failed: capability does not permit publish")
+		return
+	}
 
 	connectionID := s.client.ID()
 
@@ -453,6 +462,13 @@ func (s *session) attach(channel string) {
 	// bad-request disconnect).
 	if !validChannelName(channel) {
 		s.writeChannelError(channel, errCodeInvalidChannelName, 400, "invalid channel name")
+		return
+	}
+	// Attaching requires the subscribe operation on the channel: a
+	// capability miss fails the CHANNEL with 40160 (operation not
+	// permitted with provided capability), never the connection.
+	if !s.params.capability.Allows(auth.OpSubscribe, channel) {
+		s.writeChannelError(channel, errCodeOperationNotPermitted, 401, "capability does not permit subscribe")
 		return
 	}
 	sub := &cproto.SubscribeRequest{Channel: channel}
