@@ -341,7 +341,7 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// 40009 reject NACKs the frame and keeps the connection alive —
 	// contrast the protocol-level maxFrameSize read limit set in
 	// serveRealtime, which kills the connection outright.
-	payloads, problem := buildEnvelopes(m.Messages, envelopeParams{
+	payloads, idemKeys, problem := buildEnvelopes(m.Messages, envelopeParams{
 		connectionID: connectionID,
 		clientID:     s.params.clientID,
 		newID: func(idx int) string {
@@ -365,8 +365,17 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// back: NACK is the honest verdict (an ACK would falsely confirm the
 	// tail), and an SDK retry (RTN19a) may duplicate the prefix until
 	// idempotent dedup lands in M3.2.
-	for _, data := range payloads {
-		_, err := s.node.Publish(m.Channel, data, publishOptions(m.Channel, connectionID)...)
+	for i, data := range payloads {
+		// A client-supplied message id dedups republishes within the
+		// retention window (RSL1k2/RSL1k5): the broker returns the cached
+		// stream position and publishes nothing, so the duplicate still
+		// ACKs (the SDK retry contract) without a second delivery.
+		opts := publishOptions(m.Channel, connectionID)
+		if idemKeys[i] != "" {
+			opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
+				centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
+		}
+		_, err := s.node.Publish(m.Channel, data, opts...)
 		if err != nil {
 			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("publish failed")
 			s.writeNack(m.MsgSerial, errCodeInternal, 500, "publish failed")

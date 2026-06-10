@@ -39,6 +39,12 @@ const (
 	ephemeralHistoryTTL  = 2 * time.Minute
 )
 
+// idempotentResultTTL is the window within which a republish carrying the
+// same client-supplied message id is deduplicated (RSL1k5: "for a period
+// of time" — Ably documents ~2 minutes). The broker caches the original
+// stream position per (channel, id) and drops the duplicate publication.
+const idempotentResultTTL = 2 * time.Minute
+
 // publishProblem is a publish verdict the surface translates to its wire
 // form: the session NACKs the frame, the REST handler writes an Ably
 // error response.
@@ -81,29 +87,39 @@ type envelopeParams struct {
 // measurement basis for the maxMessageSize check, which must reject the
 // batch before anything is published. A non-nil problem means nothing may
 // be published.
-func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, *publishProblem) {
+//
+// The returned idempotencyKeys slice is index-parallel to the payloads:
+// a non-empty entry is the CLIENT-supplied message id, which carries
+// idempotency intent (RSL1k2/RSL1k5) — the publish loops pass it to the
+// broker for dedup. Server-generated ids never dedup (entry "").
+func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, []string, *publishProblem) {
 	now := time.Now().UnixMilli()
+	idempotencyKeys := make([]string, len(messages))
 
 	// Envelope every Message in full BEFORE any publish, so subscribers
 	// never depend on SDK-side inheritance from an enclosing frame, and
 	// so a rejected batch publishes nothing.
 	for idx, msg := range messages {
 		if msg == nil {
-			return nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "null message"}
+			return nil, nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "null message"}
 		}
 		if msg.ClientID != "" && p.clientID != "" && msg.ClientID != p.clientID {
 			// RTL6g/RSL1m4: an identified publisher can only publish
 			// messages carrying its own clientId; an incompatible explicit
 			// clientId is rejected by the service. Full capability
 			// semantics are M4.
-			return nil, &publishProblem{code: errCodeInvalidClientID, statusCode: 400,
+			return nil, nil, &publishProblem{code: errCodeInvalidClientID, statusCode: 400,
 				message: fmt.Sprintf("message clientId %q is incompatible with publisher clientId %q", msg.ClientID, p.clientID)}
 		}
+		clientSuppliedID := msg.ID != ""
 		if msg.ID == "" {
 			// TM2a: a unique id applied by Ably when the client supplied
-			// none. A client-supplied id is preserved; idempotency mapping
-			// is M3.2.
+			// none. A client-supplied id is preserved and doubles as the
+			// idempotency key (RSL1k2).
 			msg.ID = p.newID(idx)
+		}
+		if clientSuppliedID {
+			idempotencyKeys[idx] = msg.ID
 		}
 		if msg.ClientID == "" {
 			// RTL6g1b/RSL1m1: the service assigns the publisher's clientId
@@ -140,7 +156,7 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, *
 	for _, msg := range messages {
 		data, err := json.Marshal(msg)
 		if err != nil {
-			return nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: err.Error()}
+			return nil, nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: err.Error()}
 		}
 		payloads = append(payloads, data)
 		totalSize += len(data)
@@ -153,10 +169,10 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, *
 	// ~33% Base64 inflation of the canonical form — make this adapter
 	// marginally stricter, never looser.
 	if totalSize > maxMessageSize {
-		return nil, &publishProblem{code: errCodeMaxMessageLength, statusCode: 400,
+		return nil, nil, &publishProblem{code: errCodeMaxMessageLength, statusCode: 400,
 			message: fmt.Sprintf("maximum message length exceeded (%d bytes, limit %d)", totalSize, maxMessageSize)}
 	}
-	return payloads, nil
+	return payloads, idempotencyKeys, nil
 }
 
 // publishOptions are the node.Publish options for one enveloped message

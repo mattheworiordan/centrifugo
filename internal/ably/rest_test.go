@@ -208,3 +208,29 @@ func TestRESTChannelDetails(t *testing.T) {
 		require.True(t, present, "metric %s must be present", k)
 	}
 }
+
+// RSL1k2/RSL1k5: republishing a message with the same client-supplied id
+// within the dedup window stores it once; server-generated ids never
+// dedup.
+func TestRESTPublishIdempotent_RSL1k2(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	body := []byte(`{"name":"idem","data":"d","id":"client-id:0"}`)
+	for range 3 {
+		resp := restRequest(t, ts, http.MethodPost, "/channels/persisted:rest-idem/messages",
+			body, map[string]string{"Content-Type": contentTypeJSON})
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+	}
+	// Distinct server-generated ids: two more stored messages.
+	for range 2 {
+		resp := restRequest(t, ts, http.MethodPost, "/channels/persisted:rest-idem/messages",
+			[]byte(`{"name":"fresh","data":"d"}`), map[string]string{"Content-Type": contentTypeJSON})
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+	}
+
+	resp := restRequest(t, ts, http.MethodGet, "/channels/persisted:rest-idem/messages", nil, nil)
+	msgs := decodeMessagesBody(t, resp)
+	require.Len(t, msgs, 3, "3x same-id stores once; 2x fresh store twice")
+	require.Equal(t, "client-id:0", msgs[2].ID, "client-supplied id preserved (oldest)")
+}

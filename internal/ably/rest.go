@@ -190,7 +190,7 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "internal error")
 		return
 	}
-	payloads, problem := buildEnvelopes(messages, envelopeParams{
+	payloads, idemKeys, problem := buildEnvelopes(messages, envelopeParams{
 		// REST publishes have no connection identity: connectionID stays
 		// empty (no TM2c attribution beyond explicit TM2h above, no origin
 		// tag — REST messages are never echo-suppressed).
@@ -206,8 +206,16 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		h.writeError(rw, r, statusOf(problem), problem.code, problem.message)
 		return
 	}
-	for _, data := range payloads {
-		if _, err := h.node.Publish(channel, data, publishOptions(channel, "")...); err != nil {
+	for i, data := range payloads {
+		// Client-supplied ids dedup republishes (RSL1k2/RSL1k5): the broker
+		// drops the duplicate and the request still succeeds — pinned by
+		// ably-js "idempotentRestPublishing set to false".
+		opts := publishOptions(channel, "")
+		if idemKeys[i] != "" {
+			opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
+				centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
+		}
+		if _, err := h.node.Publish(channel, data, opts...); err != nil {
 			log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("rest publish failed")
 			h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "publish failed")
 			return
