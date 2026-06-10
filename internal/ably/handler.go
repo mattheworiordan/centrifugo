@@ -145,6 +145,9 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/channels/"):
 		// RSL1/RSL2/channel details — see rest.go.
 		h.serveChannels(rw, r)
+	case r.URL.Path == "/messages" && r.Method == http.MethodPost:
+		// BO2 batch publish — see rest.go.
+		h.serveBatchPublish(rw, r)
 	case strings.HasPrefix(r.URL.Path, "/keys/") && strings.HasSuffix(r.URL.Path, "/requestToken"):
 		// RSA8 token request exchange — see resttoken.go.
 		h.serveRequestToken(rw, r)
@@ -235,12 +238,28 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 	// RTN16-lite: a recovering client presents its previous connectionKey
 	// ("<connectionId>!<token>") as the recover query param; the session
 	// adopts the embedded connectionId so CONNECTED preserves it (RTN16d).
-	// Malformed values are ignored — the connection proceeds fresh, which
-	// is the correct recovery-failure posture.
+	// Malformed values are rejected with 80018 on the first CONNECTED and
+	// the connection proceeds fresh (RTN16e posture).
 	recoverID := ""
+	var recoverError *protocol.ErrorInfo
 	if rec := q.Get("recover"); rec != "" {
 		if i := strings.IndexByte(rec, '!'); i > 0 {
 			recoverID = rec[:i]
+		}
+		// This adapter's connectionIds are centrifuge client UUIDs: a
+		// claim that cannot be one is rejected outright — the connection
+		// proceeds FRESH and the initial CONNECTED carries 80018 (invalid
+		// connection id, registry-verified) so the SDK abandons recovery
+		// state (resets msgSerial — pinned by ably-js
+		// unrecoverableConnection). Well-formed ids are adopted
+		// unverified (RTN16-lite, documented divergence).
+		if !uuidShaped(recoverID) {
+			recoverID = ""
+			recoverError = &protocol.ErrorInfo{
+				Code:       80018,
+				StatusCode: 400,
+				Message:    "unable to recover connection: invalid connection key",
+			}
 		}
 	}
 	if recoverID != "" {
@@ -259,10 +278,33 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		protocolVersion:  q.Get("v"),               // RTN2f
 		format:           format,                   // RTN2a
 		recoverID:        recoverID,                // RTN16d
+		recoverError:     recoverError,             // RTN16e: 80018 on the first CONNECTED
 		tokenExpires:     identity.expires,         // RTN15-territory: 40142 disconnect at exp
 		reauth:           h.verifyTokenString,      // RTC8 AUTH frames
 	}, h.presence, h.mint, h.materialized)
 	sess.run(r.Context())
+}
+
+// uuidShaped reports whether s looks like a centrifuge client UUID —
+// the only shape this adapter ever mints as a connectionId, so any
+// recover claim that isn't one is definitionally invalid (80018).
+func uuidShaped(s string) bool {
+	if len(s) != 36 {
+		return false
+	}
+	for i, c := range s {
+		switch i {
+		case 8, 13, 18, 23:
+			if c != '-' {
+				return false
+			}
+		default:
+			if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // writeConnectionError fails a connection in-band before any session

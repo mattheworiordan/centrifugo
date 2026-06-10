@@ -238,3 +238,26 @@ func TestRecoveredConnectionGrantsResumedOnBareAttach(t *testing.T) {
 	require.Equal(t, protocol.ActionAttached, attached.Action)
 	require.Equal(t, protocol.FlagResumed, attached.Flags&protocol.FlagResumed)
 }
+
+// RTN16e/80018: a recover key whose connectionId could never have been
+// minted here (not UUID-shaped) is rejected — the connection proceeds
+// FRESH and the initial CONNECTED carries the 80018 error so the SDK
+// abandons its recovery state (pinned by ably-js unrecoverableConnection).
+func TestUnrecoverableKeyRejectedWith80018(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	params := defaultDialParams()
+	params.Set("recover", "_____!ablyjs_test_fake-key____")
+	conn := dialRealtime(t, ts.wsURL, params)
+	connected := readFrame(t, conn)
+	require.Equal(t, protocol.ActionConnected, connected.Action)
+	require.NotNil(t, connected.Error)
+	require.Equal(t, 80018, connected.Error.Code)
+	require.NotEqual(t, "_____", connected.ConnectionID, "the bogus claim is not adopted")
+
+	// The error rides ONLY the first CONNECTED: an AUTH-ack CONNECTED is
+	// clean (covered indirectly — the connection works normally).
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "fresh-after-80018"})
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, conn).Action)
+}

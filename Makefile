@@ -106,3 +106,13 @@ ably-conformance:
 	curl -fsS -o /dev/null http://localhost:8049/time; \
 	cd internal/ably/conformance && ABLY_CONFORMANCE_URL=localhost:8049 go test -count=1 -timeout 120s -v ./...
 
+
+# ably-poc-test is the PoC Definition-of-Done gate: the native Go suites,
+# the ably-go conformance mirrors, and the full ably-js acceptance sweep
+# (the allowlisted suites, non-comet) against a freshly built binary.
+# Requires node + the pinned ably-js checkout (.working/ably-js-pinned,
+# `npm run build:node` already done). ~15 minutes.
+ably-poc-test:
+	go test ./internal/ably/... -count=1 -timeout 300s
+	$(MAKE) ably-conformance
+	./scripts/ably-poc-acceptance.sh

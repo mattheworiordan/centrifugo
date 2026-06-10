@@ -391,6 +391,114 @@ func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, ch
 	h.writeDocument(rw, r, http.StatusOK, map[string]any{"versionSerial": version.Serial})
 }
 
+// serveBatchPublish implements POST /messages (BO2, the batch publish
+// API; pinned by ably-js request_batch_api_success via rest.request):
+// one body {channels: [...], messages: <message|[]message>} publishes the
+// same messages to every channel; the 201 response is a flat array of
+// per-channel results. Per-channel partial failure reporting (HP4
+// batchResponse) follows the SKIPPED upstream test and is out of scope —
+// any invalid channel fails the whole batch.
+func (h *Handler) serveBatchPublish(rw http.ResponseWriter, r *http.Request) {
+	identity, authErr := h.authenticate(r)
+	if authErr != nil {
+		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxMessageSize+1))
+	if err != nil || len(body) > maxMessageSize {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid request body")
+		return
+	}
+	var req struct {
+		Channels []string        `json:"channels" msgpack:"channels"`
+		Messages json.RawMessage `json:"messages" msgpack:"messages"`
+	}
+	format := requestBodyFormat(r)
+	if format == protocol.FormatMsgpack {
+		// Normalize the envelope once: decode the msgpack body to the
+		// JSON-safe generic form so the per-channel re-decode below stays
+		// format-agnostic.
+		var generic map[string]any
+		if err := protocol.UnmarshalAny(body, format, &generic); err != nil {
+			h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body")
+			return
+		}
+		if body, err = json.Marshal(generic); err != nil {
+			h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "internal error")
+			return
+		}
+	}
+	if err := json.Unmarshal(body, &req); err != nil || len(req.Channels) == 0 {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body")
+		return
+	}
+	rawMessages := strings.TrimSpace(string(req.Messages))
+	if rawMessages == "" || rawMessages == "null" || rawMessages == "[]" {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body: no messages")
+		return
+	}
+	for _, channel := range req.Channels {
+		if !validChannelName(channel) {
+			h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidChannelName, "invalid channel name")
+			return
+		}
+		if !identity.capability.Allows(auth.OpPublish, channel) {
+			h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit publish")
+			return
+		}
+	}
+
+	results := make([]any, 0, len(req.Channels))
+	for _, channel := range req.Channels {
+		// FRESH decode per channel: the publish core stamps ids/serials in
+		// place, and every channel needs its own envelopes.
+		var messages []*protocol.Message
+		if err := json.Unmarshal(req.Messages, &messages); err != nil {
+			var single protocol.Message
+			if err := json.Unmarshal(req.Messages, &single); err != nil {
+				h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch messages")
+				return
+			}
+			messages = []*protocol.Message{&single}
+		}
+		idBase, err := newRESTIDBase()
+		if err != nil {
+			h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "internal error")
+			return
+		}
+		payloads, idemKeys, serials, problem := buildEnvelopes(messages, envelopeParams{
+			clientID:   identity.clientID,
+			mintSerial: func() string { return h.mint.Mint(channel) },
+			newID: func(idx int) string {
+				return fmt.Sprintf("%s:%d", idBase, idx)
+			},
+		})
+		if problem != nil {
+			h.writeError(rw, r, statusOf(problem), problem.code, problem.message)
+			return
+		}
+		for i, data := range payloads {
+			opts := publishOptions(channel, "", serials[i])
+			if idemKeys[i] != "" {
+				opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
+					centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
+			}
+			if _, err := h.node.Publish(channel, data, opts...); err != nil {
+				log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("batch publish failed")
+				h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "publish failed")
+				return
+			}
+		}
+		if mutableChannel(channel) {
+			for _, msg := range messages {
+				h.materialized.create(channel, msg)
+			}
+		}
+		results = append(results, map[string]any{"channel": channel, "messageId": idBase})
+	}
+	h.writeDocument(rw, r, http.StatusCreated, results)
+}
+
 func statusOf(p *publishProblem) int {
 	if p.statusCode == 0 {
 		return http.StatusBadRequest

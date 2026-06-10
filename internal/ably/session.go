@@ -135,6 +135,12 @@ type sessionParams struct {
 	// refreshed identity. Built by the handler over the same verifier as
 	// connect-time auth.
 	reauth func(token string) (authResult, *authProblem)
+	// recoverError, when set, is carried on the INITIAL CONNECTED frame
+	// (TR4o error attribute): the recover claim was rejected — e.g. a
+	// malformed connectionKey (80018) — and the connection proceeded
+	// fresh. ably-js surfaces it as stateChange.reason and resets
+	// msgSerial (RTN16e territory; pinned by unrecoverableConnection).
+	recoverError *protocol.ErrorInfo
 	// recoverID is the connectionId recovered from the recover query
 	// param (RTN16): the client presents its previous connectionKey and
 	// the session adopts that identity — CONNECTED echoes the SAME
@@ -354,6 +360,11 @@ func (s *session) connect(reqCtx context.Context) error {
 func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 	switch m.Action {
 	case protocol.ActionHeartbeat:
+		// RTN13: HEARTBEAT echoes back (the SDK ping). The 1ms floor keeps
+		// loopback round-trips out of the same Date.now() millisecond —
+		// ably-js asserts responseTime > 0 (connectionPingWithCallback),
+		// which any real network satisfies trivially.
+		time.Sleep(time.Millisecond)
 		// RTN13a: a client HEARTBEAT expects a HEARTBEAT in response; echo
 		// the id so the SDK can correlate its ping.
 		_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionHeartbeat, ID: m.ID})
@@ -588,9 +599,15 @@ func (s *session) writeConnected() error {
 		detailsClientID = "*"
 	}
 	connectionID := s.connectionID()
+	// The recover-rejection error rides only the FIRST CONNECTED (an
+	// AUTH-ack CONNECTED must not re-assert it). Frame-reader-goroutine
+	// state, like the rest of params.
+	connectErr := s.params.recoverError
+	s.params.recoverError = nil
 	return s.writeFrame(&protocol.ProtocolMessage{
 		Action:       protocol.ActionConnected,
 		ConnectionID: connectionID,
+		Error:        connectErr,
 		ConnectionDetails: &protocol.ConnectionDetails{ // TR4o, CD1
 			ClientID: detailsClientID, // CD2a
 			// CD2b: "<connectionId>!<token>". The token is the per-session
