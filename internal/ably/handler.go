@@ -37,13 +37,14 @@ const (
 // paths (/time, /channels/..., realtime WebSocket at /) which cannot be
 // prefixed.
 type Handler struct {
-	mint     *serialMint
-	node     *centrifuge.Node
-	config   configtypes.Ably
-	keys     *auth.KeyStore
-	upgrade  *websocket.Upgrader
-	nonces   *nonceCache
-	presence *presenceStore
+	mint         *serialMint
+	materialized *materializedStore
+	node         *centrifuge.Node
+	config       configtypes.Ably
+	keys         *auth.KeyStore
+	upgrade      *websocket.Upgrader
+	nonces       *nonceCache
+	presence     *presenceStore
 }
 
 // NewHandler creates new Handler. The adapter is unusable without API keys
@@ -62,13 +63,14 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 		upgrade.CheckOrigin = checkOrigin
 	}
 	h := &Handler{
-		mint:     newSerialMint(),
-		node:     n,
-		config:   c,
-		keys:     keys,
-		upgrade:  upgrade,
-		nonces:   newNonceCache(),
-		presence: newPresenceStore(),
+		mint:         newSerialMint(),
+		materialized: newMaterializedStore(),
+		node:         n,
+		config:       c,
+		keys:         keys,
+		upgrade:      upgrade,
+		nonces:       newNonceCache(),
+		presence:     newPresenceStore(),
 	}
 	if err := h.seedPresenceFixtures(c.KeysFile); err != nil {
 		return nil, err
@@ -259,7 +261,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		recoverID:        recoverID,                // RTN16d
 		tokenExpires:     identity.expires,         // RTN15-territory: 40142 disconnect at exp
 		reauth:           h.verifyTokenString,      // RTC8 AUTH frames
-	}, h.presence, h.mint)
+	}, h.presence, h.mint, h.materialized)
 	sess.run(r.Context())
 }
 

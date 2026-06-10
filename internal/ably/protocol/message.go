@@ -29,6 +29,34 @@ type Message struct {
 	// in M8 — the AIT ai transport/codec blocks.
 	Extras    any   `json:"extras,omitempty"    msgpack:"extras,omitempty"`
 	Timestamp int64 `json:"timestamp,omitempty" msgpack:"timestamp,omitempty"`
+	// Action is the TM5 wire enum: 0=message.create (omitted), 1=update,
+	// 2=delete, 3=meta, 4=summary, 5=append. Mutation ops and
+	// materialized reads carry it; creates omit it (SDKs default).
+	Action int `json:"action,omitempty" msgpack:"action,omitempty"`
+	// Version describes the operation that produced this state (TM2s):
+	// versionSerial plus the operator-supplied MessageOperation fields.
+	Version *MessageVersion `json:"version,omitempty" msgpack:"version,omitempty"`
+}
+
+// Message action wire values (TM5).
+const (
+	MessageActionCreate  = 0
+	MessageActionUpdate  = 1
+	MessageActionDelete  = 2
+	MessageActionMeta    = 3
+	MessageActionSummary = 4
+	MessageActionAppend  = 5
+)
+
+// MessageVersion is the TM2s version attribute: the serial of the
+// operation (versionSerial) and the MessageOperation the mutator
+// supplied.
+type MessageVersion struct {
+	Serial      string         `json:"serial,omitempty"      msgpack:"serial,omitempty"`
+	Timestamp   int64          `json:"timestamp,omitempty"   msgpack:"timestamp,omitempty"`
+	ClientID    string         `json:"clientId,omitempty"    msgpack:"clientId,omitempty"`
+	Description string         `json:"description,omitempty" msgpack:"description,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"    msgpack:"metadata,omitempty"`
 }
 
 // ChannelMessage is one atomic publish on a channel: a server-assigned

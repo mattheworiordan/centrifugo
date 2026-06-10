@@ -95,6 +95,7 @@ func TestMsgpackEncodersCoverEveryField(t *testing.T) {
 		"Message": {
 			"id", "serial", "clientId", "connectionId", "connectionKey",
 			"name", "data", "encoding", "extras", "timestamp",
+			"action", "version",
 		},
 		"PresenceMessage": {
 			"id", "action", "clientId", "connectionId",
@@ -123,6 +124,7 @@ func TestMsgpackEncodersCoverEveryField(t *testing.T) {
 		ID: "i", Serial: "s", ClientID: "c", ConnectionID: "co",
 		ConnectionKey: "k", Name: "n", Data: "d", Encoding: "e",
 		Extras: map[string]any{"x": 1}, Timestamp: 1,
+		Action: MessageActionUpdate, Version: &MessageVersion{Serial: "v"},
 	})
 	require.ElementsMatch(t, covered["Message"], mapKeys(fullMessage))
 	fullPresence := decodeMpMap(t, &PresenceMessage{

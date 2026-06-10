@@ -73,6 +73,12 @@ func (m *Message) EncodeMsgpack(enc *msgpack.Encoder) error {
 	if m.Timestamp != 0 {
 		fields = append(fields, mpField{"timestamp", m.Timestamp})
 	}
+	if m.Action != 0 {
+		fields = append(fields, mpField{"action", m.Action})
+	}
+	if m.Version != nil {
+		fields = append(fields, mpField{"version", m.Version})
+	}
 	return encodeMpFields(enc, fields)
 }
 

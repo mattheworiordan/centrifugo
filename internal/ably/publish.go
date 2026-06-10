@@ -161,6 +161,11 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, [
 		// to a ConnectionID by the REST surface before the core runs. It
 		// must never reach storage or subscribers.
 		msg.ConnectionKey = ""
+		// Creates are creates: action and version are server-assigned by
+		// the mutation surface — a client-supplied pair on a create would
+		// mint a message masquerading as an op.
+		msg.Action = protocol.MessageActionCreate
+		msg.Version = nil
 		if msg.Timestamp == 0 {
 			// Stamp the server receipt time. SDKs never send a timestamp
 			// on publish (they back-fill from the enclosing frame per

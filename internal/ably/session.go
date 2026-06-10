@@ -51,6 +51,7 @@ import (
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
+	"github.com/centrifugal/centrifugo/v6/internal/ably/serial"
 	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 
 	"github.com/centrifugal/centrifuge"
@@ -179,14 +180,20 @@ type pendingOp struct {
 	// client claims prior attachment; ATTACHED grants RESUMED on the
 	// claim (RTN16-lite, unverified — see attach).
 	claimResume bool
+	// rewindSpec, when non-empty, requests a MATERIALIZED rewind on a
+	// mutableMessages channel: the backlog is the latest materialized
+	// state, never the raw op stream (rewind=1 after create+append must
+	// deliver ONE concatenated message — the ably-js append pin).
+	rewindSpec string
 }
 
 type session struct {
-	node     *centrifuge.Node
-	mint     *serialMint
-	conn     *websocket.Conn
-	params   sessionParams
-	presence *presenceStore
+	node         *centrifuge.Node
+	mint         *serialMint
+	materialized *materializedStore
+	conn         *websocket.Conn
+	params       sessionParams
+	presence     *presenceStore
 
 	// writeMu serializes WS writes: the reader loop, the heartbeat ticker,
 	// the centrifuge Client writer (via transport → handleReply) and the
@@ -224,10 +231,11 @@ type session struct {
 	closeCh    chan struct{} // closed on teardown: stops the heartbeat ticker and cancels the client context
 }
 
-func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore, mint *serialMint) *session {
+func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore, mint *serialMint, materialized *materializedStore) *session {
 	return &session{
 		node:          node,
 		mint:          mint,
+		materialized:  materialized,
 		conn:          conn,
 		params:        params,
 		presence:      presence,
@@ -419,6 +427,13 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "publish failed: channel mode does not permit publish")
 		return
 	}
+	// RTL32: a message presenting a serial and a mutation action is an op
+	// on an existing message, not a create.
+	if len(m.Messages) == 1 && m.Messages[0] != nil &&
+		m.Messages[0].Serial != "" && m.Messages[0].Action != protocol.MessageActionCreate {
+		s.mutateMessage(m)
+		return
+	}
 
 	connectionID := s.connectionID()
 
@@ -471,16 +486,67 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		}
 	}
 	if mutableChannel(m.Channel) {
-		// TR4s: mutableMessages publishes acknowledge with the assigned
-		// message serials.
+		// The create registers materialized state (mutation ops and
+		// materialized reads key off it), and the ACK carries the
+		// assigned message serials (TR4s).
 		msgSerials := make([]string, len(m.Messages))
 		for i, msg := range m.Messages {
 			msgSerials[i] = msg.Serial
+			s.materialized.create(m.Channel, msg)
 		}
 		s.writeAckRes(m.MsgSerial, msgSerials)
 		return
 	}
 	s.writeAck(m.MsgSerial)
+}
+
+// errCodeMutableRequired (93002, registry-verified): mutation ops are
+// only legal on channels with the mutableMessages rule.
+const errCodeMutableRequired = 93002
+
+// mutateMessage serves a realtime mutation frame (RTL32): update (1),
+// delete (2) or append (5) by serial. The op applies to the materialized
+// state, fans out as an op message carrying the original serial and an
+// operation version, and ACKs with res serials[0] = versionSerial.
+func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
+	msg := m.Messages[0]
+	if !mutableChannel(m.Channel) {
+		s.writeNack(m.MsgSerial, errCodeMutableRequired, 400, "mutation failed: this operation can only be performed on a channel with mutable messages enabled")
+		return
+	}
+	// The mutator supplies the MessageOperation in version; the server
+	// assigns the versionSerial and timestamp (TM2s).
+	version := msg.Version
+	if version == nil {
+		version = &protocol.MessageVersion{}
+	}
+	version.Serial = s.mint.Mint(m.Channel)
+	version.Timestamp = time.Now().UnixMilli()
+
+	// Binary deltas normalize like creates (canonical JSON-safe envelope).
+	normalizeMessageData(msg)
+
+	op, prob := s.materialized.mutate(m.Channel, msg.Serial, msg.Action, msg.Data, msg.Encoding, msg.Extras, version)
+	if prob != nil {
+		s.writeNack(m.MsgSerial, prob.code, prob.statusCode, "mutation failed: "+prob.message)
+		return
+	}
+	op.ID = fmt.Sprintf("%s:%d:0", s.connectionID(), m.MsgSerial)
+	data, err := json.Marshal(op)
+	if err != nil {
+		s.writeNack(m.MsgSerial, errCodeInternal, 500, "mutation failed")
+		return
+	}
+	// The op rides the live channel like any publication — tagged with
+	// its versionSerial (it advances the channel position) and the
+	// publisher origin (echo=false suppression applies).
+	if _, err := s.node.Publish(m.Channel, data, publishOptions(m.Channel, s.connectionID(), version.Serial)...); err != nil {
+		log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("mutation publish failed")
+		s.writeNack(m.MsgSerial, errCodeInternal, 500, "mutation failed")
+		return
+	}
+	// TR4s: the mutation ACK returns the versionSerial.
+	s.writeAckRes(m.MsgSerial, []string{version.Serial})
 }
 
 // ackFrame is the ACK/NACK wire shape. Unlike ProtocolMessage, msgSerial
@@ -950,8 +1016,23 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	s.modesMu.Unlock()
 	if alreadyAttached {
 		// Options update on a live attachment: continuity was never broken,
-		// which RTL12 semantics signal with RESUMED.
-		s.writeAttached(channel, m.Params, modesFromAttach(m), protocol.FlagResumed)
+		// which RTL12 semantics signal with RESUMED. A rewind param
+		// arriving via setOptions on a MUTABLE channel still serves the
+		// materialized backlog (ably-js applies setOptions({rewind})
+		// through this re-attach — the append pin's second phase).
+		extra := protocol.FlagResumed
+		var backlog []protocol.Message
+		if mutableChannel(channel) && m.Params["rewind"] != "" &&
+			m.ChannelSerial == "" && m.Flags&protocol.FlagAttachResume == 0 {
+			backlog = s.materializedRewind(channel, m.Params["rewind"])
+			if len(backlog) > 0 {
+				extra |= protocol.FlagHasBacklog
+			}
+		}
+		s.writeAttached(channel, m.Params, modesFromAttach(m), extra)
+		for i := range backlog {
+			s.deliverMaterialized(channel, &backlog[i])
+		}
 		return
 	}
 	sub := &cproto.SubscribeRequest{Channel: channel}
@@ -963,6 +1044,7 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	// attaches fresh (no RESUMED flag = discontinuity, the Ably signal).
 	resuming := false
 	rewinding := false
+	rewindSpec := ""
 	// RTN16-lite: an ATTACH carrying ATTACH_RESUME — or any cursor-less
 	// ATTACH on a RECOVERED connection (ably-js re-attaches recovered
 	// channels bare when they had no channelSerial; real Ably derives
@@ -991,10 +1073,14 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	case m.Params["rewind"] != "" && m.Flags&protocol.FlagAttachResume == 0 && s.params.recoverID == "":
 		// RTL2i: rewind replays a backlog of retained messages on a FRESH
 		// attach only — an ATTACH_RESUME attach (or one presenting a
-		// cursor, above) suppresses it (pinned by resume_rewind_1). The
-		// replay rides the same broker recovery, atomic with the
-		// subscription.
-		if pos, ok := s.rewindPosition(channel, m.Params["rewind"]); ok {
+		// cursor, above) suppresses it (pinned by resume_rewind_1).
+		if mutableChannel(channel) {
+			// Mutable channels rewind MATERIALIZED state (handled in the
+			// subscribe reply), not the raw op stream.
+			rewindSpec = m.Params["rewind"]
+		} else if pos, ok := s.rewindPosition(channel, m.Params["rewind"]); ok {
+			// Ordinary channels ride broker recovery, atomic with the
+			// subscription.
 			sub.Recover = true
 			sub.Recoverable = true
 			sub.Offset = pos.Offset
@@ -1032,6 +1118,7 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 			resuming:    resuming,
 			rewinding:   rewinding,
 			claimResume: claimResume,
+			rewindSpec:  rewindSpec,
 		}),
 		Subscribe: sub,
 	}
@@ -1179,6 +1266,13 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			// (RTL2i; never RESUMED — rewind is a fresh attach).
 			var extraFlags int64
 			var replay []*cproto.Publication
+			var materialized []protocol.Message
+			if op.rewindSpec != "" {
+				materialized = s.materializedRewind(op.channel, op.rewindSpec)
+				if len(materialized) > 0 {
+					extraFlags |= protocol.FlagHasBacklog
+				}
+			}
 			if op.claimResume {
 				extraFlags |= protocol.FlagResumed
 			}
@@ -1197,6 +1291,9 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			s.writeAttached(op.channel, op.params, op.modes, extraFlags)
 			for _, pub := range replay {
 				s.deliverPublication(op.channel, pub)
+			}
+			for i := range materialized {
+				s.deliverMaterialized(op.channel, &materialized[i])
 			}
 		case opUnsubscribe:
 			// RTL5d: confirm with DETACHED. Centrifuge unsubscribe is
@@ -1285,6 +1382,45 @@ func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
 		Channel:       channel,
 		ChannelSerial: pub.Tags[pubTagSerial], // RTL15b: SDKs track this as channel.properties.channelSerial
 		Messages:      []*protocol.Message{&msg},
+		Timestamp:     time.Now().UnixMilli(),
+	})
+}
+
+// materializedRewind resolves a mutable-channel rewind spec against the
+// materialized store: "N" = the last N messages, a duration = the
+// trailing window by create-anchored timestamp (AIT attaches with
+// rewind='2m').
+func (s *session) materializedRewind(channel, spec string) []protocol.Message {
+	if n, err := strconv.Atoi(spec); err == nil {
+		return s.materialized.latest(channel, n)
+	}
+	if d, err := time.ParseDuration(spec); err == nil && d > 0 {
+		return s.materialized.latestWindow(channel, time.Now().Add(-d).UnixMilli())
+	}
+	return nil
+}
+
+// deliverMaterialized writes one materialized message as a MESSAGE frame
+// — the mutable-channel rewind backlog. The frame channelSerial is the
+// message's latest position: the last operation's versionSerial, or the
+// create position for never-mutated messages — both are publication tag
+// values a future resume cursor can resolve.
+func (s *session) deliverMaterialized(channel string, msg *protocol.Message) {
+	cursor := ""
+	if msg.Version != nil && msg.Version.Serial != "" {
+		cursor = msg.Version.Serial
+	} else if cs, _, err := serial.ParseMessageSerial(msg.Serial); err == nil {
+		cursor = cs
+	}
+	out := *msg
+	if s.params.format == protocol.FormatMsgpack {
+		denormalizeMessageData(&out)
+	}
+	_ = s.writeFrame(&protocol.ProtocolMessage{
+		Action:        protocol.ActionMessage,
+		Channel:       channel,
+		ChannelSerial: cursor,
+		Messages:      []*protocol.Message{&out},
 		Timestamp:     time.Now().UnixMilli(),
 	})
 }

@@ -242,10 +242,12 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 	// the body and AIT requires serials[0].
 	if mutableChannel(channel) {
 		// The MESSAGE serials ("<channelSerial>:<idx>"), matching the
-		// realtime ACK res — the identity mutation ops key off.
+		// realtime ACK res — the identity mutation ops key off. Creates
+		// register materialized state.
 		msgSerials := make([]string, len(messages))
 		for i, msg := range messages {
 			msgSerials[i] = msg.Serial
+			h.materialized.create(channel, msg)
 		}
 		h.writeDocument(rw, r, http.StatusCreated, map[string]any{"serials": msgSerials})
 		return
