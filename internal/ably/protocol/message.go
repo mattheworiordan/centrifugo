@@ -124,6 +124,17 @@ const (
 	// FlagHasPresence indicates the channel has members present at attach
 	// time: the client should expect a SYNC to follow (RTL4c1-adjacent).
 	FlagHasPresence int64 = 1 << 0
+	// FlagTransient marks an ATTACH that should not be resumed on
+	// failure (TR3).
+	FlagTransient int64 = 1 << 4
+	// Channel mode flags (TR3, bits 16-19): an ATTACH carrying any mode
+	// bits requests a restricted attachment; ATTACHED echoes the granted
+	// modes.
+	FlagModePresence          int64 = 1 << 16
+	FlagModePublish           int64 = 1 << 17
+	FlagModeSubscribe         int64 = 1 << 18
+	FlagModePresenceSubscribe int64 = 1 << 19
+	FlagModeAnnotationPublish int64 = 1 << 21
 	// FlagResumed indicates the channel state was resumed from the
 	// client's supplied channelSerial: the gap between the client's
 	// cursor and the live tail was replayed in full. Cleared when the

@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -144,6 +145,10 @@ const (
 type pendingOp struct {
 	kind    opKind
 	channel string
+	// params/modes carry the ATTACH request context to the ATTACHED reply
+	// (RTL4k params echo; RTL4m mode grant).
+	params map[string]string
+	modes  int64
 }
 
 type session struct {
@@ -166,6 +171,13 @@ type session struct {
 
 	connected chan error // signalled exactly once by the centrifuge connect reply
 
+	// modesMu guards attachedModes: granted mode bits per attached channel
+	// (0 = unrestricted). Written by the reader loop (attach/detach
+	// replies arrive via the centrifuge writer goroutine), read at
+	// enforcement points on both goroutines.
+	modesMu       sync.Mutex
+	attachedModes map[string]int64
+
 	closeMu sync.Mutex
 	closed  bool
 	// cleanClose marks a client-initiated CLOSE (RTN12a): presence leaves
@@ -176,13 +188,14 @@ type session struct {
 
 func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore) *session {
 	return &session{
-		node:      node,
-		conn:      conn,
-		params:    params,
-		presence:  presence,
-		pending:   make(map[uint32]pendingOp),
-		connected: make(chan error, 1),
-		closeCh:   make(chan struct{}),
+		node:          node,
+		conn:          conn,
+		params:        params,
+		presence:      presence,
+		pending:       make(map[uint32]pendingOp),
+		attachedModes: make(map[string]int64),
+		connected:     make(chan error, 1),
+		closeCh:       make(chan struct{}),
 	}
 }
 
@@ -319,7 +332,7 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 	case protocol.ActionAttach:
 		// RTL4c: ATTACH is confirmed by ATTACHED once the synthesized
 		// centrifuge Subscribe succeeds (reply mapped in handleReply).
-		s.attach(m.Channel)
+		s.attach(m)
 		return true
 	case protocol.ActionDetach:
 		// RTL5d: DETACH is confirmed by DETACHED via the synthesized
@@ -372,6 +385,13 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// Publishing requires the publish operation on the channel (40160).
 	if !s.params.capability.Allows(auth.OpPublish, m.Channel) {
 		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "publish failed: capability does not permit publish")
+		return
+	}
+	// RTL4m enforcement: an attachment restricted to modes lacking publish
+	// rejects publishes with 40160. An unattached channel (modes==0) is a
+	// transient publish, unrestricted by modes.
+	if !modeAllows(s.channelModes(m.Channel), protocol.FlagModePublish) {
+		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "publish failed: channel mode does not permit publish")
 		return
 	}
 
@@ -470,7 +490,131 @@ func (s *session) writeNack(msgSerial int64, code int, statusCode int, message s
 	})
 }
 
-func (s *session) attach(channel string) {
+// defaultChannelModes is the mode set granted to an attach that requests
+// no restriction — real Ably always carries mode bits on ATTACHED, and a
+// default attachment gets this full set (pinned by ably-js
+// attachWithInvalidChannelParams: a plain attach yields channel.modes ==
+// ['presence','publish','subscribe','presence_subscribe','annotation_publish']).
+const defaultChannelModes = protocol.FlagModePresence | protocol.FlagModePublish |
+	protocol.FlagModeSubscribe | protocol.FlagModePresenceSubscribe |
+	protocol.FlagModeAnnotationPublish
+
+// recognizedChannelParams is the set of channel params echoed back on
+// ATTACHED — unrecognized params are dropped, not echoed verbatim (pinned
+// by ably-js attachWithInvalidChannelParams: params {nonexistent:'foo'}
+// yields channel.params == {}).
+var recognizedChannelParams = map[string]bool{
+	"modes":     true,
+	"delta":     true,
+	"rewind":    true,
+	"occupancy": true,
+}
+
+// filterChannelParams returns only the recognized params (nil when none
+// survive, so omitempty drops the attribute and SDKs see params {}).
+func filterChannelParams(params map[string]string) map[string]string {
+	var out map[string]string
+	for k, v := range params {
+		if recognizedChannelParams[k] {
+			if out == nil {
+				out = make(map[string]string, len(params))
+			}
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// modesFromAttach derives the requested mode bits from an ATTACH frame:
+// either the params "modes" comma-list (RTL4k, channelOptions.params
+// form) or the mode flag bits (TR3, channelOptions.modes form). When both
+// are present params.modes wins outright — NOT a union (pinned by ably-js
+// attachWithChannelParamsModesAndChannelModes: "modes is ignored when
+// params.modes is present"). Zero means unrestricted.
+func modesFromAttach(m *protocol.ProtocolMessage) int64 {
+	if raw, ok := m.Params["modes"]; ok {
+		var modes int64
+		for _, name := range strings.Split(raw, ",") {
+			switch strings.ToLower(strings.TrimSpace(name)) {
+			case "presence":
+				modes |= protocol.FlagModePresence
+			case "publish":
+				modes |= protocol.FlagModePublish
+			case "subscribe":
+				modes |= protocol.FlagModeSubscribe
+			case "presence_subscribe":
+				modes |= protocol.FlagModePresenceSubscribe
+			}
+		}
+		return modes
+	}
+	return m.Flags & (protocol.FlagModePresence | protocol.FlagModePublish |
+		protocol.FlagModeSubscribe | protocol.FlagModePresenceSubscribe)
+}
+
+// channelModes returns the granted mode bits for a channel (0 =
+// unrestricted or not attached).
+func (s *session) channelModes(channel string) int64 {
+	s.modesMu.Lock()
+	defer s.modesMu.Unlock()
+	return s.attachedModes[channel]
+}
+
+// modeAllows reports whether the attachment's modes permit the ability —
+// unrestricted attachments (and unattached channels: transient publish)
+// permit everything.
+func modeAllows(modes int64, ability int64) bool {
+	return modes == 0 || modes&ability != 0
+}
+
+// writeAttached records the attachment grant and confirms it on the wire:
+// ATTACHED echoing the recognized params (RTL4k1) and the granted mode bits
+// (RTL4m), HAS_PRESENCE + a single-page SYNC when members exist (RTP18-lite
+// — members delivered as PRESENT; no channelSerial cursor means ably-js
+// setPresence completes the sync on this frame). Called from the
+// opSubscribe reply (fresh attach, centrifuge reply goroutine) and from
+// the re-attach update path (frame-reader goroutine).
+func (s *session) writeAttached(channel string, params map[string]string, modes int64) {
+	// An unrestricted request is granted the full default mode set —
+	// ATTACHED always carries mode bits.
+	if modes == 0 {
+		modes = defaultChannelModes
+	}
+	var members []*protocol.PresenceMessage
+	if modeAllows(modes, protocol.FlagModePresenceSubscribe) {
+		members = s.presence.members(channel)
+	}
+	var flags int64
+	if len(members) > 0 {
+		flags |= protocol.FlagHasPresence
+	}
+	flags |= modes
+	s.modesMu.Lock()
+	s.attachedModes[channel] = modes
+	s.modesMu.Unlock()
+	_ = s.writeFrame(&protocol.ProtocolMessage{
+		Action:  protocol.ActionAttached,
+		Channel: channel,
+		Flags:   flags,
+		Params:  filterChannelParams(params),
+	})
+	if len(members) > 0 {
+		snapshot := make([]*protocol.PresenceMessage, 0, len(members))
+		for _, m := range members {
+			present := *m
+			present.Action = protocol.PresencePresent
+			snapshot = append(snapshot, &present)
+		}
+		_ = s.writeFrame(&protocol.ProtocolMessage{
+			Action:   protocol.ActionSync,
+			Channel:  channel,
+			Presence: snapshot,
+		})
+	}
+}
+
+func (s *session) attach(m *protocol.ProtocolMessage) {
+	channel := m.Channel
 	// Channel-name validation (validChannelName, publish.go), failing the
 	// CHANNEL — never the connection (pinned by ably-js
 	// channelattachempty/channelattachinvalid, RTL4d territory): code
@@ -489,6 +633,18 @@ func (s *session) attach(channel string) {
 	// permitted with provided capability), never the connection.
 	if !s.params.capability.Allows(auth.OpSubscribe, channel) {
 		s.writeChannelError(channel, errCodeOperationNotPermitted, 401, "capability does not permit subscribe")
+		return
+	}
+	// An ATTACH for an already-attached channel is an options update
+	// (RTL4h territory: ably-js setOptions re-attaches to renegotiate
+	// params/modes and resolves on the fresh ATTACHED). The centrifuge
+	// subscription already exists — and re-subscribing would be rejected
+	// as a duplicate — so the new grant is confirmed directly.
+	s.modesMu.Lock()
+	_, alreadyAttached := s.attachedModes[channel]
+	s.modesMu.Unlock()
+	if alreadyAttached {
+		s.writeAttached(channel, m.Params, modesFromAttach(m))
 		return
 	}
 	sub := &cproto.SubscribeRequest{Channel: channel}
@@ -514,7 +670,12 @@ func (s *session) attach(channel string) {
 		sub.Tf = &cproto.FilterNode{Cmp: "neq", Key: pubTagOrigin, Val: s.client.ID()}
 	}
 	cmd := &cproto.Command{
-		Id:        s.addPending(pendingOp{kind: opSubscribe, channel: channel}),
+		Id: s.addPending(pendingOp{
+			kind:    opSubscribe,
+			channel: channel,
+			params:  m.Params,
+			modes:   modesFromAttach(m),
+		}),
 		Subscribe: sub,
 	}
 	if !s.client.HandleCommand(cmd, cmd.SizeVT()) {
@@ -551,6 +712,11 @@ func (s *session) handlePresence(m *protocol.ProtocolMessage) {
 	// Presence requires the presence operation on the channel (40160).
 	if !s.params.capability.Allows(auth.OpPresence, m.Channel) {
 		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "presence failed: capability does not permit presence")
+		return
+	}
+	// RTL4m enforcement: presence operations need the presence mode.
+	if !modeAllows(s.channelModes(m.Channel), protocol.FlagModePresence) {
+		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "presence failed: channel mode does not permit presence")
 		return
 	}
 	connectionID := s.client.ID()
@@ -646,30 +812,7 @@ func (s *session) handleReply(reply *cproto.Reply) {
 				s.writeAttachError(op.channel, reply.Error)
 				return
 			}
-			// RTL4c: the confirmation ATTACHED carries the channel; the
-			// HAS_PRESENCE flag tells the client a SYNC follows.
-			members := s.presence.members(op.channel)
-			var flags int64
-			if len(members) > 0 {
-				flags |= protocol.FlagHasPresence
-			}
-			_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionAttached, Channel: op.channel, Flags: flags})
-			if len(members) > 0 {
-				// RTP18-lite single-page SYNC: members delivered as PRESENT;
-				// no channelSerial means the sync completes with this frame
-				// (ably-js setPresence ends the sync when no cursor is set).
-				snapshot := make([]*protocol.PresenceMessage, 0, len(members))
-				for _, m := range members {
-					present := *m
-					present.Action = protocol.PresencePresent
-					snapshot = append(snapshot, &present)
-				}
-				_ = s.writeFrame(&protocol.ProtocolMessage{
-					Action:   protocol.ActionSync,
-					Channel:  op.channel,
-					Presence: snapshot,
-				})
-			}
+			s.writeAttached(op.channel, op.params, op.modes)
 		case opUnsubscribe:
 			// RTL5d: confirm with DETACHED. Centrifuge unsubscribe is
 			// idempotent, so detaching a never-attached channel still
@@ -678,6 +821,9 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			if reply.Error != nil {
 				log.Warn().Str("channel", op.channel).Uint32("code", reply.Error.Code).Str("transport", transportName).Msg("unsubscribe error")
 			}
+			s.modesMu.Lock()
+			delete(s.attachedModes, op.channel)
+			s.modesMu.Unlock()
 			_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionDetached, Channel: op.channel})
 		}
 		return
@@ -712,6 +858,11 @@ func (s *session) handleReply(reply *cproto.Reply) {
 // session.
 func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
 	if pub.Tags[pubTagKind] == pubTagKindPresence {
+		// RTL4m: an attachment restricted to modes lacking
+		// presence_subscribe does not receive presence events.
+		if !modeAllows(s.channelModes(channel), protocol.FlagModePresenceSubscribe) {
+			return
+		}
 		var pm protocol.PresenceMessage
 		if err := json.Unmarshal(pub.Data, &pm); err != nil {
 			log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("dropping presence publication with undecodable payload")
@@ -723,6 +874,11 @@ func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
 			Presence:  []*protocol.PresenceMessage{&pm},
 			Timestamp: time.Now().UnixMilli(),
 		})
+		return
+	}
+	// RTL4m: an attachment restricted to modes lacking subscribe does not
+	// receive messages.
+	if !modeAllows(s.channelModes(channel), protocol.FlagModeSubscribe) {
 		return
 	}
 	var msg protocol.Message
