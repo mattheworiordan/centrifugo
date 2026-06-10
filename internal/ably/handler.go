@@ -7,7 +7,6 @@
 package ably
 
 import (
-	"encoding/binary"
 	"errors"
 	"net/http"
 	"strconv"
@@ -86,12 +85,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
-	// RTN2a: the format param selects the wire encoding. This milestone
-	// serves json only — msgpack framing lands in M2 — so anything else is
-	// rejected before the upgrade with a clear error.
+	// RTN2a: the format param selects the wire encoding — msgpack or json
+	// (absent defaults to json: SDKs always send the param when they want
+	// the binary protocol). Unknown formats are rejected before the
+	// upgrade with a clear error.
 	format, err := protocol.FormatFromQuery(q.Get("format"))
-	if err != nil || format != protocol.FormatJSON {
-		h.writeError(rw, r, http.StatusBadRequest, 40000, "unsupported format: the adapter currently serves json only")
+	if err != nil {
+		h.writeError(rw, r, http.StatusBadRequest, 40000, "unsupported format: the adapter serves json and msgpack")
 		return
 	}
 
@@ -125,7 +125,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		if errors.Is(authErr, auth.ErrNoCredentials) {
 			message = "no credentials presented"
 		}
-		writeConnectionError(conn, errCodeInvalidCredentials, http.StatusUnauthorized, message)
+		writeConnectionError(conn, format, errCodeInvalidCredentials, http.StatusUnauthorized, message)
 		_ = conn.Close()
 		return
 	}
@@ -136,7 +136,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 	if clientID == "*" {
 		// RSA7c: the literal '*' clientId value is reserved (it denotes the
 		// wildcard identity) and cannot be assumed by a connection.
-		writeConnectionError(conn, errCodeInvalidClientID, http.StatusBadRequest, "invalid clientId: the wildcard value '*' is reserved")
+		writeConnectionError(conn, format, errCodeInvalidClientID, http.StatusBadRequest, "invalid clientId: the wildcard value '*' is reserved")
 		_ = conn.Close()
 		return
 	}
@@ -150,6 +150,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		clientID:        clientID,
 		echo:            q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
 		protocolVersion: q.Get("v"),               // RTN2f
+		format:          format,                   // RTN2a
 	})
 	sess.run(r.Context())
 }
@@ -157,8 +158,10 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 // writeConnectionError fails a connection in-band before any session
 // exists: an ERROR ProtocolMessage with an empty channel attribute
 // (RTN14a/RTN14g — the client transitions to FAILED and the server
-// terminates the connection afterwards).
-func writeConnectionError(conn *websocket.Conn, code int, statusCode int, message string) {
+// terminates the connection afterwards). The frame is encoded in the
+// format the client requested (RTN2a) — an SDK on the binary protocol
+// does not decode JSON error frames.
+func writeConnectionError(conn *websocket.Conn, format protocol.Format, code int, statusCode int, message string) {
 	frame := &protocol.ProtocolMessage{
 		Action: protocol.ActionError,
 		Error: &protocol.ErrorInfo{
@@ -167,12 +170,16 @@ func writeConnectionError(conn *websocket.Conn, code int, statusCode int, messag
 			Message:    message,
 		},
 	}
-	data, err := protocol.Marshal(frame, protocol.FormatJSON)
+	data, err := protocol.Marshal(frame, format)
 	if err != nil {
 		return
 	}
+	messageType := websocket.TextMessage
+	if format == protocol.FormatMsgpack {
+		messageType = websocket.BinaryMessage
+	}
 	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	_ = conn.WriteMessage(websocket.TextMessage, data)
+	_ = conn.WriteMessage(messageType, data)
 }
 
 // serveTime implements GET /time (RSC16): the service time as a JSON/MsgPack
@@ -180,11 +187,11 @@ func writeConnectionError(conn *websocket.Conn, code int, statusCode int, messag
 func (h *Handler) serveTime(rw http.ResponseWriter, r *http.Request) {
 	now := time.Now().UnixMilli()
 	if responseFormat(r) == formatMsgPack {
-		// Minimal hand-rolled encoding of [int64]: fixarray(1) + int64. The
-		// full MsgPack codec replaces this in M2.
-		body := make([]byte, 0, 10)
-		body = append(body, 0x91, 0xd3)
-		body = binary.BigEndian.AppendUint64(body, uint64(now))
+		body, err := protocol.MarshalAny([]int64{now}, protocol.FormatMsgpack)
+		if err != nil {
+			h.writeError(rw, r, http.StatusInternalServerError, 50000, "failed to encode time")
+			return
+		}
 		rw.Header().Set("Content-Type", contentTypeMsgPack)
 		_, _ = rw.Write(body)
 		return

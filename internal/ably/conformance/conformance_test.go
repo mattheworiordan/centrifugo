@@ -9,6 +9,7 @@ package conformance
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net"
 	"net/url"
@@ -68,6 +69,24 @@ func newRealtime(t *testing.T, opts ...ably.ClientOption) *ably.Realtime {
 	return client
 }
 
+// forBothProtocols runs the test body once per wire format — every
+// conformance mirror must pass in both encodings (the M2 acceptance bar).
+// The body receives the protocol name (for channel-name isolation between
+// variants) and the client option selecting it; options passed to
+// newRealtime after the defaults override them, so the JSON default in
+// newRealtime is replaced per-variant.
+func forBothProtocols(t *testing.T, body func(t *testing.T, proto string, protoOpt ably.ClientOption)) {
+	t.Helper()
+	for _, variant := range []struct {
+		name   string
+		binary bool
+	}{{"json", false}, {"msgpack", true}} {
+		t.Run(variant.name, func(t *testing.T) {
+			body(t, variant.name, ably.WithUseBinaryProtocol(variant.binary))
+		})
+	}
+}
+
 func connect(t *testing.T, client *ably.Realtime) {
 	t.Helper()
 	connected := make(chan struct{})
@@ -121,22 +140,25 @@ func waitMessage(t *testing.T, who string, ch <-chan *ably.Message) *ably.Messag
 // publish is transient (RTL6c1), and the delivered message must carry the
 // server-built envelope (id, connectionId per TM2c, timestamp per TM2f).
 func TestPublishSingle_mirrors_publishonce_RTL6(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	forBothProtocols(t, func(t *testing.T, proto string, protoOpt ably.ClientOption) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	subscriber := newRealtime(t)
-	publisher := newRealtime(t)
-	received := subscribeAll(t, ctx, subscriber, "conformance-publishonce")
+		subscriber := newRealtime(t, protoOpt)
+		publisher := newRealtime(t, protoOpt)
+		channel := "conformance-publishonce-" + proto
+		received := subscribeAll(t, ctx, subscriber, channel)
 
-	require.NoError(t, publisher.Channels.Get("conformance-publishonce").
-		Publish(ctx, "greeting", "hello-conformance")) // returns after ACK (RTN7a)
+		require.NoError(t, publisher.Channels.Get(channel).
+			Publish(ctx, "greeting", "hello-conformance")) // returns after ACK (RTN7a)
 
-	msg := waitMessage(t, "subscriber (fan-out)", received)
-	require.Equal(t, "greeting", msg.Name)
-	require.Equal(t, "hello-conformance", msg.Data)
-	require.NotEmpty(t, msg.ID)                                      // TM2a
-	require.Equal(t, publisher.Connection.ID(), msg.ConnectionID)    // TM2c
-	require.InDelta(t, time.Now().UnixMilli(), msg.Timestamp, 60000) // TM2f
+		msg := waitMessage(t, "subscriber (fan-out)", received)
+		require.Equal(t, "greeting", msg.Name)
+		require.Equal(t, "hello-conformance", msg.Data)
+		require.NotEmpty(t, msg.ID)                                      // TM2a
+		require.Equal(t, publisher.Connection.ID(), msg.ConnectionID)    // TM2c
+		require.InDelta(t, time.Now().UnixMilli(), msg.Timestamp, 60000) // TM2f
+	})
 }
 
 // TestPublishEcho_mirrors_publishEcho_RTC1a mirrors the echoMessages=true
@@ -145,19 +167,22 @@ func TestPublishSingle_mirrors_publishonce_RTL6(t *testing.T) {
 // subscription. The echoMessages=false half is
 // TestPublishNoEcho_mirrors_publishEcho_RTL7f.
 func TestPublishEcho_mirrors_publishEcho_RTC1a(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	forBothProtocols(t, func(t *testing.T, proto string, protoOpt ably.ClientOption) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	publisher := newRealtime(t)
-	received := subscribeAll(t, ctx, publisher, "conformance-publishecho")
+		publisher := newRealtime(t, protoOpt)
+		channel := "conformance-publishecho-" + proto
+		received := subscribeAll(t, ctx, publisher, channel)
 
-	require.NoError(t, publisher.Channels.Get("conformance-publishecho").
-		Publish(ctx, "greeting", "hello-echo"))
+		require.NoError(t, publisher.Channels.Get(channel).
+			Publish(ctx, "greeting", "hello-echo"))
 
-	msg := waitMessage(t, "publisher (echo)", received)
-	require.Equal(t, "greeting", msg.Name)
-	require.Equal(t, "hello-echo", msg.Data)
-	require.Equal(t, publisher.Connection.ID(), msg.ConnectionID)
+		msg := waitMessage(t, "publisher (echo)", received)
+		require.Equal(t, "greeting", msg.Name)
+		require.Equal(t, "hello-echo", msg.Data)
+		require.Equal(t, publisher.Connection.ID(), msg.ConnectionID)
+	})
 }
 
 // TestPublishNoEcho_mirrors_publishEcho_RTL7f mirrors the
@@ -170,30 +195,33 @@ func TestPublishEcho_mirrors_publishEcho_RTC1a(t *testing.T) {
 // publish order, so the suppressed echo, were it delivered, would arrive at
 // the publisher before the marker.
 func TestPublishNoEcho_mirrors_publishEcho_RTL7f(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	forBothProtocols(t, func(t *testing.T, proto string, protoOpt ably.ClientOption) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
 
-	publisher := newRealtime(t, ably.WithEchoMessages(false))
-	subscriber := newRealtime(t)
-	publisherReceived := subscribeAll(t, ctx, publisher, "conformance-publishnoecho")
-	subscriberReceived := subscribeAll(t, ctx, subscriber, "conformance-publishnoecho")
+		publisher := newRealtime(t, protoOpt, ably.WithEchoMessages(false))
+		subscriber := newRealtime(t, protoOpt)
+		channel := "conformance-publishnoecho-" + proto
+		publisherReceived := subscribeAll(t, ctx, publisher, channel)
+		subscriberReceived := subscribeAll(t, ctx, subscriber, channel)
 
-	require.NoError(t, publisher.Channels.Get("conformance-publishnoecho").
-		Publish(ctx, "greeting", "hello-noecho"))
+		require.NoError(t, publisher.Channels.Get(channel).
+			Publish(ctx, "greeting", "hello-noecho"))
 
-	msg := waitMessage(t, "subscriber (fan-out)", subscriberReceived)
-	require.Equal(t, "greeting", msg.Name)
-	require.Equal(t, "hello-noecho", msg.Data)
+		msg := waitMessage(t, "subscriber (fan-out)", subscriberReceived)
+		require.Equal(t, "greeting", msg.Name)
+		require.Equal(t, "hello-noecho", msg.Data)
 
-	// Marker: the subscriber publishes a follow-up. The publisher's FIRST
-	// received message must be the marker — its own message was never
-	// echoed.
-	require.NoError(t, subscriber.Channels.Get("conformance-publishnoecho").
-		Publish(ctx, "marker", "from-subscriber"))
+		// Marker: the subscriber publishes a follow-up. The publisher's FIRST
+		// received message must be the marker — its own message was never
+		// echoed.
+		require.NoError(t, subscriber.Channels.Get(channel).
+			Publish(ctx, "marker", "from-subscriber"))
 
-	marker := waitMessage(t, "publisher (marker)", publisherReceived)
-	require.Equal(t, "marker", marker.Name)
-	require.Equal(t, "from-subscriber", marker.Data)
+		marker := waitMessage(t, "publisher (marker)", publisherReceived)
+		require.Equal(t, "marker", marker.Name)
+		require.Equal(t, "from-subscriber", marker.Data)
+	})
 }
 
 // TestPublishImplicitClientID_mirrors_implicit_client_id_0_RTL6g1 mirrors
@@ -201,16 +229,59 @@ func TestPublishNoEcho_mirrors_publishEcho_RTL7f(t *testing.T) {
 // publishes without an explicit Message.clientId and the delivered message
 // carries the connection's clientId, assigned by the server (RTL6g1b).
 func TestPublishImplicitClientID_mirrors_implicit_client_id_0_RTL6g1(t *testing.T) {
+	forBothProtocols(t, func(t *testing.T, proto string, protoOpt ably.ClientOption) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		subscriber := newRealtime(t, protoOpt)
+		publisher := newRealtime(t, protoOpt, ably.WithClientID("conformance-bob"))
+		channel := "conformance-implicit-clientid-" + proto
+		received := subscribeAll(t, ctx, subscriber, channel)
+
+		require.NoError(t, publisher.Channels.Get(channel).
+			Publish(ctx, "greeting", "hello-implicit"))
+
+		msg := waitMessage(t, "subscriber", received)
+		require.Equal(t, "conformance-bob", msg.ClientID) // RTL6g1b
+	})
+}
+
+// TestPublishBinaryData_crossProtocol_RSL4c1 verifies the adapter's
+// binary-payload normalization through real SDK clients: a []byte payload
+// published over the msgpack protocol (raw msgpack bin on the wire)
+// arrives intact at BOTH a msgpack subscriber (binary restored, RSL4c1)
+// and a JSON subscriber (Base64 + "base64" encoding segment on the wire,
+// RSL4d1, decoded client-side by the SDK per RSL6a).
+func TestPublishBinaryData_crossProtocol_RSL4c1(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	subscriber := newRealtime(t)
-	publisher := newRealtime(t, ably.WithClientID("conformance-bob"))
-	received := subscribeAll(t, ctx, subscriber, "conformance-implicit-clientid")
+	jsonSub := newRealtime(t, ably.WithUseBinaryProtocol(false))
+	mpSub := newRealtime(t, ably.WithUseBinaryProtocol(true))
+	publisher := newRealtime(t, ably.WithUseBinaryProtocol(true))
+	const channel = "conformance-binary-data"
+	jsonReceived := subscribeAll(t, ctx, jsonSub, channel)
+	mpReceived := subscribeAll(t, ctx, mpSub, channel)
 
-	require.NoError(t, publisher.Channels.Get("conformance-implicit-clientid").
-		Publish(ctx, "greeting", "hello-implicit"))
+	raw := []byte{0x00, 0x01, 0xfe, 0xff, 0x42}
+	require.NoError(t, publisher.Channels.Get(channel).Publish(ctx, "blob", raw))
 
-	msg := waitMessage(t, "subscriber", received)
-	require.Equal(t, "conformance-bob", msg.ClientID) // RTL6g1b
+	// ably-go v1.4.1 quirk: on realtime receive it only runs the
+	// encoding-chain decode when delta encoding is enabled on the channel
+	// (realtime_channel.go:1142 isDeltaEncodingEnabled guard), so the JSON
+	// subscriber surfaces the canonical wire form verbatim — which is
+	// exactly what this test pins: Base64 string + "base64" encoding
+	// (RSL4d1), as the real Ably service would send.
+	jsonMsg := waitMessage(t, "json subscriber", jsonReceived)
+	require.Equal(t, "base64", jsonMsg.Encoding)
+	require.Equal(t, base64.StdEncoding.EncodeToString(raw), jsonMsg.Data)
+
+	// The msgpack subscriber needs no client-side decode: the adapter pops
+	// the transport "base64" segment and restores raw msgpack binary
+	// (RSL4c1). ably-go's codec surfaces msgpack bin as a Go string
+	// (RawToString=true, ablyutil/msgpack.go:16), so the assertion
+	// compares content, not type.
+	mpMsg := waitMessage(t, "msgpack subscriber", mpReceived)
+	require.Empty(t, mpMsg.Encoding)
+	require.Equal(t, string(raw), mpMsg.Data)
 }

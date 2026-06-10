@@ -111,6 +111,11 @@ type sessionParams struct {
 	// protocolVersion is the v query param (RTN2f). Stored, not yet acted
 	// on.
 	protocolVersion string
+	// format is the wire encoding selected by the format query param
+	// (RTN2a): every outbound frame is marshaled in it (msgpack frames
+	// travel as WS binary messages, JSON as text) and every inbound frame
+	// is unmarshaled by it.
+	format protocol.Format
 }
 
 // opKind identifies the synthesized centrifuge command a pending reply
@@ -213,14 +218,16 @@ func (s *session) run(reqCtx context.Context) {
 	go s.heartbeatLoop()
 
 	for {
+		// Decode by the session's negotiated format (RTN2a) regardless of
+		// the WS frame type flag — tolerant on read; writes always carry
+		// the matching frame type (see writeBytes).
 		_, data, err := s.conn.ReadMessage()
 		if err != nil {
 			return
 		}
 		var m protocol.ProtocolMessage
-		// M1.1 serves the json wire format only; msgpack framing is M2.
-		if err := protocol.Unmarshal(data, protocol.FormatJSON, &m); err != nil {
-			log.Warn().Err(err).Str("transport", transportName).Msg("bad inbound frame")
+		if err := protocol.Unmarshal(data, s.params.format, &m); err != nil {
+			log.Warn().Err(err).Str("transport", transportName).Str("format", s.params.format.String()).Msg("bad inbound frame")
 			continue
 		}
 		if !s.handleFrame(&m) {
@@ -368,6 +375,13 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 			// TM2f), so this is what subscribers observe.
 			msg.Timestamp = now
 		}
+		// Normalize binary data to the canonical JSON-safe form (Base64
+		// string + "base64" encoding segment, RSL4d1) before enveloping,
+		// so the stored publication is format-agnostic. Everything else —
+		// including every other encoding-chain segment — passes through
+		// verbatim (see payload.go). No-op for JSON sessions: a JSON
+		// decode never yields []byte data.
+		normalizeMessageData(msg)
 	}
 
 	// Marshal every envelope before the first publish: the marshaled bytes
@@ -388,9 +402,11 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// CD2c/TO3l8: maxMessageSize, advertised in connectionDetails, limits
 	// the summed size of a frame's messages array (the realtime counterpart
 	// of REST's RSL1i, same error code 40009). Measured here as the summed
-	// marshaled-envelope byte size; real Ably sums name + data + clientId +
-	// extras only, so the server-added envelope fields (id, connectionId,
-	// timestamp) make this adapter marginally stricter, never looser. This
+	// marshaled-envelope byte size AFTER normalization; real Ably sums
+	// name + data + clientId + extras only, so the server-added envelope
+	// fields (id, connectionId, timestamp) — and for binary payloads the
+	// ~33% Base64 inflation of the canonical form — make this adapter
+	// marginally stricter, never looser. This
 	// is the application-level limit: the frame is NACKed, nothing is
 	// published, and the connection stays usable — contrast the protocol-
 	// level maxFrameSize read limit set in serveRealtime, which kills the
@@ -422,25 +438,27 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 }
 
 // ackFrame is the ACK/NACK wire shape. Unlike ProtocolMessage, msgSerial
-// and count are NOT omitempty: ably-js correlates pending publishes via
-// completeMessages({serial, count}) (src/common/lib/transport/protocol.ts
-// onAck) and an omitted msgSerial — the first publish on a connection is
-// serial 0 (RTN7b) — makes that lookup undefined and the publish promise
-// never settles (found empirically via the publish_no_attach probe;
-// ably-go tolerated missing-as-0). TR4j-faithful: the serial is always
-// present on ACK/NACK.
+// and count are NOT omitempty — in either format: ably-js correlates
+// pending publishes via completeMessages({serial, count})
+// (src/common/lib/transport/protocol.ts onAck) and an omitted msgSerial —
+// the first publish on a connection is serial 0 (RTN7b) — makes that
+// lookup undefined and the publish promise never settles (found
+// empirically via the publish_no_attach probe; ably-go tolerated
+// missing-as-0). TR4j-faithful: the serial is always present on ACK/NACK.
+// Zero-value emission of the msgpack tags is pinned by
+// TestAckFrameMsgpackWireShape.
 type ackFrame struct {
-	Action    protocol.Action     `json:"action"`
-	MsgSerial int64               `json:"msgSerial"`
-	Count     int                 `json:"count"`
-	Error     *protocol.ErrorInfo `json:"error,omitempty"`
+	Action    protocol.Action     `json:"action"          msgpack:"action"`
+	MsgSerial int64               `json:"msgSerial"       msgpack:"msgSerial"`
+	Count     int                 `json:"count"           msgpack:"count"`
+	Error     *protocol.ErrorInfo `json:"error,omitempty" msgpack:"error,omitempty"`
 }
 
 // writeAck confirms one inbound MESSAGE frame (RTN7a). msgSerial
 // round-trips exactly; count is 1: one inbound frame is one serial
 // (RTN7b).
 func (s *session) writeAck(msgSerial int64) {
-	s.writeJSON(&ackFrame{
+	s.writeWire(&ackFrame{
 		Action:    protocol.ActionAck,
 		MsgSerial: msgSerial,
 		Count:     1,
@@ -450,7 +468,7 @@ func (s *session) writeAck(msgSerial int64) {
 // writeNack fails one inbound MESSAGE frame (RTN7a), consuming its
 // msgSerial.
 func (s *session) writeNack(msgSerial int64, code int, statusCode int, message string) {
-	s.writeJSON(&ackFrame{
+	s.writeWire(&ackFrame{
 		Action:    protocol.ActionNack,
 		MsgSerial: msgSerial,
 		Count:     1,
@@ -594,6 +612,12 @@ func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
 		log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("dropping publication with undecodable payload")
 		return
 	}
+	if s.params.format == protocol.FormatMsgpack {
+		// The stored envelope is the canonical JSON-safe form; a msgpack
+		// session receives binary payloads as the msgpack binary type with
+		// the transport "base64" segment popped (RSL4c1, see payload.go).
+		denormalizeMessageData(&msg)
+	}
 	// The frame timestamp doubles as the TM2f inheritance source for SDKs;
 	// the enveloped message carries its own timestamp anyway.
 	_ = s.writeFrame(&protocol.ProtocolMessage{
@@ -623,22 +647,24 @@ func (s *session) writeAttachError(channel string, replyErr *cproto.Error) {
 }
 
 // channelErrorFrame is the wire shape of a channel-scoped ERROR. Unlike
-// ProtocolMessage, channel is NOT omitempty: ably-js routes an ERROR to a
-// channel only when the channel attribute is present (otherwise it fails
-// the whole connection, RTN14g semantics), and the empty channel name ""
-// is itself attachable — its attach error must carry "channel":""
-// explicitly (pinned by ably-js channelattachempty).
+// ProtocolMessage, channel is NOT omitempty — in either format: ably-js
+// routes an ERROR to a channel only when the channel attribute is present
+// (otherwise it fails the whole connection, RTN14g semantics), and the
+// empty channel name "" is itself attachable — its attach error must
+// carry "channel":"" explicitly (pinned by ably-js channelattachempty).
+// Zero-value emission of the msgpack tags is pinned by
+// TestChannelErrorFrameMsgpackWireShape.
 type channelErrorFrame struct {
-	Action  protocol.Action     `json:"action"`
-	Channel string              `json:"channel"`
-	Error   *protocol.ErrorInfo `json:"error"`
+	Action  protocol.Action     `json:"action"  msgpack:"action"`
+	Channel string              `json:"channel" msgpack:"channel"`
+	Error   *protocol.ErrorInfo `json:"error"   msgpack:"error"`
 }
 
 // writeChannelError fails one channel on the client with an ERROR frame
 // carrying the channel attribute (RTL14: the channel transitions to
 // FAILED; the connection stays up).
 func (s *session) writeChannelError(channel string, code int, statusCode int, message string) {
-	s.writeJSON(&channelErrorFrame{
+	s.writeWire(&channelErrorFrame{
 		Action:  protocol.ActionError,
 		Channel: channel,
 		Error: &protocol.ErrorInfo{
@@ -723,21 +749,22 @@ func (s *session) teardown() {
 	_ = s.conn.Close()
 }
 
-// writeFrame marshals and writes one ProtocolMessage as a WS text frame.
+// writeFrame marshals and writes one ProtocolMessage in the session's
+// wire format (RTN2a).
 func (s *session) writeFrame(m *protocol.ProtocolMessage) error {
-	data, err := protocol.Marshal(m, protocol.FormatJSON)
+	data, err := protocol.Marshal(m, s.params.format)
 	if err != nil {
 		return err
 	}
 	return s.writeBytes(data)
 }
 
-// writeJSON marshals and writes a bespoke wire frame — used where the
-// shared ProtocolMessage omitempty tags would drop a field that must be
-// present on the wire (ackFrame, channelErrorFrame). The msgpack
-// equivalents land with the M2 codec.
-func (s *session) writeJSON(v any) {
-	data, err := json.Marshal(v)
+// writeWire marshals and writes a bespoke wire frame in the session's
+// format — used where the shared ProtocolMessage omitempty tags would
+// drop a field that must be present on the wire (ackFrame,
+// channelErrorFrame).
+func (s *session) writeWire(v any) {
+	data, err := protocol.MarshalAny(v, s.params.format)
 	if err != nil {
 		log.Error().Err(err).Str("transport", transportName).Msg("marshal wire frame")
 		return
@@ -745,11 +772,18 @@ func (s *session) writeJSON(v any) {
 	_ = s.writeBytes(data)
 }
 
+// writeBytes writes one encoded frame with the WS frame type matching the
+// session's wire format: msgpack frames are binary messages, JSON frames
+// are text messages.
 func (s *session) writeBytes(data []byte) error {
+	messageType := websocket.TextMessage
+	if s.params.format == protocol.FormatMsgpack {
+		messageType = websocket.BinaryMessage
+	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	return s.conn.WriteMessage(websocket.TextMessage, data)
+	return s.conn.WriteMessage(messageType, data)
 }
 
 func (s *session) addPending(op pendingOp) uint32 {

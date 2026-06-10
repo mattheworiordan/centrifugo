@@ -2,7 +2,7 @@ package ably
 
 import (
 	"context"
-	"encoding/binary"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -22,6 +22,7 @@ import (
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/stretchr/testify/require"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // Keys from auth/testdata/static-app.json.
@@ -99,11 +100,10 @@ func TestTimeMsgPack_RSC16(t *testing.T) {
 
 			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
-			// fixarray(1) + int64 — see serveTime.
-			require.Len(t, body, 10)
-			require.Equal(t, byte(0x91), body[0])
-			require.Equal(t, byte(0xd3), body[1])
-			requireTimeWithinSkew(t, int64(binary.BigEndian.Uint64(body[2:])))
+			var times []int64
+			require.NoError(t, msgpack.Unmarshal(body, &times))
+			require.Len(t, times, 1)
+			requireTimeWithinSkew(t, times[0])
 		})
 	}
 }
@@ -225,43 +225,79 @@ func dialRealtime(t *testing.T, wsURL string, params url.Values) *websocket.Conn
 	return conn
 }
 
-func readFrame(t *testing.T, conn *websocket.Conn) *protocol.ProtocolMessage {
+// wsMessageType returns the WS frame type a format must travel as:
+// msgpack frames are binary messages, JSON frames are text messages.
+func wsMessageType(format protocol.Format) int {
+	if format == protocol.FormatMsgpack {
+		return websocket.BinaryMessage
+	}
+	return websocket.TextMessage
+}
+
+// readFrameFormat reads one frame in the given wire format, asserting the
+// server used the matching WS frame type.
+func readFrameFormat(t *testing.T, conn *websocket.Conn, format protocol.Format) *protocol.ProtocolMessage {
 	t.Helper()
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
-	_, data, err := conn.ReadMessage()
+	messageType, data, err := conn.ReadMessage()
 	require.NoError(t, err)
+	require.Equal(t, wsMessageType(format), messageType, "WS frame type must match the %s wire format", format)
 	var m protocol.ProtocolMessage
-	require.NoError(t, protocol.Unmarshal(data, protocol.FormatJSON, &m))
+	require.NoError(t, protocol.Unmarshal(data, format, &m))
 	return &m
+}
+
+func readFrame(t *testing.T, conn *websocket.Conn) *protocol.ProtocolMessage {
+	t.Helper()
+	return readFrameFormat(t, conn, protocol.FormatJSON)
+}
+
+func writeFrameFormat(t *testing.T, conn *websocket.Conn, m *protocol.ProtocolMessage, format protocol.Format) {
+	t.Helper()
+	data, err := protocol.Marshal(m, format)
+	require.NoError(t, err)
+	require.NoError(t, conn.WriteMessage(wsMessageType(format), data))
 }
 
 func writeFrame(t *testing.T, conn *websocket.Conn, m *protocol.ProtocolMessage) {
 	t.Helper()
-	data, err := protocol.Marshal(m, protocol.FormatJSON)
-	require.NoError(t, err)
-	require.NoError(t, conn.WriteMessage(websocket.TextMessage, data))
+	writeFrameFormat(t, conn, m, protocol.FormatJSON)
 }
 
-// readNonHeartbeatFrame reads frames until one that is not a server
+// readNonHeartbeatFrameFormat reads frames until one that is not a server
 // heartbeat arrives — the 10s heartbeat ticker (RTN23a) may interleave
 // with any read.
-func readNonHeartbeatFrame(t *testing.T, conn *websocket.Conn) *protocol.ProtocolMessage {
+func readNonHeartbeatFrameFormat(t *testing.T, conn *websocket.Conn, format protocol.Format) *protocol.ProtocolMessage {
 	t.Helper()
 	for {
-		m := readFrame(t, conn)
+		m := readFrameFormat(t, conn, format)
 		if m.Action != protocol.ActionHeartbeat {
 			return m
 		}
 	}
 }
 
+func readNonHeartbeatFrame(t *testing.T, conn *websocket.Conn) *protocol.ProtocolMessage {
+	t.Helper()
+	return readNonHeartbeatFrameFormat(t, conn, protocol.FormatJSON)
+}
+
+// connectRealtimeFormat dials with the given wire format (RTN2a) and
+// consumes the initial CONNECTED frame.
+func connectRealtimeFormat(t *testing.T, ts *realtimeTestServer, format protocol.Format) *websocket.Conn {
+	t.Helper()
+	params := defaultDialParams()
+	params.Set("format", format.String())
+	conn := dialRealtime(t, ts.wsURL, params)
+	connected := readFrameFormat(t, conn, format)
+	require.Equal(t, protocol.ActionConnected, connected.Action)
+	return conn
+}
+
 // connectRealtime dials and consumes the initial CONNECTED frame.
 func connectRealtime(t *testing.T, ts *realtimeTestServer) *websocket.Conn {
 	t.Helper()
-	conn := dialRealtime(t, ts.wsURL, defaultDialParams())
-	connected := readFrame(t, conn)
-	require.Equal(t, protocol.ActionConnected, connected.Action)
-	return conn
+	return connectRealtimeFormat(t, ts, protocol.FormatJSON)
 }
 
 // RTN6: the connection is successful once the initial CONNECTED
@@ -344,13 +380,13 @@ func TestRealtimeAuthError_RTN14a(t *testing.T) {
 	}
 }
 
-// RTN2a: only the json wire format is served this milestone; msgpack (M2)
-// and unknown formats are rejected before the upgrade.
+// RTN2a: json and msgpack are the served wire formats; unknown formats
+// are rejected before the upgrade.
 func TestRealtimeFormatRejected_RTN2a(t *testing.T) {
 	t.Parallel()
 	ts := newRealtimeServer(t)
 
-	for _, format := range []string{"msgpack", "xml"} {
+	for _, format := range []string{"xml", "protobuf"} {
 		t.Run(format, func(t *testing.T) {
 			t.Parallel()
 			params := defaultDialParams()
@@ -964,4 +1000,146 @@ func TestRealtimePublishInvalidChannelName(t *testing.T) {
 	require.Equal(t, protocol.ActionNack, nack.Action)
 	require.NotNil(t, nack.Error)
 	require.Equal(t, errCodeInvalidChannelName, nack.Error.Code)
+}
+
+// RTN2a end-to-end in the msgpack wire format: CONNECTED, ATTACH/ATTACHED,
+// publish→ACK (explicit msgSerial, TR4j), fan-out — every frame a WS
+// binary message carrying msgpack.
+func TestRealtimeMsgpackSession_RTN2a(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtimeFormat(t, ts, protocol.FormatMsgpack)
+
+	writeFrameFormat(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "mp"}, protocol.FormatMsgpack)
+	attached := readNonHeartbeatFrameFormat(t, conn, protocol.FormatMsgpack)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.Equal(t, "mp", attached.Channel)
+
+	writeFrameFormat(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "mp",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "n", Data: "plain string"}},
+	}, protocol.FormatMsgpack)
+
+	var ack, delivered *protocol.ProtocolMessage
+	for range 2 {
+		switch m := readNonHeartbeatFrameFormat(t, conn, protocol.FormatMsgpack); m.Action {
+		case protocol.ActionAck:
+			ack = m
+		case protocol.ActionMessage:
+			delivered = m
+		default:
+			t.Fatalf("unexpected frame action %d", m.Action)
+		}
+	}
+	require.NotNil(t, ack)
+	require.Equal(t, int64(0), ack.MsgSerial)
+	require.Equal(t, 1, ack.Count)
+	require.NotNil(t, delivered)
+	require.Len(t, delivered.Messages, 1)
+	require.Equal(t, "plain string", delivered.Messages[0].Data)
+	require.Empty(t, delivered.Messages[0].Encoding)
+}
+
+// RSL4c1/RSL4d1 cross-format binary data, msgpack→json: a binary payload
+// published over msgpack (raw msgpack bin) is delivered to a JSON session
+// as a Base64 string with "base64" appended to the encoding chain.
+func TestRealtimeBinaryDataMsgpackToJSON_RSL4d1(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	jsonSub := connectRealtime(t, ts)
+	writeFrame(t, jsonSub, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "bin-mj"})
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, jsonSub).Action)
+
+	mpPub := connectRealtimeFormat(t, ts, protocol.FormatMsgpack)
+	raw := []byte{0x00, 0x01, 0xfe, 0xff, 0x10}
+	writeFrameFormat(t, mpPub, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "bin-mj",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "blob", Data: raw}},
+	}, protocol.FormatMsgpack)
+
+	delivered := readNonHeartbeatFrame(t, jsonSub)
+	require.Equal(t, protocol.ActionMessage, delivered.Action)
+	require.Len(t, delivered.Messages, 1)
+	require.Equal(t, "base64", delivered.Messages[0].Encoding) // RSL4d1
+	str, ok := delivered.Messages[0].Data.(string)
+	require.True(t, ok, "JSON delivery carries Base64 string, got %T", delivered.Messages[0].Data)
+	decoded, err := base64.StdEncoding.DecodeString(str)
+	require.NoError(t, err)
+	require.Equal(t, raw, decoded)
+}
+
+// RSL4c1 cross-format binary data, json→msgpack: a Base64+"base64"
+// payload published over JSON is delivered to a msgpack session as the
+// raw msgpack binary type with the transport "base64" segment popped.
+// A non-transport remainder of the chain survives verbatim (RSL6a —
+// client-side segments are never touched).
+func TestRealtimeBinaryDataJSONToMsgpack_RSL4c1(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	mpSub := connectRealtimeFormat(t, ts, protocol.FormatMsgpack)
+	writeFrameFormat(t, mpSub, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "bin-jm"}, protocol.FormatMsgpack)
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrameFormat(t, mpSub, protocol.FormatMsgpack).Action)
+
+	jsonPub := connectRealtime(t, ts)
+	raw := []byte("cipher-or-binary-bytes")
+	b64 := base64.StdEncoding.EncodeToString(raw)
+	writeFrame(t, jsonPub, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "bin-jm",
+		MsgSerial: 0,
+		Messages: []*protocol.Message{
+			{Name: "plain-blob", Data: b64, Encoding: "base64"},
+			{Name: "ciphered", Data: b64, Encoding: "utf-8/cipher+aes-128-cbc/base64"},
+		},
+	})
+
+	// Each Message in a frame is one centrifuge Publication (M1.2 publish
+	// semantics; atomic batch delivery is M6/M8), so the two messages
+	// arrive as two MESSAGE frames in publish order.
+	first := readNonHeartbeatFrameFormat(t, mpSub, protocol.FormatMsgpack)
+	require.Equal(t, protocol.ActionMessage, first.Action)
+	require.Len(t, first.Messages, 1)
+	// Transport "base64" popped, data restored to raw bytes.
+	require.Empty(t, first.Messages[0].Encoding)
+	require.Equal(t, raw, first.Messages[0].Data)
+
+	second := readNonHeartbeatFrameFormat(t, mpSub, protocol.FormatMsgpack)
+	require.Equal(t, protocol.ActionMessage, second.Action)
+	require.Len(t, second.Messages, 1)
+	// Client-side chain remainder survives verbatim after the pop.
+	require.Equal(t, "utf-8/cipher+aes-128-cbc", second.Messages[0].Encoding)
+	require.Equal(t, raw, second.Messages[0].Data)
+}
+
+// Encoding chains with no trailing transport "base64" pass through
+// completely untouched to every session format (RSL6a: client-side
+// segments are the SDK's to decode; crypto depends on the chain
+// surviving verbatim).
+func TestRealtimeEncodingChainPassthrough_RSL6a(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	mpSub := connectRealtimeFormat(t, ts, protocol.FormatMsgpack)
+	writeFrameFormat(t, mpSub, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "chain"}, protocol.FormatMsgpack)
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrameFormat(t, mpSub, protocol.FormatMsgpack).Action)
+
+	jsonPub := connectRealtime(t, ts)
+	writeFrame(t, jsonPub, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "chain",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "j", Data: `{"a":1}`, Encoding: "json"}},
+	})
+
+	delivered := readNonHeartbeatFrameFormat(t, mpSub, protocol.FormatMsgpack)
+	require.Equal(t, protocol.ActionMessage, delivered.Action)
+	require.Len(t, delivered.Messages, 1)
+	require.Equal(t, "json", delivered.Messages[0].Encoding)
+	require.Equal(t, `{"a":1}`, delivered.Messages[0].Data)
 }

@@ -45,14 +45,22 @@ func (f Format) String() string {
 
 // Marshal encodes a ProtocolMessage in the given format.
 func Marshal(m *ProtocolMessage, f Format) ([]byte, error) {
+	return MarshalAny(m, f)
+}
+
+// MarshalAny encodes an arbitrary wire value in the given format. It exists
+// for the adapter's bespoke wire shapes (ACK/NACK and channel-scoped ERROR
+// frames, the /time response array) so every encoder shares one msgpack
+// configuration.
+func MarshalAny(v any, f Format) ([]byte, error) {
 	switch f {
 	case FormatJSON:
-		return json.Marshal(m)
+		return json.Marshal(v)
 	case FormatMsgpack:
 		var buf bytes.Buffer
 		enc := msgpack.NewEncoder(&buf)
 		enc.UseCompactInts(true)
-		if err := enc.Encode(m); err != nil {
+		if err := enc.Encode(v); err != nil {
 			return nil, err
 		}
 		return buf.Bytes(), nil
