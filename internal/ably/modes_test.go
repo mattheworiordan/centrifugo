@@ -33,7 +33,7 @@ func TestChannelModesParamsEchoAndEnforcement_RTL4k_RTL4m(t *testing.T) {
 	})
 	attached := readNonHeartbeatFrame(t, conn)
 	require.Equal(t, protocol.ActionAttached, attached.Action)
-	require.Equal(t, map[string]string{"modes": "subscribe", "delta": "vcdiff"}, attached.Params)
+	require.Equal(t, protocol.ParamsMap{"modes": "subscribe", "delta": "vcdiff"}, attached.Params)
 	require.Equal(t, protocol.FlagModeSubscribe, attached.Flags&protocol.FlagModeSubscribe)
 	require.Zero(t, attached.Flags&(protocol.FlagModePublish|protocol.FlagModePresence|protocol.FlagModePresenceSubscribe))
 
@@ -323,7 +323,7 @@ func TestChannelReattachUpdatesModes(t *testing.T) {
 	// frame itself is next.
 	updated := readNonHeartbeatFrame(t, conn)
 	require.Equal(t, protocol.ActionAttached, updated.Action)
-	require.Equal(t, map[string]string{"modes": "publish"}, updated.Params)
+	require.Equal(t, protocol.ParamsMap{"modes": "publish"}, updated.Params)
 	require.Equal(t, protocol.FlagModePublish,
 		updated.Flags&(protocol.FlagModePresence|protocol.FlagModePublish|protocol.FlagModeSubscribe|protocol.FlagModePresenceSubscribe))
 

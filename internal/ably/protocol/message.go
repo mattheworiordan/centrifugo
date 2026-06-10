@@ -65,7 +65,7 @@ type ProtocolMessage struct {
 	Flags             int64              `json:"flags,omitempty"             msgpack:"flags,omitempty"`
 	Messages          []*Message         `json:"messages,omitempty"          msgpack:"messages,omitempty"`
 	Error             *ErrorInfo         `json:"error,omitempty"             msgpack:"error,omitempty"`
-	Params            map[string]string  `json:"params,omitempty"            msgpack:"params,omitempty"`
+	Params            ParamsMap          `json:"params,omitempty"            msgpack:"params,omitempty"`
 	Presence          []*PresenceMessage `json:"presence,omitempty"          msgpack:"presence,omitempty"`          // TR4l
 	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"` // TR4o
 }
@@ -124,9 +124,16 @@ const (
 	// FlagHasPresence indicates the channel has members present at attach
 	// time: the client should expect a SYNC to follow (RTL4c1-adjacent).
 	FlagHasPresence int64 = 1 << 0
+	// FlagHasBacklog indicates a rewind attach has retained messages to
+	// deliver after ATTACHED (RTL2i; TR3).
+	FlagHasBacklog int64 = 1 << 1
 	// FlagTransient marks an ATTACH that should not be resumed on
 	// failure (TR3).
 	FlagTransient int64 = 1 << 4
+	// FlagAttachResume marks an ATTACH sent to resume a prior attachment
+	// (TR3): rewind params are suppressed on such attaches (pinned by
+	// ably-js resume_rewind_1).
+	FlagAttachResume int64 = 1 << 5
 	// Channel mode flags (TR3, bits 16-19): an ATTACH carrying any mode
 	// bits requests a restricted attachment; ATTACHED echoes the granted
 	// modes.

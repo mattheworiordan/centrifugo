@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -154,6 +155,10 @@ type pendingOp struct {
 	// Recover, and the reply's recovered publications are replayed after
 	// ATTACHED with the RESUMED flag (RTL4j territory).
 	resuming bool
+	// rewinding marks a fresh ATTACH with a rewind param: the same
+	// recovery machinery replays the backlog, but ATTACHED carries
+	// HAS_BACKLOG (when non-empty) instead of RESUMED (RTL2i).
+	rewinding bool
 }
 
 type session struct {
@@ -597,6 +602,58 @@ func (s *session) resolveCursor(channel, cursor string) (centrifuge.StreamPositi
 	return centrifuge.StreamPosition{}, false
 }
 
+// rewindPosition resolves a rewind request to the broker position to
+// recover from: "N" replays the last N retained publications, "Ns"
+// (or any Go-parsable duration) replays publications whose envelope
+// timestamp falls inside the trailing window. Returns false when there
+// is nothing to replay (empty channel, zero/invalid spec) — the attach
+// proceeds fresh without HAS_BACKLOG (rewind_has_backlog_0).
+func (s *session) rewindPosition(channel, spec string) (centrifuge.StreamPosition, bool) {
+	var pubs []*centrifuge.Publication
+	var top centrifuge.StreamPosition
+	if n, err := strconv.Atoi(spec); err == nil {
+		if n <= 0 {
+			return centrifuge.StreamPosition{}, false
+		}
+		if n > persistedHistorySize {
+			n = persistedHistorySize
+		}
+		res, err := s.node.History(channel, centrifuge.WithLimit(n), centrifuge.WithReverse(true))
+		if err != nil || len(res.Publications) == 0 {
+			return centrifuge.StreamPosition{}, false
+		}
+		pubs, top = res.Publications, res.StreamPosition
+	} else if d, err := time.ParseDuration(spec); err == nil && d > 0 {
+		res, err := s.node.History(channel,
+			centrifuge.WithLimit(persistedHistorySize), centrifuge.WithReverse(true))
+		if err != nil || len(res.Publications) == 0 {
+			return centrifuge.StreamPosition{}, false
+		}
+		cutoff := time.Now().Add(-d).UnixMilli()
+		// Publications are newest-first; keep the contiguous head whose
+		// envelope timestamps fall inside the window.
+		var inWindow []*centrifuge.Publication
+		for _, pub := range res.Publications {
+			var msg protocol.Message
+			if err := json.Unmarshal(pub.Data, &msg); err != nil || msg.Timestamp < cutoff {
+				break
+			}
+			inWindow = append(inWindow, pub)
+		}
+		if len(inWindow) == 0 {
+			return centrifuge.StreamPosition{}, false
+		}
+		pubs, top = inWindow, res.StreamPosition
+	} else {
+		return centrifuge.StreamPosition{}, false
+	}
+	// Reverse page: the OLDEST publication to replay is the last entry;
+	// recovery replays everything after the position, so recover from
+	// just before it.
+	oldest := pubs[len(pubs)-1]
+	return centrifuge.StreamPosition{Offset: oldest.Offset - 1, Epoch: top.Epoch}, true
+}
+
 // latestChannelSerial returns the serial of the channel's most recent
 // publication — the attach point ATTACHED advertises (RTL15a
 // attachSerial) — or "" for a channel with no retained publications.
@@ -708,7 +765,9 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	// subscription (no read-then-subscribe race). An unresolvable cursor
 	// attaches fresh (no RESUMED flag = discontinuity, the Ably signal).
 	resuming := false
-	if m.ChannelSerial != "" {
+	rewinding := false
+	switch {
+	case m.ChannelSerial != "":
 		if pos, ok := s.resolveCursor(channel, m.ChannelSerial); ok {
 			// Recover asks for replay from the position NOW; Recoverable is
 			// the separate declarative property centrifugo's permission
@@ -720,6 +779,19 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 			sub.Offset = pos.Offset
 			sub.Epoch = pos.Epoch
 			resuming = true
+		}
+	case m.Params["rewind"] != "" && m.Flags&protocol.FlagAttachResume == 0:
+		// RTL2i: rewind replays a backlog of retained messages on a FRESH
+		// attach only — an ATTACH_RESUME attach (or one presenting a
+		// cursor, above) suppresses it (pinned by resume_rewind_1). The
+		// replay rides the same broker recovery, atomic with the
+		// subscription.
+		if pos, ok := s.rewindPosition(channel, m.Params["rewind"]); ok {
+			sub.Recover = true
+			sub.Recoverable = true
+			sub.Offset = pos.Offset
+			sub.Epoch = pos.Epoch
+			rewinding = true
 		}
 	}
 	if !s.params.echo {
@@ -745,11 +817,12 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	}
 	cmd := &cproto.Command{
 		Id: s.addPending(pendingOp{
-			kind:     opSubscribe,
-			channel:  channel,
-			params:   m.Params,
-			modes:    modesFromAttach(m),
-			resuming: resuming,
+			kind:      opSubscribe,
+			channel:   channel,
+			params:    m.Params,
+			modes:     modesFromAttach(m),
+			resuming:  resuming,
+			rewinding: rewinding,
 		}),
 		Subscribe: sub,
 	}
@@ -892,12 +965,22 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			}
 			// RTL4j: a resumed attach replays the gap after ATTACHED. The
 			// RESUMED flag is only set when the broker confirmed recovery
-			// (RTL12: its absence signals a discontinuity).
+			// (RTL12: its absence signals a discontinuity). A rewind attach
+			// rides the same recovery but signals HAS_BACKLOG instead
+			// (RTL2i; never RESUMED — rewind is a fresh attach).
 			var extraFlags int64
 			var replay []*cproto.Publication
-			if op.resuming && reply.Subscribe != nil && reply.Subscribe.Recovered {
-				extraFlags |= protocol.FlagResumed
-				replay = reply.Subscribe.Publications
+			if reply.Subscribe != nil && reply.Subscribe.Recovered {
+				switch {
+				case op.resuming:
+					extraFlags |= protocol.FlagResumed
+					replay = reply.Subscribe.Publications
+				case op.rewinding:
+					replay = reply.Subscribe.Publications
+					if len(replay) > 0 {
+						extraFlags |= protocol.FlagHasBacklog
+					}
+				}
 			}
 			s.writeAttached(op.channel, op.params, op.modes, extraFlags)
 			for _, pub := range replay {
