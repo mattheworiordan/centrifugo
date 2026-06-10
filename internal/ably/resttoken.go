@@ -12,15 +12,24 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 
 	"github.com/rs/zerolog/log"
 )
 
-// defaultTokenTTL is Ably's default token lifetime (TK2a: 60 minutes).
-const defaultTokenTTL = time.Hour
+// defaultTokenTTL is Ably's default token lifetime (TK2a: 60 minutes);
+// maxTokenTTL caps requests at 24 hours (the Ably maximum — pinned by
+// rest/auth "Should error with excessive ttl"); timestampTolerance bounds
+// request-timestamp skew (RSA9d, pinned by "invalid timestamp" → 401).
+const (
+	defaultTokenTTL    = time.Hour
+	maxTokenTTL        = 24 * time.Hour
+	timestampTolerance = 15 * time.Minute
+)
 
 // tokenRequestBody is a signed TokenRequest (TE2-TE6 wire shape). Pointer
 // fields distinguish absent from zero: an absent ttl signs as the empty
@@ -78,17 +87,31 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A present ttl must be positive: a zero or negative value would sign
-	// one thing and issue another (the 1h default), so it is rejected
-	// outright.
-	if req.TTL != nil && *req.TTL <= 0 {
+	// A present ttl must be positive and within the 24h maximum: out of
+	// range would sign one thing and issue another.
+	if req.TTL != nil && (*req.TTL <= 0 || *req.TTL > maxTokenTTL.Milliseconds()) {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid ttl")
+		return
+	}
+	// RSA9d: the request timestamp must be within tolerance of server
+	// time; nonce reuse within the window is rejected (replay protection,
+	// pinned by rest/auth "duplicate nonce" → 401).
+	if skew := time.Since(time.UnixMilli(req.Timestamp)); skew > timestampTolerance || skew < -timestampTolerance {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeInvalidCredentials, "token request timestamp out of range")
+		return
+	}
+	// Capability shape validation (400) precedes intersection (401 on an
+	// empty result) — pinned by rest/capability "Invalid capabilities" vs
+	// the intersection rejection tests.
+	if err := auth.ValidateCapabilityShape(req.Capability); err != nil {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, err.Error())
 		return
 	}
 	// The mac covers the LITERAL fields as the SDK signed them: an absent
 	// ttl contributes the empty string (ably-js auth.ts getTokenRequest).
-	// Request timestamp staleness is NOT enforced (RSA9d divergence,
-	// tracked for M9) — the mac itself proves key possession.
+	// Timestamp skew was bounded above (RSA9d); the nonce is burned only
+	// AFTER the mac proves key possession, so unauthenticated requests
+	// cannot deny a nonce to its legitimate owner.
 	ttlStr := ""
 	if req.TTL != nil {
 		ttlStr = strconv.FormatInt(*req.TTL, 10)
@@ -98,12 +121,29 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 		h.writeError(rw, r, http.StatusUnauthorized, errCodeInvalidCredentials, "invalid token request mac")
 		return
 	}
+	if !h.nonces.use(req.Nonce) {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeInvalidCredentials, "token request nonce already used")
+		return
+	}
+
+	key, _ := h.keys.Lookup(keyName) // mac verified: the key exists
+	effectiveCapability, ok, err := auth.IntersectCapability(key.Capability, req.Capability)
+	if err != nil {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, err.Error())
+		return
+	}
+	if !ok {
+		// RSA6 territory: the requested capability has no intersection
+		// with the key's grants.
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "requested capability has no intersection with the key capability")
+		return
+	}
 
 	ttl := defaultTokenTTL
 	if req.TTL != nil && *req.TTL > 0 {
 		ttl = time.Duration(*req.TTL) * time.Millisecond
 	}
-	minted, err := h.keys.MintToken(keyName, req.ClientID, req.Capability, ttl)
+	minted, err := h.keys.MintToken(keyName, req.ClientID, effectiveCapability, ttl)
 	if err != nil {
 		log.Error().Err(err).Str("transport", transportName).Msg("token minting failed")
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "token minting failed")
@@ -114,7 +154,37 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 		KeyName:    keyName,
 		Issued:     minted.Issued,
 		Expires:    minted.Expires,
-		Capability: req.Capability,
+		Capability: effectiveCapability, // TD5: the token's EFFECTIVE capability
 		ClientID:   req.ClientID,
 	})
+}
+
+// nonceCache rejects nonce reuse within the timestamp tolerance window —
+// together with the timestamp check this bounds replay of a captured
+// signed TokenRequest.
+type nonceCache struct {
+	mu   sync.Mutex
+	seen map[string]time.Time
+}
+
+func newNonceCache() *nonceCache {
+	return &nonceCache{seen: make(map[string]time.Time)}
+}
+
+// use records the nonce, reporting false when it was already used within
+// the window. Expired entries are evicted lazily on each call.
+func (c *nonceCache) use(nonce string) bool {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for n, t := range c.seen {
+		if now.Sub(t) > 2*timestampTolerance {
+			delete(c.seen, n)
+		}
+	}
+	if _, dup := c.seen[nonce]; dup {
+		return false
+	}
+	c.seen[nonce] = now
+	return true
 }

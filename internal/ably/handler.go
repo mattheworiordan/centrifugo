@@ -38,6 +38,7 @@ type Handler struct {
 	config  configtypes.Ably
 	keys    *auth.KeyStore
 	upgrade *websocket.Upgrader
+	nonces  *nonceCache
 }
 
 // NewHandler creates new Handler. The adapter is unusable without API keys
@@ -60,6 +61,7 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 		config:  c,
 		keys:    keys,
 		upgrade: upgrade,
+		nonces:  newNonceCache(),
 	}, nil
 }
 
