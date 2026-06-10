@@ -2,13 +2,18 @@ package ably
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 
@@ -233,4 +238,83 @@ func TestRESTPublishIdempotent_RSL1k2(t *testing.T) {
 	msgs := decodeMessagesBody(t, resp)
 	require.Len(t, msgs, 3, "3x same-id stores once; 2x fresh store twice")
 	require.Equal(t, "client-id:0", msgs[2].ID, "client-supplied id preserved (oldest)")
+}
+
+// RSA8/RSA9: POST /keys/{keyName}/requestToken verifies the HMAC-signed
+// TokenRequest (the mac is the authentication) and returns TokenDetails
+// whose token the adapter's own verifier accepts.
+func TestRequestToken_RSA8(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	const keyName = "poc.key0"
+	const secret = "secret_key0_0123456789abcdef"
+	sign := func(ttl, capability, clientID, timestamp, nonce string) string {
+		mac := hmac.New(sha256.New, []byte(secret))
+		mac.Write([]byte(keyName + "\n" + ttl + "\n" + capability + "\n" + clientID + "\n" + timestamp + "\n" + nonce + "\n"))
+		return base64.StdEncoding.EncodeToString(mac.Sum(nil))
+	}
+	post := func(t *testing.T, body string) *http.Response {
+		req, err := http.NewRequest(http.MethodPost, ts.srv.URL+"/keys/"+keyName+"/requestToken", strings.NewReader(body))
+		require.NoError(t, err)
+		req.Header.Set("Content-Type", contentTypeJSON)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = resp.Body.Close() })
+		return resp
+	}
+
+	ts1 := time.Now().UnixMilli()
+	tsStr := strconv.FormatInt(ts1, 10)
+
+	t.Run("valid signed request mints a verifiable token", func(t *testing.T) {
+		mac := sign("", "", "minted-bob", tsStr, "nonce-1")
+		resp := post(t, fmt.Sprintf(`{"keyName":%q,"clientId":"minted-bob","timestamp":%d,"nonce":"nonce-1","mac":%q}`, keyName, ts1, mac))
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var details struct {
+			Token    string `json:"token"`
+			KeyName  string `json:"keyName"`
+			Issued   int64  `json:"issued"`
+			Expires  int64  `json:"expires"`
+			ClientID string `json:"clientId"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&details))
+		require.Equal(t, keyName, details.KeyName)
+		require.Equal(t, "minted-bob", details.ClientID)
+		require.Greater(t, details.Expires, details.Issued)
+		// Default TTL one hour (TK2a).
+		require.InDelta(t, time.Hour.Milliseconds(), details.Expires-details.Issued, 1000)
+
+		// The minted token authenticates a realtime connection with the
+		// token-bound identity.
+		params := url.Values{}
+		params.Set("format", "json")
+		params.Set("v", "6")
+		params.Set("access_token", details.Token)
+		conn := dialRealtime(t, ts.wsURL, params)
+		m := readFrame(t, conn)
+		require.Equal(t, protocol.ActionConnected, m.Action)
+		require.Equal(t, "minted-bob", m.ConnectionDetails.ClientID)
+	})
+
+	t.Run("ttl signs as its literal decimal", func(t *testing.T) {
+		mac := sign("60000", "", "", tsStr, "nonce-2")
+		resp := post(t, fmt.Sprintf(`{"keyName":%q,"ttl":60000,"timestamp":%d,"nonce":"nonce-2","mac":%q}`, keyName, ts1, mac))
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		var details struct{ Issued, Expires int64 }
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&details))
+		require.InDelta(t, int64(60000), details.Expires-details.Issued, 1000)
+	})
+
+	t.Run("bad mac rejected 40101", func(t *testing.T) {
+		resp := post(t, fmt.Sprintf(`{"keyName":%q,"timestamp":%d,"nonce":"nonce-3","mac":"AAAA"}`, keyName, ts1))
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		require.Equal(t, "40101", resp.Header.Get("X-Ably-Errorcode"))
+	})
+
+	t.Run("keyName mismatch rejected", func(t *testing.T) {
+		mac := sign("", "", "", tsStr, "nonce-4")
+		resp := post(t, fmt.Sprintf(`{"keyName":"poc.key1","timestamp":%d,"nonce":"nonce-4","mac":%q}`, ts1, mac))
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	})
 }

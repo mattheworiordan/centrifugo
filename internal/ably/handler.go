@@ -75,6 +75,9 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/channels/"):
 		// RSL1/RSL2/channel details — see rest.go.
 		h.serveChannels(rw, r)
+	case strings.HasPrefix(r.URL.Path, "/keys/") && strings.HasSuffix(r.URL.Path, "/requestToken"):
+		// RSA8 token request exchange — see resttoken.go.
+		h.serveRequestToken(rw, r)
 	default:
 		// Catch-all REST error per the Ably error contract; route surface
 		// grows milestone by milestone.

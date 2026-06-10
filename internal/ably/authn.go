@@ -8,6 +8,7 @@ package ably
 // static key store's keys.
 
 import (
+	"encoding/base64"
 	"errors"
 	"net/http"
 	"strings"
@@ -50,6 +51,16 @@ func (h *Handler) authenticate(r *http.Request) (authResult, *authProblem) {
 	if token == "" {
 		if bearer := r.Header.Get("Authorization"); strings.HasPrefix(bearer, "Bearer ") {
 			token = strings.TrimPrefix(bearer, "Bearer ")
+			// SDKs Base64-encode the token in the Authorization header
+			// (ably-js auth.ts getAuthHeaders); a raw token is also legal.
+			// The discriminator is exact: JWTs always contain dots, Base64
+			// output never does — so a dotted value is raw, anything else
+			// is decoded.
+			if !strings.Contains(token, ".") {
+				if decoded, err := base64.StdEncoding.DecodeString(token); err == nil {
+					token = string(decoded)
+				}
+			}
 		}
 	}
 	if token != "" {

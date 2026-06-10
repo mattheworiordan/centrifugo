@@ -1264,7 +1264,9 @@ func TestRESTTokenAuth(t *testing.T) {
 	ts := newRealtimeServer(t)
 
 	bearer := func(token string) map[string]string {
-		return map[string]string{"Content-Type": contentTypeJSON, "Authorization": "Bearer " + token}
+		// SDKs Base64-encode the token in the Authorization header.
+		return map[string]string{"Content-Type": contentTypeJSON,
+			"Authorization": "Bearer " + base64.StdEncoding.EncodeToString([]byte(token))}
 	}
 	post := func(t *testing.T, token string) *http.Response {
 		req, err := http.NewRequest(http.MethodPost, ts.srv.URL+"/channels/persisted:rest-token/messages",
