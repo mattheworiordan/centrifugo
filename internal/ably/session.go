@@ -149,6 +149,11 @@ type pendingOp struct {
 	// (RTL4k params echo; RTL4m mode grant).
 	params map[string]string
 	modes  int64
+	// resuming marks an ATTACH that presented a channelSerial cursor which
+	// resolved to a broker position: the synthesized subscribe carries
+	// Recover, and the reply's recovered publications are replayed after
+	// ATTACHED with the RESUMED flag (RTL4j territory).
+	resuming bool
 }
 
 type session struct {
@@ -570,13 +575,28 @@ func modeAllows(modes int64, ability int64) bool {
 	return modes == 0 || modes&ability != 0
 }
 
-// writeAttached records the attachment grant and confirms it on the wire:
-// ATTACHED echoing the recognized params (RTL4k1) and the granted mode bits
-// (RTL4m), HAS_PRESENCE + a single-page SYNC when members exist (RTP18-lite
-// — members delivered as PRESENT; no channelSerial cursor means ably-js
-// setPresence completes the sync on this frame). Called from the
-// opSubscribe reply (fresh attach, centrifuge reply goroutine) and from
-// the re-attach update path (frame-reader goroutine).
+// resolveCursor maps a client-presented channelSerial cursor to the
+// broker position of the publication that carried it — by LOOKUP over
+// the publication tags, never lexicographic comparison (mint and append
+// are not atomic; see serials.go). A cursor that no longer resolves
+// (expired from the retention window, or a serial only seen on a
+// history-free live presence event) loses continuity: the attach
+// proceeds fresh, without RESUMED — exactly how Ably signals an
+// unbridgeable gap.
+func (s *session) resolveCursor(channel, cursor string) (centrifuge.StreamPosition, bool) {
+	res, err := s.node.History(channel,
+		centrifuge.WithLimit(persistedHistorySize), centrifuge.WithReverse(true))
+	if err != nil {
+		return centrifuge.StreamPosition{}, false
+	}
+	for _, pub := range res.Publications {
+		if pub.Tags[pubTagSerial] == cursor {
+			return centrifuge.StreamPosition{Offset: pub.Offset, Epoch: res.StreamPosition.Epoch}, true
+		}
+	}
+	return centrifuge.StreamPosition{}, false
+}
+
 // latestChannelSerial returns the serial of the channel's most recent
 // publication — the attach point ATTACHED advertises (RTL15a
 // attachSerial) — or "" for a channel with no retained publications.
@@ -593,7 +613,18 @@ func (s *session) latestChannelSerial(channel string) string {
 	return res.Publications[0].Tags[pubTagSerial]
 }
 
-func (s *session) writeAttached(channel string, params map[string]string, modes int64) {
+// writeAttached records the attachment grant and confirms it on the wire:
+// ATTACHED echoing the recognized params (RTL4k1) and the granted mode bits
+// (RTL4m), HAS_PRESENCE + a single-page SYNC when members exist (RTP18-lite
+// — members delivered as PRESENT; no channelSerial cursor means ably-js
+// setPresence completes the sync on this frame). Called from the
+// opSubscribe reply (fresh attach, centrifuge reply goroutine) and from
+// the re-attach update path (frame-reader goroutine). On a resumed
+// attach, presence events that occurred inside the gap are NOT replayed
+// (live presence publications are history-free): current presence state
+// arrives via HAS_PRESENCE + SYNC here instead — matching Ably, which
+// re-syncs presence on resume rather than replaying it.
+func (s *session) writeAttached(channel string, params map[string]string, modes int64, extraFlags int64) {
 	// An unrestricted request is granted the full default mode set —
 	// ATTACHED always carries mode bits.
 	if modes == 0 {
@@ -603,7 +634,7 @@ func (s *session) writeAttached(channel string, params map[string]string, modes 
 	if modeAllows(modes, protocol.FlagModePresenceSubscribe) {
 		members = s.presence.members(channel)
 	}
-	var flags int64
+	flags := extraFlags
 	if len(members) > 0 {
 		flags |= protocol.FlagHasPresence
 	}
@@ -664,10 +695,33 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	_, alreadyAttached := s.attachedModes[channel]
 	s.modesMu.Unlock()
 	if alreadyAttached {
-		s.writeAttached(channel, m.Params, modesFromAttach(m))
+		// Options update on a live attachment: continuity was never broken,
+		// which RTL12 semantics signal with RESUMED.
+		s.writeAttached(channel, m.Params, modesFromAttach(m), protocol.FlagResumed)
 		return
 	}
 	sub := &cproto.SubscribeRequest{Channel: channel}
+	// RTL4j territory: an ATTACH presenting a channelSerial cursor asks to
+	// resume from that position. When the cursor resolves to a retained
+	// publication, the synthesized subscribe requests centrifuge recovery
+	// from its offset — the broker replays the gap atomically with the
+	// subscription (no read-then-subscribe race). An unresolvable cursor
+	// attaches fresh (no RESUMED flag = discontinuity, the Ably signal).
+	resuming := false
+	if m.ChannelSerial != "" {
+		if pos, ok := s.resolveCursor(channel, m.ChannelSerial); ok {
+			// Recover asks for replay from the position NOW; Recoverable is
+			// the separate declarative property centrifugo's permission
+			// chain checks (chOpts.AllowRecovery gates e.Recoverable —
+			// internal/client/handler.go) before the library honors
+			// Recover. Both are required.
+			sub.Recover = true
+			sub.Recoverable = true
+			sub.Offset = pos.Offset
+			sub.Epoch = pos.Epoch
+			resuming = true
+		}
+	}
 	if !s.params.echo {
 		// RTL7f: an echo=false connection (RTN2b; RTC1a — echo defaults to
 		// on) must not receive its own publications back. Every adapter
@@ -691,10 +745,11 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	}
 	cmd := &cproto.Command{
 		Id: s.addPending(pendingOp{
-			kind:    opSubscribe,
-			channel: channel,
-			params:  m.Params,
-			modes:   modesFromAttach(m),
+			kind:     opSubscribe,
+			channel:  channel,
+			params:   m.Params,
+			modes:    modesFromAttach(m),
+			resuming: resuming,
 		}),
 		Subscribe: sub,
 	}
@@ -835,7 +890,19 @@ func (s *session) handleReply(reply *cproto.Reply) {
 				s.writeAttachError(op.channel, reply.Error)
 				return
 			}
-			s.writeAttached(op.channel, op.params, op.modes)
+			// RTL4j: a resumed attach replays the gap after ATTACHED. The
+			// RESUMED flag is only set when the broker confirmed recovery
+			// (RTL12: its absence signals a discontinuity).
+			var extraFlags int64
+			var replay []*cproto.Publication
+			if op.resuming && reply.Subscribe != nil && reply.Subscribe.Recovered {
+				extraFlags |= protocol.FlagResumed
+				replay = reply.Subscribe.Publications
+			}
+			s.writeAttached(op.channel, op.params, op.modes, extraFlags)
+			for _, pub := range replay {
+				s.deliverPublication(op.channel, pub)
+			}
 		case opUnsubscribe:
 			// RTL5d: confirm with DETACHED. Centrifuge unsubscribe is
 			// idempotent, so detaching a never-attached channel still

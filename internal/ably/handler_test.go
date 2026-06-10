@@ -187,8 +187,18 @@ func newRealtimeServer(t *testing.T) *realtimeTestServer {
 			// into the SubscribeReply options); without it centrifuge rejects
 			// any SubscribeRequest carrying a Tf filter — the echo=false
 			// attach path (RTL7f).
+			// Mirrors centrifugo's permission chain (internal/client/
+			// handler.go:853): recovery is granted ONLY when the subscribe
+			// declares the Recoverable property — matching how
+			// allow_recovery behaves in production, so a missing
+			// sub.Recoverable fails here too (it did once: the gap-replay
+			// path set only Recover and recovery silently never engaged on
+			// the real server).
 			cb(centrifuge.SubscribeReply{
-				Options: centrifuge.SubscribeOptions{AllowTagsFilter: true},
+				Options: centrifuge.SubscribeOptions{
+					AllowTagsFilter: true,
+					EnableRecovery:  e.Recoverable,
+				},
 			}, nil)
 		})
 	})
