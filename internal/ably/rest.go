@@ -334,6 +334,28 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 		return
 	}
 
+	// untilAttach (RSL2b-adjacent): ably-js translates history
+	// {untilAttach: true} into from_serial=<attachSerial> — the ATTACHED
+	// channelSerial (realtimechannel.ts history). The serial resolves to
+	// its publication's offset by tag LOOKUP (see serials.go) and bounds
+	// the read at that offset INCLUSIVE: the attach-point publication is
+	// the newest pre-attach message. An attach point that has left the
+	// retention window means nothing retained is pre-attach — empty page.
+	var boundOffset uint64 // 0 = unbounded
+	var boundEpoch string
+	if fromSerial := q.Get("from_serial"); fromSerial != "" {
+		var ok bool
+		boundOffset, boundEpoch, ok = h.resolveSerialOffset(readChannel, fromSerial)
+		if !ok {
+			// Also reachable on page 2+ if the attach-point publication is
+			// evicted mid-pagination: the empty page ends the walk early
+			// even though older pre-attach messages may survive — marginal
+			// under PoC retention windows, matching first-page behavior.
+			h.writeHistoryPage(rw, r, kind, nil, limit, backwards, false, 0, "")
+			return
+		}
+	}
+
 	var pubs []*centrifuge.Publication
 	var epoch string
 	var err error
@@ -363,6 +385,17 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 			pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(limit),
 				centrifuge.WithSince(&centrifuge.StreamPosition{Offset: cursor, Epoch: cursorEpoch}))
 		}
+	} else if backwards && boundOffset > 0 {
+		// First page of a bounded backwards read: identical shape to a
+		// cursor at boundOffset+1, so the window is [bound-limit+1, bound].
+		low := uint64(1)
+		if boundOffset >= uint64(limit) {
+			low = boundOffset - uint64(limit) + 1
+		}
+		count := int(boundOffset - low + 1)
+		pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(count),
+			centrifuge.WithSince(&centrifuge.StreamPosition{Offset: low - 1, Epoch: boundEpoch}))
+		reversePubs(pubs)
 	} else {
 		pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(limit), centrifuge.WithReverse(backwards))
 	}
@@ -370,6 +403,19 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 		log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("history read failed")
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "history read failed")
 		return
+	}
+
+	if boundOffset > 0 && !backwards {
+		// Forwards reads enforce the bound by truncation on every page
+		// (from_serial survives into the page links); reaching the bound
+		// ends pagination.
+		kept := pubs[:0]
+		for _, pub := range pubs {
+			if pub.Offset <= boundOffset {
+				kept = append(kept, pub)
+			}
+		}
+		pubs = kept
 	}
 
 	// Page cursors come from the raw publication window, BEFORE the time
@@ -433,9 +479,29 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 		nextCursor = lowestOffset
 	} else {
 		hasNext = len(pubs) == limit
+		if boundOffset > 0 && highestOffset >= boundOffset {
+			hasNext = false
+		}
 		nextCursor = highestOffset
 	}
 	h.writeHistoryPage(rw, r, kind, items, limit, backwards, hasNext, nextCursor, epoch)
+}
+
+// resolveSerialOffset maps a channelSerial to the broker offset of the
+// publication that carried it — tag LOOKUP, never lexicographic
+// comparison (serials.go). Used by the from_serial history bound.
+func (h *Handler) resolveSerialOffset(channel, serial string) (uint64, string, bool) {
+	pubs, epoch, err := h.historyPubs(channel,
+		centrifuge.WithLimit(persistedHistorySize), centrifuge.WithReverse(true))
+	if err != nil {
+		return 0, "", false
+	}
+	for _, pub := range pubs {
+		if pub.Tags[pubTagSerial] == serial {
+			return pub.Offset, epoch, true
+		}
+	}
+	return 0, "", false
 }
 
 func (h *Handler) historyPubs(channel string, opts ...centrifuge.HistoryOption) ([]*centrifuge.Publication, string, error) {
@@ -480,6 +546,12 @@ func (h *Handler) writeHistoryPage(rw http.ResponseWriter, r *http.Request, kind
 	}
 	if raw := r.URL.Query().Get("end"); raw != "" {
 		bounds += "&end=" + url.QueryEscape(raw)
+	}
+	if raw := r.URL.Query().Get("from_serial"); raw != "" {
+		// The untilAttach bound survives into page links: backwards pages
+		// continue via cursor (already below the bound); forwards pages
+		// re-apply the truncation.
+		bounds += "&from_serial=" + url.QueryEscape(raw)
 	}
 	first := fmt.Sprintf("%s?limit=%d&direction=%s%s", base, limit, direction, bounds)
 	links := []string{fmt.Sprintf("<%s>; rel=\"first\"", first)}
