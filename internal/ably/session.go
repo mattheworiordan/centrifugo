@@ -34,8 +34,9 @@ package ably
 // calls node.Publish directly. Delivery rides the per-connection client:
 // subscribed clients receive the publication and handleReply translates
 // push.Pub back into Ably MESSAGE frames — including to the publisher
-// itself via its own subscription (the RTC1a echo-on default; echo=false
-// filtering, RTL7f, is M1.3).
+// itself via its own subscription (the RTC1a echo-on default). echo=false
+// connections suppress their own messages with a subscription tags filter
+// (RTL7f, see attach).
 
 import (
 	"context"
@@ -72,6 +73,7 @@ const (
 // code registry (github.com/ably/ably-common protocol/errors.json).
 const (
 	errCodeBadRequest             = 40000 // bad request
+	errCodeMaxMessageLength       = 40009 // maximum message length exceeded
 	errCodeInvalidClientID        = 40012 // invalid client id
 	errCodeInvalidCredentials     = 40101 // invalid credentials
 	errCodeOperationNotPermitted  = 40160 // operation not permitted with provided capability
@@ -86,9 +88,9 @@ const (
 const writeTimeout = 5 * time.Second
 
 // pubTagOrigin is the publication tag carrying the publisher's Ably
-// connectionId. Set on every adapter publish; M1.3 synthesizes a
-// SubscribeRequest.Tf filter NOT(o == own connectionId) from it for
-// echo=false connections (RTL7f).
+// connectionId. Set on every adapter publish; echo=false connections
+// subscribe with a SubscribeRequest.Tf filter excluding it (RTL7f, see
+// attach).
 const pubTagOrigin = "o"
 
 // sessionParams carries the per-connection parameters extracted from the
@@ -100,9 +102,9 @@ type sessionParams struct {
 	// clientID is the clientId query param (RTN2d), echoed back in
 	// connectionDetails.clientId (CD2a) when set.
 	clientID string
-	// echo is the echo query param (RTN2b). Stored now; echo=false
-	// filtering lands in M1.3 (fan-out currently always echoes, the
-	// echo=true default).
+	// echo is the echo query param (RTN2b; on by default per RTC1a). When
+	// false, every ATTACH subscribes with a tags filter suppressing this
+	// connection's own publications (RTL7f, see attach).
 	echo bool
 	// protocolVersion is the v query param (RTN2f). Stored, not yet acted
 	// on.
@@ -358,6 +360,37 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		}
 	}
 
+	// Marshal every envelope before the first publish: the marshaled bytes
+	// are both the publication payload and the measurement basis for the
+	// maxMessageSize check, which must reject the frame before anything is
+	// published.
+	payloads := make([][]byte, 0, len(m.Messages))
+	totalSize := 0
+	for _, msg := range m.Messages {
+		data, err := json.Marshal(msg)
+		if err != nil {
+			s.writeNack(m.MsgSerial, errCodeInternal, 500, fmt.Sprintf("publish failed: %s", err))
+			return
+		}
+		payloads = append(payloads, data)
+		totalSize += len(data)
+	}
+	// CD2c/TO3l8: maxMessageSize, advertised in connectionDetails, limits
+	// the summed size of a frame's messages array (the realtime counterpart
+	// of REST's RSL1i, same error code 40009). Measured here as the summed
+	// marshaled-envelope byte size; real Ably sums name + data + clientId +
+	// extras only, so the server-added envelope fields (id, connectionId,
+	// timestamp) make this adapter marginally stricter, never looser. This
+	// is the application-level limit: the frame is NACKed, nothing is
+	// published, and the connection stays usable — contrast the protocol-
+	// level maxFrameSize read limit set in serveRealtime, which kills the
+	// connection outright.
+	if totalSize > maxMessageSize {
+		s.writeNack(m.MsgSerial, errCodeMaxMessageLength, 400,
+			fmt.Sprintf("publish failed: maximum message length exceeded (%d bytes, limit %d)", totalSize, maxMessageSize))
+		return
+	}
+
 	// Publish sequentially in frame order. Each Message becomes one
 	// centrifuge Publication; order preservation is what M1.2 guarantees —
 	// atomic batch semantics and server-assigned serials land with
@@ -366,13 +399,8 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// back: NACK is the honest verdict (an ACK would falsely confirm the
 	// tail), and an SDK retry (RTN19a) may duplicate the prefix until
 	// idempotent dedup lands in M3.
-	for _, msg := range m.Messages {
-		data, err := json.Marshal(msg)
-		if err != nil {
-			s.writeNack(m.MsgSerial, errCodeInternal, 500, fmt.Sprintf("publish failed: %s", err))
-			return
-		}
-		_, err = s.node.Publish(m.Channel, data,
+	for _, data := range payloads {
+		_, err := s.node.Publish(m.Channel, data,
 			centrifuge.WithTags(map[string]string{pubTagOrigin: connectionID}))
 		if err != nil {
 			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("publish failed")
@@ -412,9 +440,31 @@ func (s *session) writeNack(msgSerial int64, code int, statusCode int, message s
 }
 
 func (s *session) attach(channel string) {
+	sub := &cproto.SubscribeRequest{Channel: channel}
+	if !s.params.echo {
+		// RTL7f: an echo=false connection (RTN2b; RTC1a — echo defaults to
+		// on) must not receive its own publications back. Every adapter
+		// publish tags its publications with the publisher's connectionId
+		// (pubTagOrigin, see publish), so the subscription carries a tags
+		// filter excluding them. The leaf FilterNode (Op "") with Cmp "neq"
+		// matches when the tag is absent OR differs (centrifuge
+		// internal/filter CompareNotEQ), so untagged publications from
+		// native Centrifugo clients still deliver.
+		//
+		// Preconditions and invariants, both verified in centrifuge:
+		//   - The filter is only honored when the channel allows tags
+		//     filters (SubscribeOptions.AllowTagsFilter, centrifugo channel
+		//     option allow_tags_filter); otherwise centrifuge rejects the
+		//     subscribe (client.go subscribeCmd).
+		//   - Filtered publications still reach writePublication for offset
+		//     tracking (hub.go broadcastPublication), so the subscriber's
+		//     stream position advances and a future resume (M3) sees no
+		//     false discontinuity.
+		sub.Tf = &cproto.FilterNode{Cmp: "neq", Key: pubTagOrigin, Val: s.client.ID()}
+	}
 	cmd := &cproto.Command{
 		Id:        s.addPending(pendingOp{kind: opSubscribe, channel: channel}),
-		Subscribe: &cproto.SubscribeRequest{Channel: channel},
+		Subscribe: sub,
 	}
 	if !s.client.HandleCommand(cmd, cmd.SizeVT()) {
 		// HandleCommand can return false after a successful dispatch (its

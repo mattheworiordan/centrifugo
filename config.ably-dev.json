@@ -11,7 +11,8 @@
       "presence": true,
       "history_size": 100,
       "history_ttl": "300s",
-      "allow_subscribe_for_client": true
+      "allow_subscribe_for_client": true,
+      "allow_tags_filter": true
     }
   },
   "log": {

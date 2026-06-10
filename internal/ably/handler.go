@@ -107,6 +107,16 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Protocol-level inbound size guard: cap WS reads at the maxFrameSize
+	// the connection advertises in connectionDetails (CD2d), so an abusive
+	// frame cannot exhaust memory. Exceeding this READ limit kills the
+	// connection (the websocket library sends a close message and the
+	// session read loop errors out) — unlike the application-level
+	// maxMessageSize check (CD2c) in the session publish path, which NACKs
+	// the frame and keeps the connection alive. The gap between the two
+	// limits is headroom for protocol overhead around legitimate payloads.
+	conn.SetReadLimit(maxFrameSize)
+
 	if authErr != nil {
 		// RTN14a: an invalid API key fails the connection. The ERROR frame
 		// has an empty channel attribute, so the client transitions to

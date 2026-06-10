@@ -176,7 +176,14 @@ func newRealtimeServer(t *testing.T) *realtimeTestServer {
 				cb(centrifuge.SubscribeReply{}, centrifuge.ErrorPermissionDenied)
 				return
 			}
-			cb(centrifuge.SubscribeReply{}, nil)
+			// AllowTagsFilter mirrors centrifugo's allow_tags_filter channel
+			// option (internal/client/handler.go maps chOpts.AllowTagsFilter
+			// into the SubscribeReply options); without it centrifuge rejects
+			// any SubscribeRequest carrying a Tf filter — the echo=false
+			// attach path (RTL7f).
+			cb(centrifuge.SubscribeReply{
+				Options: centrifuge.SubscribeOptions{AllowTagsFilter: true},
+			}, nil)
 		})
 	})
 
@@ -533,8 +540,8 @@ func TestRealtimePublishFanOut_RTL6_RTL7(t *testing.T) {
 
 // RTC1a: echoMessages is on by default, so an attached publisher receives
 // its own message back via its subscription, alongside the ACK. (RTL7f —
-// the echo=false suppression test — is M1.3.) The two frames originate
-// from different goroutines, so order is not asserted.
+// echo=false suppression — is TestRealtimeNoEcho_RTL7f.) The two frames
+// originate from different goroutines, so order is not asserted.
 func TestRealtimePublishEcho_RTC1a(t *testing.T) {
 	t.Parallel()
 	ts := newRealtimeServer(t)
@@ -569,6 +576,172 @@ func TestRealtimePublishEcho_RTC1a(t *testing.T) {
 	require.Equal(t, "echo-test", delivered.Channel)
 	require.Len(t, delivered.Messages, 1)
 	require.Equal(t, "hello", delivered.Messages[0].Data)
+}
+
+// RTL7f: a connection with echo=false (RTN2b; RTC1a — echo defaults to on)
+// never receives its own messages back, while other attached connections
+// do, and messages from others still reach it (the filter suppresses own
+// messages only). Suppression is asserted with a marker rather than a
+// sleep: publications on one channel reach a subscriber in publish order,
+// so if A's own message had been delivered it would precede B's marker on
+// A's connection.
+func TestRealtimeNoEcho_RTL7f(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	// A: echo=false, attached.
+	paramsA := defaultDialParams()
+	paramsA.Set("echo", "false")
+	connA := dialRealtime(t, ts.wsURL, paramsA)
+	connectedA := readFrame(t, connA)
+	require.Equal(t, protocol.ActionConnected, connectedA.Action)
+	writeFrame(t, connA, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "noecho-test"})
+	attachedA := readNonHeartbeatFrame(t, connA)
+	require.Equal(t, protocol.ActionAttached, attachedA.Action)
+
+	// B: echo default (on), attached.
+	connB := connectRealtime(t, ts)
+	writeFrame(t, connB, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "noecho-test"})
+	attachedB := readNonHeartbeatFrame(t, connB)
+	require.Equal(t, protocol.ActionAttached, attachedB.Action)
+
+	// A publishes: A gets its ACK (RTN7a), B receives the message, A must
+	// not — asserted via the marker below.
+	writeFrame(t, connA, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "noecho-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "from-a", Data: "a-1"}},
+	})
+	ackA := readNonHeartbeatFrame(t, connA)
+	require.Equal(t, protocol.ActionAck, ackA.Action)
+	require.Equal(t, int64(0), ackA.MsgSerial)
+
+	deliveredB := readNonHeartbeatFrame(t, connB)
+	require.Equal(t, protocol.ActionMessage, deliveredB.Action)
+	require.Len(t, deliveredB.Messages, 1)
+	require.Equal(t, "from-a", deliveredB.Messages[0].Name)
+
+	// Marker: B publishes next. B (echo on) gets ACK plus its own echo, in
+	// either order (different goroutines).
+	writeFrame(t, connB, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "noecho-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "from-b", Data: "b-1"}},
+	})
+	var ackB, echoB *protocol.ProtocolMessage
+	for range 2 {
+		switch m := readNonHeartbeatFrame(t, connB); m.Action {
+		case protocol.ActionAck:
+			ackB = m
+		case protocol.ActionMessage:
+			echoB = m
+		default:
+			t.Fatalf("unexpected frame action %d", m.Action)
+		}
+	}
+	require.NotNil(t, ackB)
+	require.NotNil(t, echoB)
+	require.Len(t, echoB.Messages, 1)
+	require.Equal(t, "from-b", echoB.Messages[0].Name)
+
+	// A's FIRST received MESSAGE is B's marker: A's own "from-a" — published
+	// before it — was never delivered, and messages from others get through.
+	deliveredA := readNonHeartbeatFrame(t, connA)
+	require.Equal(t, protocol.ActionMessage, deliveredA.Action)
+	require.Len(t, deliveredA.Messages, 1)
+	require.Equal(t, "from-b", deliveredA.Messages[0].Name)
+}
+
+// CD2c/TO3l8: a MESSAGE frame whose summed message payload size exceeds the
+// advertised maxMessageSize is rejected as a whole — NACK with 40009
+// (maximum message length exceeded), statusCode 400, the realtime
+// counterpart of REST's RSL1i — publishing nothing, and the connection
+// survives (application-level reject; contrast the read-limit drop below).
+func TestRealtimePublishMaxMessageSize(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "maxsize-test"})
+	attached := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+
+	// Two messages, each under the limit, summing over it: the limit binds
+	// on the frame's summed payload size (TO3l8), not per message.
+	big := strings.Repeat("x", 40_000)
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "maxsize-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "big-0", Data: big}, {Name: "big-1", Data: big}},
+	})
+	nack := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionNack, nack.Action)
+	require.Equal(t, int64(0), nack.MsgSerial)
+	require.Equal(t, 1, nack.Count)
+	require.NotNil(t, nack.Error)
+	require.Equal(t, errCodeMaxMessageLength, nack.Error.Code)
+	require.Equal(t, http.StatusBadRequest, nack.Error.StatusCode)
+
+	// The connection stays usable: a follow-up publish ACKs, and its echo is
+	// the FIRST delivered MESSAGE — nothing from the rejected frame was
+	// published (delivery is in publish order).
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "maxsize-test",
+		MsgSerial: 1,
+		Messages:  []*protocol.Message{{Name: "small", Data: "ok"}},
+	})
+	var ack, delivered *protocol.ProtocolMessage
+	for range 2 {
+		switch m := readNonHeartbeatFrame(t, conn); m.Action {
+		case protocol.ActionAck:
+			ack = m
+		case protocol.ActionMessage:
+			delivered = m
+		default:
+			t.Fatalf("unexpected frame action %d", m.Action)
+		}
+	}
+	require.NotNil(t, ack)
+	require.Equal(t, int64(1), ack.MsgSerial)
+	require.NotNil(t, delivered)
+	require.Len(t, delivered.Messages, 1)
+	require.Equal(t, "small", delivered.Messages[0].Name)
+}
+
+// CD2d: a frame beyond the advertised maxFrameSize trips the WS read limit
+// set in serveRealtime — the protocol-level guard. Unlike the
+// application-level maxMessageSize NACK above, this kills the connection.
+func TestRealtimeReadLimitExceeded_CD2d(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	frame := &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "readlimit-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "huge", Data: strings.Repeat("x", maxFrameSize+1024)}},
+	}
+	data, err := protocol.Marshal(frame, protocol.FormatJSON)
+	require.NoError(t, err)
+	// The write itself may error mid-frame: the server aborts as soon as the
+	// frame header announces an over-limit payload, possibly before the
+	// client drains its send buffer.
+	_ = conn.WriteMessage(websocket.TextMessage, data)
+
+	// The connection dies (heartbeats may interleave before the close
+	// arrives). The read must end in a server-side close, not a timeout.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	for {
+		if _, _, err := conn.ReadMessage(); err != nil {
+			requireServerClosed(t, err)
+			return
+		}
+	}
 }
 
 // RTL6g: an identified connection publishing a Message with an

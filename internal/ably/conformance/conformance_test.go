@@ -142,7 +142,8 @@ func TestPublishSingle_mirrors_publishonce_RTL6(t *testing.T) {
 // TestPublishEcho_mirrors_publishEcho_RTC1a mirrors the echoMessages=true
 // half of ably-js realtime/message "publishEcho": with echo on (the
 // default) an attached publisher receives its own message back via its
-// subscription. echo=false suppression is M1.3.
+// subscription. The echoMessages=false half is
+// TestPublishNoEcho_mirrors_publishEcho_RTL7f.
 func TestPublishEcho_mirrors_publishEcho_RTC1a(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -157,6 +158,42 @@ func TestPublishEcho_mirrors_publishEcho_RTC1a(t *testing.T) {
 	require.Equal(t, "greeting", msg.Name)
 	require.Equal(t, "hello-echo", msg.Data)
 	require.Equal(t, publisher.Connection.ID(), msg.ConnectionID)
+}
+
+// TestPublishNoEcho_mirrors_publishEcho_RTL7f mirrors the
+// echoMessages=false half of ably-js realtime/message "publishEcho": with
+// echo disabled in the client options (ably-go WithEchoMessages(false),
+// which puts echo=false on the upgrade querystring per RTN2b) the publisher
+// does not receive its own message back, while a separate subscriber does
+// (RTL7f; RTC1a is the echo-on default). Suppression is asserted with a
+// marker rather than a sleep: messages on one channel reach a subscriber in
+// publish order, so the suppressed echo, were it delivered, would arrive at
+// the publisher before the marker.
+func TestPublishNoEcho_mirrors_publishEcho_RTL7f(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	publisher := newRealtime(t, ably.WithEchoMessages(false))
+	subscriber := newRealtime(t)
+	publisherReceived := subscribeAll(t, ctx, publisher, "conformance-publishnoecho")
+	subscriberReceived := subscribeAll(t, ctx, subscriber, "conformance-publishnoecho")
+
+	require.NoError(t, publisher.Channels.Get("conformance-publishnoecho").
+		Publish(ctx, "greeting", "hello-noecho"))
+
+	msg := waitMessage(t, "subscriber (fan-out)", subscriberReceived)
+	require.Equal(t, "greeting", msg.Name)
+	require.Equal(t, "hello-noecho", msg.Data)
+
+	// Marker: the subscriber publishes a follow-up. The publisher's FIRST
+	// received message must be the marker — its own message was never
+	// echoed.
+	require.NoError(t, subscriber.Channels.Get("conformance-publishnoecho").
+		Publish(ctx, "marker", "from-subscriber"))
+
+	marker := waitMessage(t, "publisher (marker)", publisherReceived)
+	require.Equal(t, "marker", marker.Name)
+	require.Equal(t, "from-subscriber", marker.Data)
 }
 
 // TestPublishImplicitClientID_mirrors_implicit_client_id_0_RTL6g1 mirrors
