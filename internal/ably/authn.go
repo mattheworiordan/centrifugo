@@ -1,0 +1,88 @@
+package ably
+
+// Unified request/connection authentication for both surfaces: token auth
+// (Ably-JWT via the access_token query param on realtime upgrades —
+// RTC1-territory, ably-js auth.ts — or an Authorization: Bearer header on
+// REST) takes precedence over Basic key auth (RSA11: Basic header or key
+// query param). Verify-only: tokens are externally minted against the
+// static key store's keys.
+
+import (
+	"errors"
+	"net/http"
+	"strings"
+
+	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
+)
+
+// authResult is the resolved identity of an authenticated caller.
+type authResult struct {
+	// viaToken reports token authentication (identity comes from the
+	// token claims; the RSA7e2 X-Ably-ClientId header applies only to
+	// Basic auth).
+	viaToken bool
+	// clientID is the bound identity; empty = unidentified.
+	clientID string
+	// wildcardClientID reports a token whose clientId is the literal "*"
+	// (RSA7b4): the caller has no identity but may assume any.
+	wildcardClientID bool
+	// capability is the verbatim capability JSON governing the caller:
+	// the key's capability for Basic auth, the x-ably-capability claim
+	// for token auth. Enforced from M4.3.
+	capability string
+	// keyName is the authenticating key (Basic) or signing key (token).
+	keyName string
+}
+
+// authProblem is the Ably error verdict of a failed authentication,
+// written in-band by the realtime surface and as an HTTP error by REST.
+type authProblem struct {
+	code       int
+	statusCode int
+	message    string
+}
+
+// authenticate resolves the caller's identity. Token credentials win when
+// both schemes are presented (SDKs send exactly one).
+func (h *Handler) authenticate(r *http.Request) (authResult, *authProblem) {
+	token := r.URL.Query().Get("access_token")
+	if token == "" {
+		if bearer := r.Header.Get("Authorization"); strings.HasPrefix(bearer, "Bearer ") {
+			token = strings.TrimPrefix(bearer, "Bearer ")
+		}
+	}
+	if token != "" {
+		claims, err := h.keys.VerifyToken(token)
+		switch {
+		case errors.Is(err, auth.ErrTokenExpired):
+			// 40142: the client is expected to renew and retry (RSA4b).
+			return authResult{}, &authProblem{code: 40142, statusCode: http.StatusUnauthorized, message: "token expired"}
+		case err != nil:
+			return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: "invalid token"}
+		}
+		res := authResult{
+			viaToken:   true,
+			capability: claims.Capability,
+			keyName:    claims.KeyName,
+		}
+		if claims.ClientID == "*" {
+			res.wildcardClientID = true // RSA7b4
+		} else {
+			res.clientID = claims.ClientID
+		}
+		return res, nil
+	}
+
+	key, err := h.keys.Authenticate(r)
+	if err != nil {
+		message := "invalid credentials"
+		if errors.Is(err, auth.ErrNoCredentials) {
+			message = "no credentials presented"
+		}
+		return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: message}
+	}
+	return authResult{
+		capability: key.Capability,
+		keyName:    key.APIKey.AppID + "." + key.APIKey.KeyID,
+	}, nil
+}

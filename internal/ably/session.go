@@ -72,17 +72,18 @@ const (
 // Ably error codes used by the adapter, verified against the Ably error
 // code registry (github.com/ably/ably-common protocol/errors.json).
 const (
-	errCodeBadRequest             = 40000 // bad request
-	errCodeInvalidConnectionID    = 40006 // invalid connection id
-	errCodeMaxMessageLength       = 40009 // maximum message length exceeded
-	errCodeInvalidChannelName     = 40010 // invalid channel name
-	errCodeInvalidClientID        = 40012 // invalid client id
-	errCodeInvalidCredentials     = 40101 // invalid credentials
-	errCodeOperationNotPermitted  = 40160 // operation not permitted with provided capability
-	errCodeNotFound               = 40400 // not found
-	errCodeInternal               = 50000 // internal error
-	errCodeDisconnected           = 80003 // disconnected
-	errCodeChannelOperationFailed = 90000 // channel operation failed
+	errCodeBadRequest              = 40000 // bad request
+	errCodeInvalidConnectionID     = 40006 // invalid connection id
+	errCodeMaxMessageLength        = 40009 // maximum message length exceeded
+	errCodeInvalidChannelName      = 40010 // invalid channel name
+	errCodeInvalidClientID         = 40012 // invalid client id
+	errCodeInvalidCredentials      = 40101 // invalid credentials
+	errCodeIncompatibleCredentials = 40102 // incompatible credentials
+	errCodeOperationNotPermitted   = 40160 // operation not permitted with provided capability
+	errCodeNotFound                = 40400 // not found
+	errCodeInternal                = 50000 // internal error
+	errCodeDisconnected            = 80003 // disconnected
+	errCodeChannelOperationFailed  = 90000 // channel operation failed
 )
 
 // writeTimeout bounds every WS write so a non-reading client cannot pin a
@@ -102,9 +103,14 @@ type sessionParams struct {
 	// userID becomes the centrifuge Credentials UserID: the clientId query
 	// param (RTN2d) when present, the authenticated key name otherwise.
 	userID string
-	// clientID is the clientId query param (RTN2d), echoed back in
+	// clientID is the connection's bound identity — the clientId query
+	// param (RTN2d) or the token-bound clientId (RSA7a) — echoed back in
 	// connectionDetails.clientId (CD2a) when set.
 	clientID string
+	// wildcardClientID reports a wildcard-token connection that assumed
+	// no identity: connectionDetails.clientId carries the literal "*"
+	// (RSA15b) while messages stay unstamped.
+	wildcardClientID bool
 	// echo is the echo query param (RTN2b; on by default per RTC1a). When
 	// false, every ATTACH subscribes with a tags filter suppressing this
 	// connection's own publications (RTL7f, see attach).
@@ -198,12 +204,19 @@ func (s *session) run(reqCtx context.Context) {
 	// ProtocolMessage is sent. The Ably WS protocol has no client→server
 	// CONNECT frame: the upgrade itself, with auth and options in query
 	// params (RTN2), is the connect request.
+	detailsClientID := s.params.clientID
+	if s.params.wildcardClientID {
+		// RSA15b: a wildcard-token connection that assumed no identity
+		// advertises the literal "*" — the SDK knows it may publish on
+		// behalf of any clientId. Messages stay unstamped.
+		detailsClientID = "*"
+	}
 	connectionID := s.client.ID()
 	err := s.writeFrame(&protocol.ProtocolMessage{
 		Action:       protocol.ActionConnected,
 		ConnectionID: connectionID,
 		ConnectionDetails: &protocol.ConnectionDetails{ // TR4o, CD1
-			ClientID:           s.params.clientID,     // CD2a
+			ClientID:           detailsClientID,       // CD2a
 			ConnectionKey:      connectionID + "!key", // CD2b; resume is M3, any opaque string
 			MaxMessageSize:     maxMessageSize,        // CD2c
 			MaxFrameSize:       maxFrameSize,          // CD2d

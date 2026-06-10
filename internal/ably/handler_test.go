@@ -21,6 +21,7 @@ import (
 	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 
 	"github.com/centrifugal/centrifuge"
+	"github.com/cristalhq/jwt/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -1142,4 +1143,140 @@ func TestRealtimeEncodingChainPassthrough_RSL6a(t *testing.T) {
 	require.Len(t, delivered.Messages, 1)
 	require.Equal(t, "json", delivered.Messages[0].Encoding)
 	require.Equal(t, `{"a":1}`, delivered.Messages[0].Data)
+}
+
+// mintSessionJWT signs an Ably-JWT against a testdata key for token-auth
+// tests (kid poc.key1).
+func mintSessionJWT(t *testing.T, clientID string, expires time.Time) string {
+	t.Helper()
+	signer, err := jwt.NewSignerHS(jwt.HS256, paddedTestSecret())
+	require.NoError(t, err)
+	claims := map[string]any{"exp": expires.Unix()}
+	if clientID != "" {
+		claims["x-ably-clientId"] = clientID
+	}
+	payload, err := json.Marshal(claims)
+	require.NoError(t, err)
+	token, err := jwt.NewBuilder(signer, jwt.WithKeyID("poc.key1")).Build(json.RawMessage(payload))
+	require.NoError(t, err)
+	return token.String()
+}
+
+// paddedTestSecret zero-pads poc.key1's secret to 32 bytes, matching the
+// verifier's Ably-JWT HMAC key derivation.
+func paddedTestSecret() []byte {
+	secret := []byte("secret_key1_0123456789abcdef")
+	padded := make([]byte, 32)
+	copy(padded, secret)
+	return padded
+}
+
+// Token auth on the realtime surface: access_token connects, the
+// token-bound clientId becomes the connection identity (RSA7a), expiry
+// maps to 40142, a mismatched clientId param to 40102 (RSA15a), and a
+// wildcard token advertises "*" in connectionDetails (RSA15b).
+func TestRealtimeTokenAuth(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	dialToken := func(t *testing.T, token string, extra func(url.Values)) *websocket.Conn {
+		params := url.Values{}
+		params.Set("format", "json")
+		params.Set("v", "6")
+		params.Set("access_token", token)
+		if extra != nil {
+			extra(params)
+		}
+		return dialRealtime(t, ts.wsURL, params)
+	}
+
+	t.Run("token-bound identity connects", func(t *testing.T) {
+		conn := dialToken(t, mintSessionJWT(t, "token-bob", time.Now().Add(time.Hour)), nil)
+		m := readFrame(t, conn)
+		require.Equal(t, protocol.ActionConnected, m.Action)
+		require.Equal(t, "token-bob", m.ConnectionDetails.ClientID) // CD2a
+		require.Eventually(t, func() bool { return ts.lastUser() == "token-bob" }, 2*time.Second, 10*time.Millisecond)
+	})
+
+	t.Run("RSA4b territory: expired token 40142", func(t *testing.T) {
+		conn := dialToken(t, mintSessionJWT(t, "x", time.Now().Add(-time.Minute)), nil)
+		m := readFrame(t, conn)
+		require.Equal(t, protocol.ActionError, m.Action)
+		require.Equal(t, 40142, m.Error.Code)
+		require.Equal(t, http.StatusUnauthorized, m.Error.StatusCode)
+	})
+
+	t.Run("RSA15a: clientId param incompatible with token 40102", func(t *testing.T) {
+		conn := dialToken(t, mintSessionJWT(t, "token-bob", time.Now().Add(time.Hour)), func(p url.Values) {
+			p.Set("clientId", "alice")
+		})
+		m := readFrame(t, conn)
+		require.Equal(t, protocol.ActionError, m.Action)
+		require.Equal(t, errCodeIncompatibleCredentials, m.Error.Code)
+	})
+
+	t.Run("RSA15a: matching clientId param accepted", func(t *testing.T) {
+		conn := dialToken(t, mintSessionJWT(t, "token-bob", time.Now().Add(time.Hour)), func(p url.Values) {
+			p.Set("clientId", "token-bob")
+		})
+		require.Equal(t, protocol.ActionConnected, readFrame(t, conn).Action)
+	})
+
+	t.Run("RSA15b: wildcard token advertises *", func(t *testing.T) {
+		conn := dialToken(t, mintSessionJWT(t, "*", time.Now().Add(time.Hour)), nil)
+		m := readFrame(t, conn)
+		require.Equal(t, protocol.ActionConnected, m.Action)
+		require.Equal(t, "*", m.ConnectionDetails.ClientID)
+	})
+
+	t.Run("RSA7b4: wildcard token may assume a clientId", func(t *testing.T) {
+		conn := dialToken(t, mintSessionJWT(t, "*", time.Now().Add(time.Hour)), func(p url.Values) {
+			p.Set("clientId", "carol")
+		})
+		m := readFrame(t, conn)
+		require.Equal(t, protocol.ActionConnected, m.Action)
+		require.Equal(t, "carol", m.ConnectionDetails.ClientID)
+	})
+
+	t.Run("invalid token 40101", func(t *testing.T) {
+		conn := dialToken(t, "garbage-token", nil)
+		m := readFrame(t, conn)
+		require.Equal(t, protocol.ActionError, m.Action)
+		require.Equal(t, errCodeInvalidCredentials, m.Error.Code)
+	})
+}
+
+// Token auth on the REST surface: Authorization Bearer authenticates, the
+// token clientId is the publisher identity, expiry maps to 40142.
+func TestRESTTokenAuth(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	bearer := func(token string) map[string]string {
+		return map[string]string{"Content-Type": contentTypeJSON, "Authorization": "Bearer " + token}
+	}
+	post := func(t *testing.T, token string) *http.Response {
+		req, err := http.NewRequest(http.MethodPost, ts.srv.URL+"/channels/persisted:rest-token/messages",
+			strings.NewReader(`{"name":"e"}`))
+		require.NoError(t, err)
+		for k, v := range bearer(token) {
+			req.Header.Set(k, v)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = resp.Body.Close() })
+		return resp
+	}
+
+	resp := post(t, mintSessionJWT(t, "rest-token-bob", time.Now().Add(time.Hour)))
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	resp = restRequest(t, ts, http.MethodGet, "/channels/persisted:rest-token/messages", nil, nil)
+	msgs := decodeMessagesBody(t, resp)
+	require.Len(t, msgs, 1)
+	require.Equal(t, "rest-token-bob", msgs[0].ClientID) // token identity stamped
+
+	resp = post(t, mintSessionJWT(t, "x", time.Now().Add(-time.Minute)))
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	require.Equal(t, "40142", resp.Header.Get("X-Ably-Errorcode"))
 }

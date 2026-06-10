@@ -98,11 +98,11 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// RTN2e/RSA11: verify the presented API key (Basic auth header or key
-	// query param) before any session state exists. The verdict is
-	// delivered in-band after the upgrade: Ably SDKs expect realtime auth
-	// failures as an ERROR ProtocolMessage, not a failed handshake.
-	key, authErr := h.keys.Authenticate(r)
+	// RTN2e/RSA11 + token auth: resolve the caller's identity before any
+	// session state exists. The verdict is delivered in-band after the
+	// upgrade: Ably SDKs expect realtime auth failures as an ERROR
+	// ProtocolMessage, not a failed handshake.
+	identity, authErr := h.authenticate(r)
 
 	conn, _, err := h.upgrade.Upgrade(rw, r, nil)
 	if err != nil {
@@ -121,20 +121,17 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(maxFrameSize)
 
 	if authErr != nil {
-		// RTN14a: an invalid API key fails the connection. The ERROR frame
+		// RTN14a: invalid credentials fail the connection. The ERROR frame
 		// has an empty channel attribute, so the client transitions to
 		// FAILED and the server terminates the connection (RTN14g).
-		message := "invalid credentials"
-		if errors.Is(authErr, auth.ErrNoCredentials) {
-			message = "no credentials presented"
-		}
-		writeConnectionError(conn, format, errCodeInvalidCredentials, http.StatusUnauthorized, message)
+		writeConnectionError(conn, format, authErr.code, authErr.statusCode, authErr.message)
 		_ = conn.Close()
 		return
 	}
 
-	// RTN2d: an explicit clientId param is assumed for the connection; the
-	// authenticated key name identifies it otherwise.
+	// RTN2d: an explicit clientId param is assumed for the connection; a
+	// token-bound identity (RSA7a) or the authenticating key name
+	// identifies it otherwise.
 	clientID := q.Get("clientId")
 	if clientID == "*" {
 		// RSA7c: the literal '*' clientId value is reserved (it denotes the
@@ -143,17 +140,32 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		return
 	}
-	userID := key.APIKey.AppID + "." + key.APIKey.KeyID
+	switch {
+	case identity.clientID != "":
+		// RSA15a: a clientId param must match the token-bound identity.
+		if clientID != "" && clientID != identity.clientID {
+			writeConnectionError(conn, format, errCodeIncompatibleCredentials, http.StatusUnauthorized,
+				"clientId is incompatible with the token's clientId")
+			_ = conn.Close()
+			return
+		}
+		clientID = identity.clientID
+	case identity.wildcardClientID:
+		// RSA7b4/RSA15b: a wildcard token carries no identity; the caller
+		// may assume any clientId (including none).
+	}
+	userID := identity.keyName
 	if clientID != "" {
 		userID = clientID
 	}
 
 	sess := newSession(h.node, conn, sessionParams{
-		userID:          userID,
-		clientID:        clientID,
-		echo:            q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
-		protocolVersion: q.Get("v"),               // RTN2f
-		format:          format,                   // RTN2a
+		userID:           userID,
+		clientID:         clientID,
+		wildcardClientID: identity.wildcardClientID && clientID == "",
+		echo:             q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
+		protocolVersion:  q.Get("v"),               // RTN2f
+		format:           format,                   // RTN2a
 	})
 	sess.run(r.Context())
 }

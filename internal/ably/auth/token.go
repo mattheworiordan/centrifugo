@@ -26,6 +26,8 @@ var (
 
 // TokenClaims is the verified identity an Ably-JWT carries.
 type TokenClaims struct {
+	// KeyName is the signing key (the kid header, appId.keyId).
+	KeyName string
 	// ClientID is the x-ably-clientId claim: the token-bound identity.
 	// The literal "*" is the wildcard identity (RSA7b4): the bearer may
 	// assume any clientId.
@@ -90,6 +92,7 @@ func (s *KeyStore) VerifyToken(token string) (TokenClaims, error) {
 		return TokenClaims{}, ErrTokenExpired
 	}
 	return TokenClaims{
+		KeyName:    parsed.Header().KeyID,
 		ClientID:   claims.ClientID,
 		Capability: claims.Capability,
 		Expires:    claims.Exp * 1000,

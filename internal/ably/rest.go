@@ -61,14 +61,16 @@ func (h *Handler) serveChannels(rw http.ResponseWriter, r *http.Request) {
 		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "not found")
 		return
 	}
-	// Every /channels route is authenticated (RSA11 Basic / key param).
-	if _, err := h.keys.Authenticate(r); err != nil {
-		h.writeError(rw, r, http.StatusUnauthorized, errCodeInvalidCredentials, "invalid credentials")
+	// Every /channels route is authenticated: token (Bearer) or Basic/key
+	// param (RSA11), resolved by the shared authenticator.
+	identity, authErr := h.authenticate(r)
+	if authErr != nil {
+		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
 		return
 	}
 	switch {
 	case sub == "messages" && r.Method == http.MethodPost:
-		h.serveRESTPublish(rw, r, channel)
+		h.serveRESTPublish(rw, r, channel, identity)
 	case sub == "messages" && r.Method == http.MethodGet:
 		h.serveRESTHistory(rw, r, channel)
 	case sub == "" && r.Method == http.MethodGet:
@@ -119,7 +121,7 @@ func decodeMessageBody(body []byte, format protocol.Format) ([]*protocol.Message
 }
 
 // serveRESTPublish implements POST /channels/{channel}/messages (RSL1).
-func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, channel string) {
+func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, channel string, identity authResult) {
 	if !validChannelName(channel) {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidChannelName, "invalid channel name")
 		return
@@ -171,18 +173,22 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		msg.ConnectionID = connID
 	}
 
-	// RSA7e2: a Basic-auth REST client conveys its identity as an
-	// X-Ably-ClientId header, Base64 encoded. An identified publisher's
-	// clientId is stamped on clientId-less messages and incompatible
-	// explicit clientIds are rejected (RSL1m1/RSL1m4, in the shared core).
-	publisherClientID := ""
-	if raw := r.Header.Get("X-Ably-ClientId"); raw != "" {
-		decoded, err := base64.StdEncoding.DecodeString(raw)
-		if err != nil {
-			h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidClientID, "invalid X-Ably-ClientId header")
-			return
+	// The publisher's identity: the token-bound clientId for token auth
+	// (a wildcard token has none and may assume any — RSA7b4); for Basic
+	// auth, the RSA7e2 X-Ably-ClientId header, Base64 encoded. An
+	// identified publisher's clientId is stamped on clientId-less messages
+	// and incompatible explicit clientIds are rejected (RSL1m1/RSL1m4, in
+	// the shared core).
+	publisherClientID := identity.clientID
+	if !identity.viaToken {
+		if raw := r.Header.Get("X-Ably-ClientId"); raw != "" {
+			decoded, err := base64.StdEncoding.DecodeString(raw)
+			if err != nil {
+				h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidClientID, "invalid X-Ably-ClientId header")
+				return
+			}
+			publisherClientID = string(decoded)
 		}
-		publisherClientID = string(decoded)
 	}
 
 	idBase, err := newRESTIDBase()
