@@ -37,6 +37,7 @@ const (
 // paths (/time, /channels/..., realtime WebSocket at /) which cannot be
 // prefixed.
 type Handler struct {
+	mint     *serialMint
 	node     *centrifuge.Node
 	config   configtypes.Ably
 	keys     *auth.KeyStore
@@ -61,6 +62,7 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 		upgrade.CheckOrigin = checkOrigin
 	}
 	h := &Handler{
+		mint:     newSerialMint(),
 		node:     n,
 		config:   c,
 		keys:     keys,
@@ -121,7 +123,7 @@ func (h *Handler) seedPresenceFixtures(path string) error {
 			if err != nil {
 				return fmt.Errorf("ably presence fixtures: %w", err)
 			}
-			if _, err := h.node.Publish(presenceHistoryChannel(ch.Name), data, publishOptions(ch.Name, "")...); err != nil {
+			if _, err := h.node.Publish(presenceHistoryChannel(ch.Name), data, publishOptions(ch.Name, "", h.mint.Mint(ch.Name))...); err != nil {
 				return fmt.Errorf("ably presence fixtures: %w", err)
 			}
 		}
@@ -236,7 +238,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		echo:             q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
 		protocolVersion:  q.Get("v"),               // RTN2f
 		format:           format,                   // RTN2a
-	}, h.presence)
+	}, h.presence, h.mint)
 	sess.run(r.Context())
 }
 

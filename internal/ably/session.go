@@ -153,6 +153,7 @@ type pendingOp struct {
 
 type session struct {
 	node     *centrifuge.Node
+	mint     *serialMint
 	conn     *websocket.Conn
 	params   sessionParams
 	presence *presenceStore
@@ -186,9 +187,10 @@ type session struct {
 	closeCh    chan struct{} // closed on teardown: stops the heartbeat ticker and cancels the client context
 }
 
-func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore) *session {
+func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore, mint *serialMint) *session {
 	return &session{
 		node:          node,
+		mint:          mint,
 		conn:          conn,
 		params:        params,
 		presence:      presence,
@@ -403,9 +405,10 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// 40009 reject NACKs the frame and keeps the connection alive —
 	// contrast the protocol-level maxFrameSize read limit set in
 	// serveRealtime, which kills the connection outright.
-	payloads, idemKeys, problem := buildEnvelopes(m.Messages, envelopeParams{
+	payloads, idemKeys, serials, problem := buildEnvelopes(m.Messages, envelopeParams{
 		connectionID: connectionID,
 		clientID:     s.params.clientID,
+		mintSerial:   func() string { return s.mint.Mint(m.Channel) },
 		newID: func(idx int) string {
 			// Server-assigned unique id of the form
 			// <connectionId>:<msgSerial>:<index> — the shape TM2a expects
@@ -432,7 +435,7 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		// retention window (RSL1k2/RSL1k5): the broker returns the cached
 		// stream position and publishes nothing, so the duplicate still
 		// ACKs (the SDK retry contract) without a second delivery.
-		opts := publishOptions(m.Channel, connectionID)
+		opts := publishOptions(m.Channel, connectionID, serials[i])
 		if idemKeys[i] != "" {
 			opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
 				centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
@@ -574,6 +577,22 @@ func modeAllows(modes int64, ability int64) bool {
 // setPresence completes the sync on this frame). Called from the
 // opSubscribe reply (fresh attach, centrifuge reply goroutine) and from
 // the re-attach update path (frame-reader goroutine).
+// latestChannelSerial returns the serial of the channel's most recent
+// publication — the attach point ATTACHED advertises (RTL15a
+// attachSerial) — or "" for a channel with no retained publications.
+func (s *session) latestChannelSerial(channel string) string {
+	res, err := s.node.History(channel, centrifuge.WithLimit(1), centrifuge.WithReverse(true))
+	if err != nil {
+		// A channel without history configured (or a broker hiccup) just
+		// attaches without a serial — never fail the attach over it.
+		return ""
+	}
+	if len(res.Publications) == 0 {
+		return ""
+	}
+	return res.Publications[0].Tags[pubTagSerial]
+}
+
 func (s *session) writeAttached(channel string, params map[string]string, modes int64) {
 	// An unrestricted request is granted the full default mode set —
 	// ATTACHED always carries mode bits.
@@ -593,10 +612,11 @@ func (s *session) writeAttached(channel string, params map[string]string, modes 
 	s.attachedModes[channel] = modes
 	s.modesMu.Unlock()
 	_ = s.writeFrame(&protocol.ProtocolMessage{
-		Action:  protocol.ActionAttached,
-		Channel: channel,
-		Flags:   flags,
-		Params:  filterChannelParams(params),
+		Action:        protocol.ActionAttached,
+		Channel:       channel,
+		ChannelSerial: s.latestChannelSerial(channel), // RTL15a: the attach point
+		Flags:         flags,
+		Params:        filterChannelParams(params),
 	})
 	if len(members) > 0 {
 		snapshot := make([]*protocol.PresenceMessage, 0, len(members))
@@ -759,7 +779,7 @@ func (s *session) handlePresence(m *protocol.ProtocolMessage) {
 			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "presence failed: unsupported action")
 			return
 		}
-		if err := publishPresenceEvent(s.node, m.Channel, &entry); err != nil {
+		if err := publishPresenceEvent(s.node, s.mint, m.Channel, &entry); err != nil {
 			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("presence publish failed")
 			s.writeNack(m.MsgSerial, errCodeInternal, 500, "presence failed")
 			return
@@ -773,19 +793,22 @@ func (s *session) handlePresence(m *protocol.ProtocolMessage) {
 // history) and no origin tag (presence events reach everyone, including
 // the originator, regardless of the echo=false message filter). Package
 // level so grace timers outliving their session can use it.
-func publishPresenceEvent(node *centrifuge.Node, channel string, entry *protocol.PresenceMessage) error {
+func publishPresenceEvent(node *centrifuge.Node, mint *serialMint, channel string, entry *protocol.PresenceMessage) error {
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
+	// RTL15b: presence events advance the channel position too — the
+	// serial is drawn from the same per-channel sequence as messages.
+	cs := mint.Mint(channel)
 	if _, err = node.Publish(channel, data,
-		centrifuge.WithTags(map[string]string{pubTagKind: pubTagKindPresence})); err != nil {
+		centrifuge.WithTags(map[string]string{pubTagKind: pubTagKindPresence, pubTagSerial: cs})); err != nil {
 		return err
 	}
 	// Presence history lives on the client-unreachable shadow channel with
 	// the live channel's retention tier — the live publication above stays
 	// history-free so message history is never polluted.
-	historyOpts := publishOptions(channel, "")
+	historyOpts := publishOptions(channel, "", cs)
 	_, err = node.Publish(presenceHistoryChannel(channel), data, historyOpts...)
 	return err
 }
@@ -869,10 +892,11 @@ func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
 			return
 		}
 		_ = s.writeFrame(&protocol.ProtocolMessage{
-			Action:    protocol.ActionPresence,
-			Channel:   channel,
-			Presence:  []*protocol.PresenceMessage{&pm},
-			Timestamp: time.Now().UnixMilli(),
+			Action:        protocol.ActionPresence,
+			Channel:       channel,
+			ChannelSerial: pub.Tags[pubTagSerial], // RTL15b: presence advances the channel position
+			Presence:      []*protocol.PresenceMessage{&pm},
+			Timestamp:     time.Now().UnixMilli(),
 		})
 		return
 	}
@@ -895,10 +919,11 @@ func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
 	// The frame timestamp doubles as the TM2f inheritance source for SDKs;
 	// the enveloped message carries its own timestamp anyway.
 	_ = s.writeFrame(&protocol.ProtocolMessage{
-		Action:    protocol.ActionMessage,
-		Channel:   channel,
-		Messages:  []*protocol.Message{&msg},
-		Timestamp: time.Now().UnixMilli(),
+		Action:        protocol.ActionMessage,
+		Channel:       channel,
+		ChannelSerial: pub.Tags[pubTagSerial], // RTL15b: SDKs track this as channel.properties.channelSerial
+		Messages:      []*protocol.Message{&msg},
+		Timestamp:     time.Now().UnixMilli(),
 	})
 }
 
@@ -1035,8 +1060,9 @@ func (s *session) leavePresence() {
 	clean := s.cleanClose
 	s.closeMu.Unlock()
 	node := s.node
+	mint := s.mint
 	fanout := func(channel string, member *protocol.PresenceMessage) {
-		if err := publishPresenceEvent(node, channel, member); err != nil {
+		if err := publishPresenceEvent(node, mint, channel, member); err != nil {
 			log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("leave fan-out failed")
 		}
 	}

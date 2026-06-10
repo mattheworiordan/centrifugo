@@ -206,11 +206,12 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "internal error")
 		return
 	}
-	payloads, idemKeys, problem := buildEnvelopes(messages, envelopeParams{
+	payloads, idemKeys, serials, problem := buildEnvelopes(messages, envelopeParams{
 		// REST publishes have no connection identity: connectionID stays
 		// empty (no TM2c attribution beyond explicit TM2h above, no origin
 		// tag — REST messages are never echo-suppressed).
-		clientID: publisherClientID,
+		clientID:   publisherClientID,
+		mintSerial: func() string { return h.mint.Mint(channel) },
 		newID: func(idx int) string {
 			// TM2a: server-assigned ids for REST messages share the
 			// "<base>:<idx>" shape SDK-side idempotent publishing uses
@@ -226,7 +227,7 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		// Client-supplied ids dedup republishes (RSL1k2/RSL1k5): the broker
 		// drops the duplicate and the request still succeeds — pinned by
 		// ably-js "idempotentRestPublishing set to false".
-		opts := publishOptions(channel, "")
+		opts := publishOptions(channel, "", serials[i])
 		if idemKeys[i] != "" {
 			opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
 				centrifuge.WithIdempotentResultTTL(idempotentResultTTL))

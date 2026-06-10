@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
+	"github.com/centrifugal/centrifugo/v6/internal/ably/serial"
 
 	"github.com/centrifugal/centrifuge"
 )
@@ -79,6 +80,11 @@ type envelopeParams struct {
 	// newID generates the server-assigned message id for the message at
 	// the given batch index when the client supplied none (TM2a).
 	newID func(idx int) string
+	// mintSerial returns a fresh channelSerial per message — every
+	// message becomes its own publication, so each gets its own serial
+	// (see serials.go). Both current callers set it; nil is tolerated
+	// (skips serial stamping, serials returned nil).
+	mintSerial func() string
 }
 
 // buildEnvelopes validates and envelopes an inbound message batch in
@@ -92,23 +98,32 @@ type envelopeParams struct {
 // a non-empty entry is the CLIENT-supplied message id, which carries
 // idempotency intent (RSL1k2/RSL1k5) — the publish loops pass it to the
 // broker for dedup. Server-generated ids never dedup (entry "").
-func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, []string, *publishProblem) {
+//
+// The returned serials slice is also index-parallel: each message's
+// freshly-minted channelSerial, which the publish loops attach as the
+// pubTagSerial publication tag. Message.Serial inside the envelope is
+// the per-message form <channelSerial>:000. Nil when p.mintSerial is nil.
+func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, []string, []string, *publishProblem) {
 	now := time.Now().UnixMilli()
 	idempotencyKeys := make([]string, len(messages))
+	var serials []string
+	if p.mintSerial != nil {
+		serials = make([]string, len(messages))
+	}
 
 	// Envelope every Message in full BEFORE any publish, so subscribers
 	// never depend on SDK-side inheritance from an enclosing frame, and
 	// so a rejected batch publishes nothing.
 	for idx, msg := range messages {
 		if msg == nil {
-			return nil, nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "null message"}
+			return nil, nil, nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "null message"}
 		}
 		if msg.ClientID != "" && p.clientID != "" && msg.ClientID != p.clientID {
 			// RTL6g/RSL1m4: an identified publisher can only publish
 			// messages carrying its own clientId; an incompatible explicit
 			// clientId is rejected by the service. Full capability
 			// semantics are M4.
-			return nil, nil, &publishProblem{code: errCodeInvalidClientID, statusCode: 400,
+			return nil, nil, nil, &publishProblem{code: errCodeInvalidClientID, statusCode: 400,
 				message: fmt.Sprintf("message clientId %q is incompatible with publisher clientId %q", msg.ClientID, p.clientID)}
 		}
 		clientSuppliedID := msg.ID != ""
@@ -142,6 +157,15 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, [
 			// TM2f), so this is what subscribers observe.
 			msg.Timestamp = now
 		}
+		if p.mintSerial != nil {
+			// RTL15 territory: the message's channel position. Stamped
+			// inside the envelope so history reads and the M8 mutation
+			// surface see it; idx is always 0 — one message per
+			// publication (see serials.go divergence note).
+			cs := p.mintSerial()
+			serials[idx] = cs
+			msg.Serial = serial.MessageSerial(cs, 0)
+		}
 		// Normalize binary data to the canonical JSON-safe form (Base64
 		// string + "base64" encoding segment, RSL4d1) before enveloping,
 		// so the stored publication is format-agnostic. Everything else —
@@ -156,7 +180,7 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, [
 	for _, msg := range messages {
 		data, err := json.Marshal(msg)
 		if err != nil {
-			return nil, nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: err.Error()}
+			return nil, nil, nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: err.Error()}
 		}
 		payloads = append(payloads, data)
 		totalSize += len(data)
@@ -169,20 +193,28 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, [
 	// ~33% Base64 inflation of the canonical form — make this adapter
 	// marginally stricter, never looser.
 	if totalSize > maxMessageSize {
-		return nil, nil, &publishProblem{code: errCodeMaxMessageLength, statusCode: 400,
+		return nil, nil, nil, &publishProblem{code: errCodeMaxMessageLength, statusCode: 400,
 			message: fmt.Sprintf("maximum message length exceeded (%d bytes, limit %d)", totalSize, maxMessageSize)}
 	}
-	return payloads, idempotencyKeys, nil
+	return payloads, idempotencyKeys, serials, nil
 }
 
 // publishOptions are the node.Publish options for one enveloped message
-// on channel: the retention tier the channel name selects, plus — when
+// on channel: the retention tier the channel name selects, the
+// publication's channelSerial tag (RTL15, see serials.go), plus — when
 // the publish is attributed to a realtime connection — the origin tag
 // echo=false subscriptions filter on (RTL7f, see session attach).
-func publishOptions(channel string, originConnectionID string) []centrifuge.PublishOption {
+func publishOptions(channel string, originConnectionID string, channelSerial string) []centrifuge.PublishOption {
 	opts := make([]centrifuge.PublishOption, 0, 2)
+	tags := make(map[string]string, 2)
 	if originConnectionID != "" {
-		opts = append(opts, centrifuge.WithTags(map[string]string{pubTagOrigin: originConnectionID}))
+		tags[pubTagOrigin] = originConnectionID
+	}
+	if channelSerial != "" {
+		tags[pubTagSerial] = channelSerial
+	}
+	if len(tags) > 0 {
+		opts = append(opts, centrifuge.WithTags(tags))
 	}
 	if strings.HasPrefix(channel, persistedNamespacePrefix) {
 		opts = append(opts, centrifuge.WithHistory(persistedHistorySize, persistedHistoryTTL))
