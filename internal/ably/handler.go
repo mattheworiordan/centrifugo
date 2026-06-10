@@ -8,11 +8,14 @@ package ably
 
 import (
 	"encoding/binary"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
+	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
 	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 
@@ -34,11 +37,21 @@ const (
 type Handler struct {
 	node    *centrifuge.Node
 	config  configtypes.Ably
+	keys    *auth.KeyStore
 	upgrade *websocket.Upgrader
 }
 
-// NewHandler creates new Handler.
-func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http.Request) bool) *Handler {
+// NewHandler creates new Handler. The adapter is unusable without API keys
+// to authenticate against (RSA11 Basic auth), so an enabled adapter with no
+// keys_file — or one that fails to load — is a startup error.
+func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http.Request) bool) (*Handler, error) {
+	if c.KeysFile == "" {
+		return nil, errors.New("ably adapter is enabled but ably.keys_file is not set")
+	}
+	keys, err := auth.LoadKeyStore(c.KeysFile)
+	if err != nil {
+		return nil, err
+	}
 	upgrade := &websocket.Upgrader{}
 	if checkOrigin != nil {
 		upgrade.CheckOrigin = checkOrigin
@@ -46,8 +59,9 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 	return &Handler{
 		node:    n,
 		config:  c,
+		keys:    keys,
 		upgrade: upgrade,
-	}
+	}, nil
 }
 
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
@@ -66,16 +80,89 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serveRealtime is a placeholder for the realtime protocol endpoint: it
-// accepts the WebSocket upgrade and closes. The protocol state machine lands
-// with the M0 Node-driving-path spike.
+// serveRealtime runs one Ably realtime session (see session.go for the
+// frame flow): querystring parsing (RTN2), key authentication, then the
+// per-connection centrifuge client.
 func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	// RTN2a: the format param selects the wire encoding. This milestone
+	// serves json only — msgpack framing lands in M2 — so anything else is
+	// rejected before the upgrade with a clear error.
+	format, err := protocol.FormatFromQuery(q.Get("format"))
+	if err != nil || format != protocol.FormatJSON {
+		h.writeError(rw, r, http.StatusBadRequest, 40000, "unsupported format: the adapter currently serves json only")
+		return
+	}
+
+	// RTN2e/RSA11: verify the presented API key (Basic auth header or key
+	// query param) before any session state exists. The verdict is
+	// delivered in-band after the upgrade: Ably SDKs expect realtime auth
+	// failures as an ERROR ProtocolMessage, not a failed handshake.
+	key, authErr := h.keys.Authenticate(r)
+
 	conn, _, err := h.upgrade.Upgrade(rw, r, nil)
 	if err != nil {
 		log.Error().Err(err).Str("transport", "ably").Msg("websocket upgrade error")
 		return
 	}
-	_ = conn.Close()
+
+	if authErr != nil {
+		// RTN14a: an invalid API key fails the connection. The ERROR frame
+		// has an empty channel attribute, so the client transitions to
+		// FAILED and the server terminates the connection (RTN14g).
+		message := "invalid credentials"
+		if errors.Is(authErr, auth.ErrNoCredentials) {
+			message = "no credentials presented"
+		}
+		writeConnectionError(conn, errCodeInvalidCredentials, http.StatusUnauthorized, message)
+		_ = conn.Close()
+		return
+	}
+
+	// RTN2d: an explicit clientId param is assumed for the connection; the
+	// authenticated key name identifies it otherwise.
+	clientID := q.Get("clientId")
+	if clientID == "*" {
+		// RSA7c: the literal '*' clientId value is reserved (it denotes the
+		// wildcard identity) and cannot be assumed by a connection.
+		writeConnectionError(conn, errCodeInvalidClientID, http.StatusBadRequest, "invalid clientId: the wildcard value '*' is reserved")
+		_ = conn.Close()
+		return
+	}
+	userID := key.APIKey.AppID + "." + key.APIKey.KeyID
+	if clientID != "" {
+		userID = clientID
+	}
+
+	sess := newSession(h.node, conn, sessionParams{
+		userID:          userID,
+		clientID:        clientID,
+		echo:            q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
+		protocolVersion: q.Get("v"),               // RTN2f
+	})
+	sess.run(r.Context())
+}
+
+// writeConnectionError fails a connection in-band before any session
+// exists: an ERROR ProtocolMessage with an empty channel attribute
+// (RTN14a/RTN14g — the client transitions to FAILED and the server
+// terminates the connection afterwards).
+func writeConnectionError(conn *websocket.Conn, code int, statusCode int, message string) {
+	frame := &protocol.ProtocolMessage{
+		Action: protocol.ActionError,
+		Error: &protocol.ErrorInfo{
+			Code:       code,
+			StatusCode: statusCode,
+			Message:    message,
+		},
+	}
+	data, err := protocol.Marshal(frame, protocol.FormatJSON)
+	if err != nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	_ = conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // serveTime implements GET /time (RSC16): the service time as a JSON/MsgPack

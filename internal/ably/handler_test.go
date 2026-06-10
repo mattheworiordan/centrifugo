@@ -4,25 +4,44 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
+	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 
 	"github.com/centrifugal/centrifuge"
 	"github.com/stretchr/testify/require"
 )
+
+// Keys from auth/testdata/static-app.json.
+const (
+	testKey     = "poc.key0:secret_key0_0123456789abcdef"
+	testKeyName = "poc.key0"
+)
+
+// deniedChannel is rejected by the test node's subscribe handler, standing
+// in for centrifugo's permission chain (which rejects identically, with
+// centrifuge.ErrorPermissionDenied).
+const deniedChannel = "denied"
 
 func newTestHandler(t *testing.T) *Handler {
 	t.Helper()
 	node, err := centrifuge.New(centrifuge.Config{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
-	return NewHandler(node, configtypes.Ably{Enabled: true}, func(r *http.Request) bool { return true })
+	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, func(r *http.Request) bool { return true })
+	require.NoError(t, err)
+	return h
 }
 
 func requireTimeWithinSkew(t *testing.T, ms int64) {
@@ -113,23 +132,334 @@ func TestNotFoundError(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, envelope.Error.StatusCode)
 }
 
-// RTN1: realtime connections arrive as WebSocket upgrades at the web root.
-// The M0 skeleton accepts the upgrade and closes.
-func TestRealtimeUpgradeAccepted(t *testing.T) {
+// The adapter enabled without a keys file is a startup error: it cannot
+// authenticate anyone (RSA11), so booting in that state would be useless.
+func TestNewHandlerRequiresKeysFile(t *testing.T) {
 	t.Parallel()
-	h := newTestHandler(t)
-	srv := httptest.NewServer(h)
-	defer srv.Close()
+	node, err := centrifuge.New(centrifuge.Config{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
 
-	url := "ws" + strings.TrimPrefix(srv.URL, "http")
-	req, err := http.NewRequest(http.MethodGet, srv.URL, nil)
+	_, err = NewHandler(node, configtypes.Ably{Enabled: true}, nil)
+	require.ErrorContains(t, err, "keys_file")
+
+	_, err = NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/does-not-exist.json"}, nil)
+	require.Error(t, err)
+}
+
+// realtimeTestServer is a real centrifuge node behind the Ably handler,
+// with a subscribe handler standing in for centrifugo's permission chain.
+type realtimeTestServer struct {
+	wsURL    string
+	node     *centrifuge.Node
+	srv      *httptest.Server
+	lastUser func() string // centrifuge UserID of the most recently connected client
+}
+
+func newRealtimeServer(t *testing.T) *realtimeTestServer {
+	t.Helper()
+	node, err := centrifuge.New(centrifuge.Config{})
 	require.NoError(t, err)
-	req.Header.Set("Connection", "Upgrade")
-	req.Header.Set("Upgrade", "websocket")
-	req.Header.Set("Sec-WebSocket-Version", "13")
-	req.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
-	resp, err := http.DefaultClient.Do(req)
+	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
+
+	var mu sync.Mutex
+	var lastUser string
+	node.OnConnect(func(client *centrifuge.Client) {
+		mu.Lock()
+		lastUser = client.UserID()
+		mu.Unlock()
+		client.OnSubscribe(func(e centrifuge.SubscribeEvent, cb centrifuge.SubscribeCallback) {
+			if e.Channel == deniedChannel {
+				cb(centrifuge.SubscribeReply{}, centrifuge.ErrorPermissionDenied)
+				return
+			}
+			cb(centrifuge.SubscribeReply{}, nil)
+		})
+	})
+
+	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, func(r *http.Request) bool { return true })
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode, "upgrade at %s", url)
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	return &realtimeTestServer{
+		wsURL: "ws" + strings.TrimPrefix(srv.URL, "http"),
+		node:  node,
+		srv:   srv,
+		lastUser: func() string {
+			mu.Lock()
+			defer mu.Unlock()
+			return lastUser
+		},
+	}
+}
+
+// defaultDialParams mirrors what an Ably SDK puts on the upgrade
+// querystring (RTN2).
+func defaultDialParams() url.Values {
+	params := url.Values{}
+	params.Set("format", "json") // RTN2a
+	params.Set("echo", "true")   // RTN2b
+	params.Set("v", "6")         // RTN2f
+	params.Set("key", testKey)   // RTN2e
+	return params
+}
+
+func dialRealtime(t *testing.T, wsURL string, params url.Values) *websocket.Conn {
+	t.Helper()
+	dialer := websocket.Dialer{}
+	conn, _, _, err := dialer.Dial(wsURL+"/?"+params.Encode(), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
+func readFrame(t *testing.T, conn *websocket.Conn) *protocol.ProtocolMessage {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, data, err := conn.ReadMessage()
+	require.NoError(t, err)
+	var m protocol.ProtocolMessage
+	require.NoError(t, protocol.Unmarshal(data, protocol.FormatJSON, &m))
+	return &m
+}
+
+func writeFrame(t *testing.T, conn *websocket.Conn, m *protocol.ProtocolMessage) {
+	t.Helper()
+	data, err := protocol.Marshal(m, protocol.FormatJSON)
+	require.NoError(t, err)
+	require.NoError(t, conn.WriteMessage(websocket.TextMessage, data))
+}
+
+// connectRealtime dials and consumes the initial CONNECTED frame.
+func connectRealtime(t *testing.T, ts *realtimeTestServer) *websocket.Conn {
+	t.Helper()
+	conn := dialRealtime(t, ts.wsURL, defaultDialParams())
+	connected := readFrame(t, conn)
+	require.Equal(t, protocol.ActionConnected, connected.Action)
+	return conn
+}
+
+// RTN6: the connection is successful once the initial CONNECTED
+// ProtocolMessage is received, carrying connectionId and the
+// connectionDetails constraints (TR4o, CD2).
+func TestRealtimeConnect_RTN6(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	conn := dialRealtime(t, ts.wsURL, defaultDialParams())
+	m := readFrame(t, conn)
+
+	require.Equal(t, protocol.ActionConnected, m.Action)
+	require.NotEmpty(t, m.ConnectionID)
+
+	// TR4o/CD2: connectionDetails advertises the connection constraints.
+	require.NotNil(t, m.ConnectionDetails)
+	require.NotEmpty(t, m.ConnectionDetails.ConnectionKey)                              // CD2b
+	require.Equal(t, int64(maxMessageSize), m.ConnectionDetails.MaxMessageSize)         // CD2c
+	require.Equal(t, int64(maxFrameSize), m.ConnectionDetails.MaxFrameSize)             // CD2d
+	require.Equal(t, int64(maxInboundRate), m.ConnectionDetails.MaxInboundRate)         // CD2e
+	require.Equal(t, int64(connectionStateTTL), m.ConnectionDetails.ConnectionStateTTL) // CD2f
+	require.Equal(t, int64(15000), m.ConnectionDetails.MaxIdleInterval)                 // CD2h, RTN23a
+
+	// The centrifuge client is not anonymous: its UserID is the
+	// authenticated key name (credentials set via centrifuge.SetCredentials
+	// before NewClient).
+	require.Eventually(t, func() bool { return ts.lastUser() == testKeyName }, 2*time.Second, 10*time.Millisecond)
+}
+
+// RTN2d/CD2a: a clientId querystring param is assumed for the connection
+// and echoed in connectionDetails.clientId.
+func TestRealtimeConnectClientID_RTN2d(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	params := defaultDialParams()
+	params.Set("clientId", "bob")
+	conn := dialRealtime(t, ts.wsURL, params)
+	m := readFrame(t, conn)
+
+	require.Equal(t, protocol.ActionConnected, m.Action)
+	require.NotNil(t, m.ConnectionDetails)
+	require.Equal(t, "bob", m.ConnectionDetails.ClientID) // CD2a
+	require.Eventually(t, func() bool { return ts.lastUser() == "bob" }, 2*time.Second, 10*time.Millisecond)
+}
+
+// RTN14a: an invalid API key fails the connection with an in-band ERROR
+// ProtocolMessage (empty channel attribute), after which the server
+// terminates the connection (RTN14g). Code 40101 (invalid credentials),
+// statusCode 401.
+func TestRealtimeAuthError_RTN14a(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	cases := map[string]func(params url.Values){
+		"bad_key":     func(params url.Values) { params.Set("key", "poc.key0:wrong-secret") },
+		"unknown_key": func(params url.Values) { params.Set("key", "poc.nokey:secret") },
+		"missing_key": func(params url.Values) { params.Del("key") },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			params := defaultDialParams()
+			mutate(params)
+			conn := dialRealtime(t, ts.wsURL, params)
+
+			m := readFrame(t, conn)
+			require.Equal(t, protocol.ActionError, m.Action)
+			require.Empty(t, m.Channel)
+			require.NotNil(t, m.Error)
+			require.Equal(t, 40101, m.Error.Code)
+			require.Equal(t, http.StatusUnauthorized, m.Error.StatusCode)
+
+			// RTN14g: the server terminates the connection after the ERROR.
+			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, _, err := conn.ReadMessage()
+			require.Error(t, err)
+		})
+	}
+}
+
+// RTN2a: only the json wire format is served this milestone; msgpack (M2)
+// and unknown formats are rejected before the upgrade.
+func TestRealtimeFormatRejected_RTN2a(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	for _, format := range []string{"msgpack", "xml"} {
+		t.Run(format, func(t *testing.T) {
+			t.Parallel()
+			params := defaultDialParams()
+			params.Set("format", format)
+			dialer := websocket.Dialer{}
+			_, resp, _, err := dialer.Dial(ts.wsURL+"/?"+params.Encode(), nil)
+			require.Error(t, err)
+			require.NotNil(t, resp)
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			_ = resp.Body.Close()
+		})
+	}
+}
+
+// RTN13a: a client HEARTBEAT expects a HEARTBEAT in response, with the id
+// echoed for correlation.
+func TestRealtimeHeartbeatEcho_RTN13a(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionHeartbeat, ID: "hb-1"})
+	m := readFrame(t, conn)
+	require.Equal(t, protocol.ActionHeartbeat, m.Action)
+	require.Equal(t, "hb-1", m.ID)
+}
+
+// RTL4c: ATTACH is confirmed by an ATTACHED carrying the channel.
+// RTL5d: DETACH is confirmed by a DETACHED carrying the channel.
+func TestRealtimeAttachDetach_RTL4c_RTL5d(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "test"})
+	attached := readFrame(t, conn)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.Equal(t, "test", attached.Channel)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionDetach, Channel: "test"})
+	detached := readFrame(t, conn)
+	require.Equal(t, protocol.ActionDetached, detached.Action)
+	require.Equal(t, "test", detached.Channel)
+}
+
+// RTL14: a failed ATTACH (here: subscribe permission denied) is reported
+// as an ERROR ProtocolMessage carrying the channel, failing that channel
+// on the client. Permission denied maps to 40160 (operation not permitted
+// with provided capability), statusCode 401.
+func TestRealtimeAttachDenied_RTL14(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: deniedChannel})
+	m := readFrame(t, conn)
+	require.Equal(t, protocol.ActionError, m.Action)
+	require.Equal(t, deniedChannel, m.Channel)
+	require.NotNil(t, m.Error)
+	require.Equal(t, errCodeOperationNotPermitted, m.Error.Code)
+	require.Equal(t, http.StatusUnauthorized, m.Error.StatusCode)
+}
+
+// RTN12a: CLOSE is confirmed by CLOSED, after which the connection is
+// dropped.
+func TestRealtimeClose_RTN12a(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionClose})
+	m := readFrame(t, conn)
+	require.Equal(t, protocol.ActionClosed, m.Action)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	requireServerClosed(t, err)
+}
+
+// requireServerClosed asserts a read error came from the server actually
+// closing the connection rather than our read deadline expiring — the
+// regression guard for the teardown re-entrancy deadlock: a teardown
+// wedged inside closeFn() (centrifuge re-enters via Transport.Close)
+// never reaches conn.Close(), so the read ends in a timeout instead.
+func requireServerClosed(t *testing.T, err error) {
+	t.Helper()
+	var nerr net.Error
+	require.False(t, errors.As(err, &nerr) && nerr.Timeout(),
+		"server never closed the connection: close-path deadlock")
+}
+
+// When centrifuge closes the client server-side (here: node shutdown) the
+// session reports DISCONNECTED with code 80003 and drops the connection —
+// the genuine handleTransportClose path, the other ordering of the
+// close-path re-entrancy interaction. RTN15h3: a DISCONNECTED with a
+// non-token error makes the client attempt an immediate reconnect.
+func TestRealtimeServerInitiatedClose(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	go func() { _ = ts.node.Shutdown(context.Background()) }()
+
+	m := readFrame(t, conn)
+	require.Equal(t, protocol.ActionDisconnected, m.Action)
+	require.NotNil(t, m.Error)
+	require.Equal(t, errCodeDisconnected, m.Error.Code)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
+	requireServerClosed(t, err)
+}
+
+// RSA7c: the literal '*' clientId value is reserved (the wildcard
+// identity) and cannot be assumed by a connection. Code 40012 (invalid
+// client id).
+func TestRealtimeWildcardClientIDRejected_RSA7c(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	params := defaultDialParams()
+	params.Set("clientId", "*")
+	conn := dialRealtime(t, ts.wsURL, params)
+
+	m := readFrame(t, conn)
+	require.Equal(t, protocol.ActionError, m.Action)
+	require.NotNil(t, m.Error)
+	require.Equal(t, errCodeInvalidClientID, m.Error.Code)
+	require.Equal(t, http.StatusBadRequest, m.Error.StatusCode)
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, _, err := conn.ReadMessage()
+	require.Error(t, err)
 }

@@ -10,7 +10,8 @@
     "without_namespace": {
       "presence": true,
       "history_size": 100,
-      "history_ttl": "300s"
+      "history_ttl": "300s",
+      "allow_subscribe_for_client": true
     }
   },
   "log": {

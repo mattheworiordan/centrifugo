@@ -204,7 +204,11 @@ func Mux(
 		if flags&HandlerAdmin != 0 && strings.TrimRight(cfg.Admin.HandlerPrefix, "/") == "" {
 			log.Fatal().Msg("ably adapter claims the web root and conflicts with admin on the same port: set admin.handler_prefix or serve admin on a separate internal port")
 		}
-		mux.Handle("/", connChain.Then(ably.NewHandler(n, cfg.Ably, getCheckOrigin(cfg))))
+		ablyHandler, err := ably.NewHandler(n, cfg.Ably, getCheckOrigin(cfg))
+		if err != nil {
+			log.Fatal().Err(err).Msg("error creating ably handler")
+		}
+		mux.Handle("/", connChain.Then(ablyHandler))
 	}
 
 	if flags&HandlerHTTPStream != 0 {

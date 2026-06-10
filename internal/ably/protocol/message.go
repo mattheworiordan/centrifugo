@@ -38,19 +38,41 @@ type ChannelMessage struct {
 }
 
 // ProtocolMessage is one frame on the realtime WebSocket connection.
+//
+// MsgSerial keeps omitempty so frames where the serial is meaningless
+// (HEARTBEAT, CONNECTED, ...) match the wire shape of the real Ably
+// service. The one observable consequence: an ACK for msgSerial 0 omits
+// the field — SDK decoders read the missing field as 0, which is the
+// correct value (verified against ably-go's pendingEmitter.Ack). A
+// per-action conditional encoder can make this strictly TR4j-faithful
+// later if a stricter SDK demands it.
 type ProtocolMessage struct {
-	Action        Action            `json:"action"                  msgpack:"action"`
-	ID            string            `json:"id,omitempty"            msgpack:"id,omitempty"`
-	ConnectionID  string            `json:"connectionId,omitempty"  msgpack:"connectionId,omitempty"`
-	Channel       string            `json:"channel,omitempty"       msgpack:"channel,omitempty"`
-	ChannelSerial string            `json:"channelSerial,omitempty" msgpack:"channelSerial,omitempty"`
-	MsgSerial     int64             `json:"msgSerial,omitempty"     msgpack:"msgSerial,omitempty"`
-	Timestamp     int64             `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
-	Count         int               `json:"count,omitempty"         msgpack:"count,omitempty"`
-	Flags         int64             `json:"flags,omitempty"         msgpack:"flags,omitempty"`
-	Messages      []*Message        `json:"messages,omitempty"      msgpack:"messages,omitempty"`
-	Error         *ErrorInfo        `json:"error,omitempty"         msgpack:"error,omitempty"`
-	Params        map[string]string `json:"params,omitempty"        msgpack:"params,omitempty"`
+	Action            Action             `json:"action"                      msgpack:"action"`
+	ID                string             `json:"id,omitempty"                msgpack:"id,omitempty"`
+	ConnectionID      string             `json:"connectionId,omitempty"      msgpack:"connectionId,omitempty"`
+	Channel           string             `json:"channel,omitempty"           msgpack:"channel,omitempty"`
+	ChannelSerial     string             `json:"channelSerial,omitempty"     msgpack:"channelSerial,omitempty"`
+	MsgSerial         int64              `json:"msgSerial,omitempty"         msgpack:"msgSerial,omitempty"`
+	Timestamp         int64              `json:"timestamp,omitempty"         msgpack:"timestamp,omitempty"`
+	Count             int                `json:"count,omitempty"             msgpack:"count,omitempty"`
+	Flags             int64              `json:"flags,omitempty"             msgpack:"flags,omitempty"`
+	Messages          []*Message         `json:"messages,omitempty"          msgpack:"messages,omitempty"`
+	Error             *ErrorInfo         `json:"error,omitempty"             msgpack:"error,omitempty"`
+	Params            map[string]string  `json:"params,omitempty"            msgpack:"params,omitempty"`
+	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"` // TR4o
+}
+
+// ConnectionDetails carries connection-scoped constraints and metadata
+// on a CONNECTED ProtocolMessage (TR4o, CD1). Durations are wire-encoded
+// as integer milliseconds.
+type ConnectionDetails struct {
+	ClientID           string `json:"clientId,omitempty"           msgpack:"clientId,omitempty"`           // CD2a
+	ConnectionKey      string `json:"connectionKey,omitempty"      msgpack:"connectionKey,omitempty"`      // CD2b
+	MaxMessageSize     int64  `json:"maxMessageSize,omitempty"     msgpack:"maxMessageSize,omitempty"`     // CD2c
+	MaxFrameSize       int64  `json:"maxFrameSize,omitempty"       msgpack:"maxFrameSize,omitempty"`       // CD2d
+	MaxInboundRate     int64  `json:"maxInboundRate,omitempty"     msgpack:"maxInboundRate,omitempty"`     // CD2e
+	ConnectionStateTTL int64  `json:"connectionStateTtl,omitempty" msgpack:"connectionStateTtl,omitempty"` // CD2f
+	MaxIdleInterval    int64  `json:"maxIdleInterval,omitempty"    msgpack:"maxIdleInterval,omitempty"`    // CD2h
 }
 
 // ErrorInfo describes an error in Ably's standard wire form, attached
