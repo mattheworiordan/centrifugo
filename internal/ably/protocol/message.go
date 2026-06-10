@@ -63,6 +63,7 @@ type ProtocolMessage struct {
 	Messages          []*Message         `json:"messages,omitempty"          msgpack:"messages,omitempty"`
 	Error             *ErrorInfo         `json:"error,omitempty"             msgpack:"error,omitempty"`
 	Params            map[string]string  `json:"params,omitempty"            msgpack:"params,omitempty"`
+	Presence          []*PresenceMessage `json:"presence,omitempty"          msgpack:"presence,omitempty"`          // TR4l
 	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"` // TR4o
 }
 
@@ -79,6 +80,30 @@ type ConnectionDetails struct {
 	MaxIdleInterval    int64  `json:"maxIdleInterval,omitempty"    msgpack:"maxIdleInterval,omitempty"`    // CD2h
 }
 
+// PresenceMessage is one presence event on a channel (TP1): a member
+// entering, updating its data, or leaving, plus the synthetic
+// present/absent states used during SYNC.
+type PresenceMessage struct {
+	ID           string         `json:"id,omitempty"           msgpack:"id,omitempty"`
+	Action       PresenceAction `json:"action"                 msgpack:"action"`
+	ClientID     string         `json:"clientId,omitempty"     msgpack:"clientId,omitempty"`
+	ConnectionID string         `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
+	Data         any            `json:"data,omitempty"         msgpack:"data,omitempty"`
+	Encoding     string         `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
+	Timestamp    int64          `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+}
+
+// PresenceAction is the wire enum of presence event kinds (TP2).
+type PresenceAction int
+
+const (
+	PresenceAbsent  PresenceAction = 0
+	PresencePresent PresenceAction = 1
+	PresenceEnter   PresenceAction = 2
+	PresenceLeave   PresenceAction = 3
+	PresenceUpdate  PresenceAction = 4
+)
+
 // ErrorInfo describes an error in Ably's standard wire form, attached
 // to a ProtocolMessage when the server needs to convey a non-fatal
 // problem to the client (e.g. a resume that could not fully replay).
@@ -89,8 +114,11 @@ type ErrorInfo struct {
 	HRef       string `json:"href,omitempty"       msgpack:"href,omitempty"`
 }
 
-// Flags carried on ATTACHED.
+// Flags carried on ATTACHED (TR3).
 const (
+	// FlagHasPresence indicates the channel has members present at attach
+	// time: the client should expect a SYNC to follow (RTL4c1-adjacent).
+	FlagHasPresence int64 = 1 << 0
 	// FlagResumed indicates the channel state was resumed from the
 	// client's supplied channelSerial: the gap between the client's
 	// cursor and the live tail was replayed in full. Cleared when the

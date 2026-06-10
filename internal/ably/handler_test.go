@@ -1363,3 +1363,118 @@ func TestCapabilityEnforcement_40160(t *testing.T) {
 		require.Equal(t, "40160", hresp.Header.Get("X-Ably-Errorcode"))
 	})
 }
+
+// RTP core: ENTER fans out to subscribers and self, the member set drives
+// HAS_PRESENCE + a completing SYNC on late attach, LEAVE removes, a
+// closing connection's members leave implicitly.
+func TestRealtimePresence_RTP(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	// A (identified) attaches and enters.
+	paramsA := defaultDialParams()
+	paramsA.Set("clientId", "alice")
+	connA := dialRealtime(t, ts.wsURL, paramsA)
+	require.Equal(t, protocol.ActionConnected, readFrame(t, connA).Action)
+	writeFrame(t, connA, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "pres"})
+	attached := readNonHeartbeatFrame(t, connA)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.Zero(t, attached.Flags&protocol.FlagHasPresence, "empty channel: no HAS_PRESENCE")
+
+	writeFrame(t, connA, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: "pres", MsgSerial: 0,
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Data: "hi"}},
+	})
+	var sawAck, sawEnter bool
+	for !sawAck || !sawEnter {
+		switch m := readNonHeartbeatFrame(t, connA); m.Action {
+		case protocol.ActionAck:
+			sawAck = true
+		case protocol.ActionPresence:
+			require.Equal(t, protocol.PresenceEnter, m.Presence[0].Action)
+			require.Equal(t, "alice", m.Presence[0].ClientID) // identity stamped
+			require.NotEmpty(t, m.Presence[0].ConnectionID)   // TP3 attribution
+			sawEnter = true
+		default:
+			t.Fatalf("unexpected action %d", m.Action)
+		}
+	}
+
+	// B attaches late: HAS_PRESENCE set and a completing SYNC delivers alice.
+	connB := connectRealtime(t, ts)
+	writeFrame(t, connB, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "pres"})
+	attachedB := readNonHeartbeatFrame(t, connB)
+	require.Equal(t, protocol.ActionAttached, attachedB.Action)
+	require.NotZero(t, attachedB.Flags&protocol.FlagHasPresence, "HAS_PRESENCE expected")
+	sync := readNonHeartbeatFrame(t, connB)
+	require.Equal(t, protocol.ActionSync, sync.Action)
+	require.Empty(t, sync.ChannelSerial, "no cursor: sync completes in one frame")
+	require.Len(t, sync.Presence, 1)
+	require.Equal(t, protocol.PresencePresent, sync.Presence[0].Action)
+	require.Equal(t, "alice", sync.Presence[0].ClientID)
+
+	// A leaves explicitly; B sees the LEAVE.
+	writeFrame(t, connA, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: "pres", MsgSerial: 1,
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceLeave}},
+	})
+	leave := readNonHeartbeatFrame(t, connB)
+	require.Equal(t, protocol.ActionPresence, leave.Action)
+	require.Equal(t, protocol.PresenceLeave, leave.Presence[0].Action)
+	require.Equal(t, "alice", leave.Presence[0].ClientID)
+
+	// Drain A's own ACK + LEAVE delivery before the next exchange.
+	for drained := 0; drained < 2; drained++ {
+		m := readNonHeartbeatFrame(t, connA)
+		require.Contains(t, []protocol.Action{protocol.ActionAck, protocol.ActionPresence}, m.Action)
+	}
+
+	// Leave again: 91002 not entered.
+	writeFrame(t, connA, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: "pres", MsgSerial: 2,
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceLeave}},
+	})
+	nack := readNonHeartbeatFrame(t, connA)
+	require.Equal(t, protocol.ActionNack, nack.Action)
+	require.Equal(t, errCodePresenceNotEntered, nack.Error.Code)
+}
+
+// A connection closing implicitly leaves its presence (clean-close path;
+// the abrupt-disconnect grace is M5.2). An unidentified connection
+// entering without a clientId is 91000.
+func TestRealtimePresenceLifecycle(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	// Watcher attaches first.
+	watcher := connectRealtime(t, ts)
+	writeFrame(t, watcher, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "pres-life"})
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, watcher).Action)
+
+	// 91000: unidentified, no clientId anywhere.
+	anon := connectRealtime(t, ts)
+	writeFrame(t, anon, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: "pres-life", MsgSerial: 0,
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
+	})
+	nack := readNonHeartbeatFrame(t, anon)
+	require.Equal(t, protocol.ActionNack, nack.Action)
+	require.Equal(t, errCodePresenceNoClientID, nack.Error.Code)
+
+	// Explicit clientId on the entry works even unidentified.
+	writeFrame(t, anon, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: "pres-life", MsgSerial: 1,
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, ClientID: "bob"}},
+	})
+	require.Equal(t, protocol.ActionAck, readNonHeartbeatFrame(t, anon).Action)
+	enter := readNonHeartbeatFrame(t, watcher)
+	require.Equal(t, protocol.ActionPresence, enter.Action)
+	require.Equal(t, "bob", enter.Presence[0].ClientID)
+
+	// Closing bob's connection synthesizes the LEAVE.
+	writeFrame(t, anon, &protocol.ProtocolMessage{Action: protocol.ActionClose})
+	leave := readNonHeartbeatFrame(t, watcher)
+	require.Equal(t, protocol.ActionPresence, leave.Action)
+	require.Equal(t, protocol.PresenceLeave, leave.Presence[0].Action)
+	require.Equal(t, "bob", leave.Presence[0].ClientID)
+}

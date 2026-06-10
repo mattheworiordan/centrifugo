@@ -85,6 +85,8 @@ const (
 	errCodeInternal                = 50000 // internal error
 	errCodeDisconnected            = 80003 // disconnected
 	errCodeChannelOperationFailed  = 90000 // channel operation failed
+	errCodePresenceNoClientID      = 91000 // unable to enter presence channel (no clientId)
+	errCodePresenceNotEntered      = 91002 // unable to leave presence channel that is not entered
 )
 
 // writeTimeout bounds every WS write so a non-reading client cannot pin a
@@ -145,9 +147,10 @@ type pendingOp struct {
 }
 
 type session struct {
-	node   *centrifuge.Node
-	conn   *websocket.Conn
-	params sessionParams
+	node     *centrifuge.Node
+	conn     *websocket.Conn
+	params   sessionParams
+	presence *presenceStore
 
 	// writeMu serializes WS writes: the reader loop, the heartbeat ticker,
 	// the centrifuge Client writer (via transport → handleReply) and the
@@ -168,11 +171,12 @@ type session struct {
 	closeCh chan struct{} // closed on teardown: stops the heartbeat ticker and cancels the client context
 }
 
-func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams) *session {
+func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore) *session {
 	return &session{
 		node:      node,
 		conn:      conn,
 		params:    params,
+		presence:  presence,
 		pending:   make(map[uint32]pendingOp),
 		connected: make(chan error, 1),
 		closeCh:   make(chan struct{}),
@@ -318,6 +322,11 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 		// RTL6: an inbound MESSAGE is a publish request; it is confirmed
 		// with ACK or failed with NACK (RTN7a).
 		s.publish(m)
+		return true
+	case protocol.ActionPresence:
+		// RTP territory: presence operations consume the frame's msgSerial
+		// and are confirmed with ACK like publishes.
+		s.handlePresence(m)
 		return true
 	case protocol.ActionClose:
 		// RTN12a: confirm the close request with CLOSED, then drop the
@@ -519,6 +528,83 @@ func (s *session) detach(channel string) {
 	}
 }
 
+// handlePresence serves one inbound PRESENCE frame (RTP): each entry is
+// an ENTER, UPDATE or LEAVE op; the member set updates and the event fans
+// out as a presence-tagged publication. The frame's msgSerial is ACKed
+// after every entry lands, mirroring the publish contract.
+func (s *session) handlePresence(m *protocol.ProtocolMessage) {
+	if !validChannelName(m.Channel) {
+		s.writeNack(m.MsgSerial, errCodeInvalidChannelName, 400, "presence failed: invalid channel name")
+		return
+	}
+	// Presence requires the presence operation on the channel (40160).
+	if !s.params.capability.Allows(auth.OpPresence, m.Channel) {
+		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "presence failed: capability does not permit presence")
+		return
+	}
+	connectionID := s.client.ID()
+	now := time.Now().UnixMilli()
+	for idx, pm := range m.Presence {
+		if pm == nil {
+			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "presence failed: null entry")
+			return
+		}
+		// RTP8: a presence member needs an identity — the entry's clientId
+		// or the connection's (91000 otherwise).
+		clientID := pm.ClientID
+		if clientID == "" {
+			clientID = s.params.clientID
+		}
+		if clientID == "" {
+			s.writeNack(m.MsgSerial, errCodePresenceNoClientID, 400, "presence failed: no clientId")
+			return
+		}
+		entry := *pm
+		entry.ClientID = clientID
+		entry.ConnectionID = connectionID // TP3 attribution
+		if entry.ID == "" {
+			entry.ID = fmt.Sprintf("%s:%d:%d", connectionID, m.MsgSerial, idx)
+		}
+		if entry.Timestamp == 0 {
+			entry.Timestamp = now
+		}
+		normalizePresenceData(&entry)
+
+		switch entry.Action {
+		case protocol.PresenceEnter, protocol.PresenceUpdate:
+			s.presence.set(m.Channel, &entry)
+		case protocol.PresenceLeave:
+			if !s.presence.remove(m.Channel, connectionID, clientID) {
+				s.writeNack(m.MsgSerial, errCodePresenceNotEntered, 400, "presence failed: not entered")
+				return
+			}
+		default:
+			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "presence failed: unsupported action")
+			return
+		}
+		if err := s.publishPresenceEvent(m.Channel, &entry); err != nil {
+			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("presence publish failed")
+			s.writeNack(m.MsgSerial, errCodeInternal, 500, "presence failed")
+			return
+		}
+	}
+	s.writeAck(m.MsgSerial)
+}
+
+// publishPresenceEvent fans a presence event out as a presence-tagged
+// publication: no history options (presence never pollutes message
+// history) and no origin tag (presence events reach everyone, including
+// the originator, regardless of the echo=false message filter).
+func (s *session) publishPresenceEvent(channel string, entry *protocol.PresenceMessage) error {
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+	_, err = s.node.Publish(channel, data,
+		centrifuge.WithTags(map[string]string{pubTagKind: pubTagKindPresence}))
+	return err
+}
+
 // handleReply maps one decoded centrifuge protocol.Reply to Ably frames.
 // Called from the centrifuge Client writer goroutine (through
 // transport.Write/WriteMany).
@@ -541,8 +627,30 @@ func (s *session) handleReply(reply *cproto.Reply) {
 				s.writeAttachError(op.channel, reply.Error)
 				return
 			}
-			// RTL4c: the confirmation ATTACHED carries the channel.
-			_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionAttached, Channel: op.channel})
+			// RTL4c: the confirmation ATTACHED carries the channel; the
+			// HAS_PRESENCE flag tells the client a SYNC follows.
+			members := s.presence.members(op.channel)
+			var flags int64
+			if len(members) > 0 {
+				flags |= protocol.FlagHasPresence
+			}
+			_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionAttached, Channel: op.channel, Flags: flags})
+			if len(members) > 0 {
+				// RTP18-lite single-page SYNC: members delivered as PRESENT;
+				// no channelSerial means the sync completes with this frame
+				// (ably-js setPresence ends the sync when no cursor is set).
+				snapshot := make([]*protocol.PresenceMessage, 0, len(members))
+				for _, m := range members {
+					present := *m
+					present.Action = protocol.PresencePresent
+					snapshot = append(snapshot, &present)
+				}
+				_ = s.writeFrame(&protocol.ProtocolMessage{
+					Action:   protocol.ActionSync,
+					Channel:  op.channel,
+					Presence: snapshot,
+				})
+			}
 		case opUnsubscribe:
 			// RTL5d: confirm with DETACHED. Centrifuge unsubscribe is
 			// idempotent, so detaching a never-attached channel still
@@ -584,6 +692,20 @@ func (s *session) handleReply(reply *cproto.Reply) {
 // payload that does not decode is logged and dropped; it must not kill the
 // session.
 func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
+	if pub.Tags[pubTagKind] == pubTagKindPresence {
+		var pm protocol.PresenceMessage
+		if err := json.Unmarshal(pub.Data, &pm); err != nil {
+			log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("dropping presence publication with undecodable payload")
+			return
+		}
+		_ = s.writeFrame(&protocol.ProtocolMessage{
+			Action:    protocol.ActionPresence,
+			Channel:   channel,
+			Presence:  []*protocol.PresenceMessage{&pm},
+			Timestamp: time.Now().UnixMilli(),
+		})
+		return
+	}
 	var msg protocol.Message
 	if err := json.Unmarshal(pub.Data, &msg); err != nil {
 		log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("dropping publication with undecodable payload")
@@ -720,10 +842,31 @@ func (s *session) teardown() {
 	if !s.beginClose() {
 		return
 	}
+	s.leavePresence()
 	if s.closeFn != nil {
 		_ = s.closeFn()
 	}
 	_ = s.conn.Close()
+}
+
+// leavePresence removes every member this connection holds and fans out
+// synthesized LEAVE events (RTP territory: members do not outlive their
+// connection; the 15s abrupt-disconnect grace is the M5.2 refinement).
+func (s *session) leavePresence() {
+	if s.client == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+	for channel, members := range s.presence.removeConnection(s.client.ID()) {
+		for _, m := range members {
+			leave := *m
+			leave.Action = protocol.PresenceLeave
+			leave.Timestamp = now
+			if err := s.publishPresenceEvent(channel, &leave); err != nil {
+				log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("leave fan-out failed")
+			}
+		}
+	}
 }
 
 // writeFrame marshals and writes one ProtocolMessage in the session's

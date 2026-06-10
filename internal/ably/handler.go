@@ -34,11 +34,12 @@ const (
 // paths (/time, /channels/..., realtime WebSocket at /) which cannot be
 // prefixed.
 type Handler struct {
-	node    *centrifuge.Node
-	config  configtypes.Ably
-	keys    *auth.KeyStore
-	upgrade *websocket.Upgrader
-	nonces  *nonceCache
+	node     *centrifuge.Node
+	config   configtypes.Ably
+	keys     *auth.KeyStore
+	upgrade  *websocket.Upgrader
+	nonces   *nonceCache
+	presence *presenceStore
 }
 
 // NewHandler creates new Handler. The adapter is unusable without API keys
@@ -57,11 +58,12 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 		upgrade.CheckOrigin = checkOrigin
 	}
 	return &Handler{
-		node:    n,
-		config:  c,
-		keys:    keys,
-		upgrade: upgrade,
-		nonces:  newNonceCache(),
+		node:     n,
+		config:   c,
+		keys:     keys,
+		upgrade:  upgrade,
+		nonces:   newNonceCache(),
+		presence: newPresenceStore(),
 	}, nil
 }
 
@@ -172,7 +174,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		echo:             q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
 		protocolVersion:  q.Get("v"),               // RTN2f
 		format:           format,                   // RTN2a
-	})
+	}, h.presence)
 	sess.run(r.Context())
 }
 

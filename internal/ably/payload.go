@@ -78,3 +78,18 @@ func denormalizeMessageData(msg *protocol.Message) {
 	msg.Data = raw
 	msg.Encoding = remainder
 }
+
+// normalizePresenceData applies the same canonical-form rule to presence
+// payloads as normalizeMessageData does to messages (RSL4d1 semantics).
+func normalizePresenceData(pm *protocol.PresenceMessage) {
+	data, ok := pm.Data.([]byte)
+	if !ok {
+		return
+	}
+	pm.Data = base64.StdEncoding.EncodeToString(data)
+	if pm.Encoding == "" {
+		pm.Encoding = encodingBase64
+	} else {
+		pm.Encoding += "/" + encodingBase64
+	}
+}
