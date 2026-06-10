@@ -18,10 +18,14 @@ type Message struct {
 	Serial       string `json:"serial,omitempty"       msgpack:"serial,omitempty"`
 	ClientID     string `json:"clientId,omitempty"     msgpack:"clientId,omitempty"`
 	ConnectionID string `json:"connectionId,omitempty" msgpack:"connectionId,omitempty"`
-	Name         string `json:"name,omitempty"         msgpack:"name,omitempty"`
-	Data         any    `json:"data,omitempty"         msgpack:"data,omitempty"`
-	Encoding     string `json:"encoding,omitempty"     msgpack:"encoding,omitempty"`
-	Timestamp    int64  `json:"timestamp,omitempty"    msgpack:"timestamp,omitempty"`
+	// ConnectionKey is only ever populated by a REST publisher publishing
+	// on behalf of an existing realtime connection (TM2h). The server
+	// resolves it to a ConnectionID and never stores or delivers it.
+	ConnectionKey string `json:"connectionKey,omitempty" msgpack:"connectionKey,omitempty"`
+	Name          string `json:"name,omitempty"          msgpack:"name,omitempty"`
+	Data          any    `json:"data,omitempty"          msgpack:"data,omitempty"`
+	Encoding      string `json:"encoding,omitempty"      msgpack:"encoding,omitempty"`
+	Timestamp     int64  `json:"timestamp,omitempty"     msgpack:"timestamp,omitempty"`
 }
 
 // ChannelMessage is one atomic publish on a channel: a server-assigned

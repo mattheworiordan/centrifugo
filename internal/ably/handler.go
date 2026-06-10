@@ -72,10 +72,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	switch {
 	case r.URL.Path == "/time" && r.Method == http.MethodGet:
 		h.serveTime(rw, r)
+	case strings.HasPrefix(r.URL.Path, "/channels/"):
+		// RSL1/RSL2/channel details — see rest.go.
+		h.serveChannels(rw, r)
 	default:
 		// Catch-all REST error per the Ably error contract; route surface
 		// grows milestone by milestone.
-		h.writeError(rw, r, http.StatusNotFound, 40400, "not found")
+		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "not found")
 	}
 }
 
@@ -186,7 +189,7 @@ func writeConnectionError(conn *websocket.Conn, format protocol.Format, code int
 // array containing a single milliseconds-since-epoch integer.
 func (h *Handler) serveTime(rw http.ResponseWriter, r *http.Request) {
 	now := time.Now().UnixMilli()
-	if responseFormat(r) == formatMsgPack {
+	if responseFormat(r) == protocol.FormatMsgpack {
 		body, err := protocol.MarshalAny([]int64{now}, protocol.FormatMsgpack)
 		if err != nil {
 			h.writeError(rw, r, http.StatusInternalServerError, 50000, "failed to encode time")
@@ -200,26 +203,19 @@ func (h *Handler) serveTime(rw http.ResponseWriter, r *http.Request) {
 	_, _ = rw.Write([]byte("[" + strconv.FormatInt(now, 10) + "]"))
 }
 
-type restFormat int
-
-const (
-	formatJSON restFormat = iota
-	formatMsgPack
-)
-
 // responseFormat picks the REST response encoding: the format query param
 // takes precedence, then the Accept header (RSC8c).
-func responseFormat(r *http.Request) restFormat {
+func responseFormat(r *http.Request) protocol.Format {
 	switch r.URL.Query().Get("format") {
 	case "msgpack":
-		return formatMsgPack
+		return protocol.FormatMsgpack
 	case "json":
-		return formatJSON
+		return protocol.FormatJSON
 	}
 	if strings.Contains(r.Header.Get("Accept"), contentTypeMsgPack) {
-		return formatMsgPack
+		return protocol.FormatMsgpack
 	}
-	return formatJSON
+	return protocol.FormatJSON
 }
 
 // writeError writes an Ably REST error response: an error envelope body plus

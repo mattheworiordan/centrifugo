@@ -43,7 +43,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,11 +73,13 @@ const (
 // code registry (github.com/ably/ably-common protocol/errors.json).
 const (
 	errCodeBadRequest             = 40000 // bad request
+	errCodeInvalidConnectionID    = 40006 // invalid connection id
 	errCodeMaxMessageLength       = 40009 // maximum message length exceeded
 	errCodeInvalidChannelName     = 40010 // invalid channel name
 	errCodeInvalidClientID        = 40012 // invalid client id
 	errCodeInvalidCredentials     = 40101 // invalid credentials
 	errCodeOperationNotPermitted  = 40160 // operation not permitted with provided capability
+	errCodeNotFound               = 40400 // not found
 	errCodeInternal               = 50000 // internal error
 	errCodeDisconnected           = 80003 // disconnected
 	errCodeChannelOperationFailed = 90000 // channel operation failed
@@ -327,93 +328,32 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// Same channel-name validation as attach (40010): publishing to an
 	// invalid name must NACK, not reach centrifuge (pinned by ably-js
 	// channelattach_publish_invalid).
-	if strings.HasPrefix(m.Channel, ":") {
+	if !validChannelName(m.Channel) {
 		s.writeNack(m.MsgSerial, errCodeInvalidChannelName, 400, "publish failed: invalid channel name")
 		return
 	}
 
 	connectionID := s.client.ID()
-	now := time.Now().UnixMilli()
 
-	// Envelope every Message in full BEFORE any publish, so subscribers
-	// never depend on SDK-side inheritance from the enclosing
-	// ProtocolMessage, and so a rejected frame publishes nothing.
-	for idx, msg := range m.Messages {
-		if msg == nil {
-			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "publish failed: null message")
-			return
-		}
-		if msg.ClientID != "" && s.params.clientID != "" && msg.ClientID != s.params.clientID {
-			// RTL6g: an identified connection can only publish messages
-			// carrying its own clientId; an incompatible explicit clientId
-			// is rejected by the service (the server-side reject expected
-			// by RTL6g4's test). The connection stays usable. Full
-			// capability semantics are M4.
-			s.writeNack(m.MsgSerial, errCodeInvalidClientID, 400,
-				fmt.Sprintf("publish failed: message clientId %q is incompatible with connection clientId %q", msg.ClientID, s.params.clientID))
-			return
-		}
-		if msg.ID == "" {
+	// Validation, envelope rules (CD2c/TO3l8 size accounting included) and
+	// payload normalization live in the shared publish core (publish.go),
+	// reused verbatim by the REST publish surface. The application-level
+	// 40009 reject NACKs the frame and keeps the connection alive —
+	// contrast the protocol-level maxFrameSize read limit set in
+	// serveRealtime, which kills the connection outright.
+	payloads, problem := buildEnvelopes(m.Messages, envelopeParams{
+		connectionID: connectionID,
+		clientID:     s.params.clientID,
+		newID: func(idx int) string {
 			// Server-assigned unique id of the form
 			// <connectionId>:<msgSerial>:<index> — the shape TM2a expects
 			// SDKs to derive for realtime messages (the ProtocolMessage id
-			// is connectionId:msgSerial per TR4n). A client-supplied id is
-			// preserved; idempotency mapping is M3.
-			msg.ID = fmt.Sprintf("%s:%d:%d", connectionID, m.MsgSerial, idx)
-		}
-		if msg.ClientID == "" {
-			// RTL6g1b: the service assigns the connection's clientId to
-			// messages published without one (no-op for unidentified
-			// connections).
-			msg.ClientID = s.params.clientID
-		}
-		// TM2c: the message is attributed to the publishing connection.
-		msg.ConnectionID = connectionID
-		if msg.Timestamp == 0 {
-			// Stamp the server receipt time. SDKs never send a timestamp
-			// on publish (they back-fill from the enclosing frame per
-			// TM2f), so this is what subscribers observe.
-			msg.Timestamp = now
-		}
-		// Normalize binary data to the canonical JSON-safe form (Base64
-		// string + "base64" encoding segment, RSL4d1) before enveloping,
-		// so the stored publication is format-agnostic. Everything else —
-		// including every other encoding-chain segment — passes through
-		// verbatim (see payload.go). No-op for JSON sessions: a JSON
-		// decode never yields []byte data.
-		normalizeMessageData(msg)
-	}
-
-	// Marshal every envelope before the first publish: the marshaled bytes
-	// are both the publication payload and the measurement basis for the
-	// maxMessageSize check, which must reject the frame before anything is
-	// published.
-	payloads := make([][]byte, 0, len(m.Messages))
-	totalSize := 0
-	for _, msg := range m.Messages {
-		data, err := json.Marshal(msg)
-		if err != nil {
-			s.writeNack(m.MsgSerial, errCodeInternal, 500, fmt.Sprintf("publish failed: %s", err))
-			return
-		}
-		payloads = append(payloads, data)
-		totalSize += len(data)
-	}
-	// CD2c/TO3l8: maxMessageSize, advertised in connectionDetails, limits
-	// the summed size of a frame's messages array (the realtime counterpart
-	// of REST's RSL1i, same error code 40009). Measured here as the summed
-	// marshaled-envelope byte size AFTER normalization; real Ably sums
-	// name + data + clientId + extras only, so the server-added envelope
-	// fields (id, connectionId, timestamp) — and for binary payloads the
-	// ~33% Base64 inflation of the canonical form — make this adapter
-	// marginally stricter, never looser. This
-	// is the application-level limit: the frame is NACKed, nothing is
-	// published, and the connection stays usable — contrast the protocol-
-	// level maxFrameSize read limit set in serveRealtime, which kills the
-	// connection outright.
-	if totalSize > maxMessageSize {
-		s.writeNack(m.MsgSerial, errCodeMaxMessageLength, 400,
-			fmt.Sprintf("publish failed: maximum message length exceeded (%d bytes, limit %d)", totalSize, maxMessageSize))
+			// is connectionId:msgSerial per TR4n).
+			return fmt.Sprintf("%s:%d:%d", connectionID, m.MsgSerial, idx)
+		},
+	})
+	if problem != nil {
+		s.writeNack(m.MsgSerial, problem.code, problem.statusCode, "publish failed: "+problem.message)
 		return
 	}
 
@@ -424,10 +364,9 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// NACKs the whole frame with the already-published prefix NOT rolled
 	// back: NACK is the honest verdict (an ACK would falsely confirm the
 	// tail), and an SDK retry (RTN19a) may duplicate the prefix until
-	// idempotent dedup lands in M3.
+	// idempotent dedup lands in M3.2.
 	for _, data := range payloads {
-		_, err := s.node.Publish(m.Channel, data,
-			centrifuge.WithTags(map[string]string{pubTagOrigin: connectionID}))
+		_, err := s.node.Publish(m.Channel, data, publishOptions(m.Channel, connectionID)...)
 		if err != nil {
 			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("publish failed")
 			s.writeNack(m.MsgSerial, errCodeInternal, 500, "publish failed")
@@ -481,16 +420,16 @@ func (s *session) writeNack(msgSerial int64, code int, statusCode int, message s
 }
 
 func (s *session) attach(channel string) {
-	// Channel-name validation, failing the CHANNEL — never the connection
-	// (pinned by ably-js channelattachempty/channelattachinvalid, RTL4d
-	// territory): empty names and names beginning with ':' are invalid,
-	// code 40010. Validated here so the bad name never reaches centrifuge,
-	// whose empty-channel handling disconnects the whole client. The full
-	// Ably channel-name grammar is not enforced. detach() deliberately has
-	// no such guard: after the 40010 the channel is FAILED client-side and
-	// conforming SDKs never send DETACH for it (an empty-name DETACH from a
-	// non-conforming client gets centrifuge's bad-request disconnect).
-	if channel == "" || strings.HasPrefix(channel, ":") {
+	// Channel-name validation (validChannelName, publish.go), failing the
+	// CHANNEL — never the connection (pinned by ably-js
+	// channelattachempty/channelattachinvalid, RTL4d territory): code
+	// 40010. Validated here so the bad name never reaches centrifuge,
+	// whose empty-channel handling disconnects the whole client. detach()
+	// deliberately has no such guard: after the 40010 the channel is
+	// FAILED client-side and conforming SDKs never send DETACH for it (an
+	// empty-name DETACH from a non-conforming client gets centrifuge's
+	// bad-request disconnect).
+	if !validChannelName(channel) {
 		s.writeChannelError(channel, errCodeInvalidChannelName, 400, "invalid channel name")
 		return
 	}

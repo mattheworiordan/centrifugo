@@ -71,11 +71,18 @@ func MarshalAny(v any, f Format) ([]byte, error) {
 
 // Unmarshal decodes data into m using the given format.
 func Unmarshal(data []byte, f Format, m *ProtocolMessage) error {
+	return UnmarshalAny(data, f, m)
+}
+
+// UnmarshalAny decodes an arbitrary wire value in the given format — the
+// decode counterpart of MarshalAny, used by the REST surface where request
+// bodies are bare Message documents rather than ProtocolMessage frames.
+func UnmarshalAny(data []byte, f Format, v any) error {
 	switch f {
 	case FormatJSON:
-		return json.Unmarshal(data, m)
+		return json.Unmarshal(data, v)
 	case FormatMsgpack:
-		return msgpack.Unmarshal(data, m)
+		return msgpack.Unmarshal(data, v)
 	default:
 		return fmt.Errorf("unsupported format %d", f)
 	}
