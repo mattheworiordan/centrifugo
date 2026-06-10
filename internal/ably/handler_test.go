@@ -155,6 +155,7 @@ type realtimeTestServer struct {
 	wsURL    string
 	node     *centrifuge.Node
 	srv      *httptest.Server
+	handler  *Handler
 	lastUser func() string // centrifuge UserID of the most recently connected client
 }
 
@@ -195,9 +196,10 @@ func newRealtimeServer(t *testing.T) *realtimeTestServer {
 	t.Cleanup(srv.Close)
 
 	return &realtimeTestServer{
-		wsURL: "ws" + strings.TrimPrefix(srv.URL, "http"),
-		node:  node,
-		srv:   srv,
+		wsURL:   "ws" + strings.TrimPrefix(srv.URL, "http"),
+		node:    node,
+		srv:     srv,
+		handler: h,
 		lastUser: func() string {
 			mu.Lock()
 			defer mu.Unlock()

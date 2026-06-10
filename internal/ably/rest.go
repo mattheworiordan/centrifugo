@@ -74,6 +74,8 @@ func (h *Handler) serveChannels(rw http.ResponseWriter, r *http.Request) {
 		h.serveRESTPublish(rw, r, channel, identity)
 	case sub == "messages" && r.Method == http.MethodGet:
 		h.serveRESTHistory(rw, r, channel, identity)
+	case sub == "presence" && r.Method == http.MethodGet:
+		h.serveRESTPresence(rw, r, channel, identity)
 	case sub == "" && r.Method == http.MethodGet:
 		h.serveChannelDetails(rw, r, channel)
 	default:
@@ -453,6 +455,47 @@ func (h *Handler) writeHistoryPage(rw http.ResponseWriter, r *http.Request, chan
 	h.writeDocument(rw, r, http.StatusOK, items)
 }
 
+// serveRESTPresence implements GET /channels/{channel}/presence: the
+// current member set as a bare array of PresenceMessages with action
+// present (RSL3-adjacent — ably-js rest presence get). Bounded by limit;
+// presence sets are small enough that Link pagination is omitted (noted
+// for M9 should a test demand it).
+func (h *Handler) serveRESTPresence(rw http.ResponseWriter, r *http.Request, channel string, identity authResult) {
+	if !validChannelName(channel) {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidChannelName, "invalid channel name")
+		return
+	}
+	// Reading presence requires the presence operation (40160).
+	if !identity.capability.Allows(auth.OpPresence, channel) {
+		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit presence")
+		return
+	}
+	limit := historyDefaultLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 || n > historyMaxLimit {
+			h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid limit")
+			return
+		}
+		limit = n
+	}
+	format := responseFormat(r)
+	members := h.presence.members(channel)
+	items := make([]*protocol.PresenceMessage, 0, len(members))
+	for _, m := range members {
+		if len(items) >= limit {
+			break
+		}
+		present := *m
+		present.Action = protocol.PresencePresent
+		if format == protocol.FormatMsgpack {
+			denormalizePresenceData(&present)
+		}
+		items = append(items, &present)
+	}
+	h.writeDocument(rw, r, http.StatusOK, items)
+}
+
 // channelDetails is the GET /channels/{channel} response shape pinned by
 // ably-js rest/status status0 (CHD1-adjacent: channelId plus
 // status.occupancy.metrics with the six numeric occupancy fields).
@@ -490,10 +533,9 @@ func (h *Handler) serveChannelDetails(rw http.ResponseWriter, r *http.Request, c
 		return
 	}
 	subscribers := h.node.Hub().NumSubscribers(channel)
-	presence := 0
-	if stats, err := h.node.PresenceStats(channel); err == nil {
-		presence = stats.NumClients
-	}
+	// Presence occupancy comes from the adapter-owned member set (the
+	// centrifuge presence manager only sees native centrifugo clients).
+	presence := len(h.presence.members(channel))
 	h.writeDocument(rw, r, http.StatusOK, &channelDetails{
 		ChannelID: channel,
 		Name:      channel,

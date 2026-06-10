@@ -318,3 +318,46 @@ func TestRequestToken_RSA8(t *testing.T) {
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	})
 }
+
+// REST presence: the member set as a bare array (fixture members seeded
+// at startup for persisted:presence_fixtures), plus live members from
+// realtime ENTERs; capability-gated.
+func TestRESTPresence(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	// The harness fixture seeds 6 members with verbatim encodings.
+	resp := restRequest(t, ts, http.MethodGet, "/channels/persisted:presence_fixtures/presence", nil, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	data, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	var members []*protocol.PresenceMessage
+	require.NoError(t, json.Unmarshal(data, &members))
+	require.Len(t, members, 6)
+	byClient := map[string]*protocol.PresenceMessage{}
+	for _, m := range members {
+		require.Equal(t, protocol.PresencePresent, m.Action)
+		byClient[m.ClientID] = m
+	}
+	require.Contains(t, byClient, "client_string")
+	require.Equal(t, "json/utf-8/cipher+aes-128-cbc/base64", byClient["client_encoded"].Encoding, "cipher chain verbatim")
+
+	// A live ENTER appears in REST presence.
+	params := defaultDialParams()
+	params.Set("clientId", "live-carol")
+	conn := dialRealtime(t, ts.wsURL, params)
+	require.Equal(t, protocol.ActionConnected, readFrame(t, conn).Action)
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action: protocol.ActionPresence, Channel: "rest-pres-live", MsgSerial: 0,
+		Presence: []*protocol.PresenceMessage{{Action: protocol.PresenceEnter}},
+	})
+	require.Equal(t, protocol.ActionAck, readNonHeartbeatFrame(t, conn).Action)
+
+	resp = restRequest(t, ts, http.MethodGet, "/channels/rest-pres-live/presence", nil, nil)
+	data, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	members = nil
+	require.NoError(t, json.Unmarshal(data, &members))
+	require.Len(t, members, 1)
+	require.Equal(t, "live-carol", members[0].ClientID)
+}

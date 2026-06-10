@@ -168,7 +168,10 @@ type session struct {
 
 	closeMu sync.Mutex
 	closed  bool
-	closeCh chan struct{} // closed on teardown: stops the heartbeat ticker and cancels the client context
+	// cleanClose marks a client-initiated CLOSE (RTN12a): presence leaves
+	// immediately. Abrupt drops keep members for the grace window.
+	cleanClose bool
+	closeCh    chan struct{} // closed on teardown: stops the heartbeat ticker and cancels the client context
 }
 
 func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore) *session {
@@ -187,6 +190,11 @@ func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParam
 // frame, heartbeat ticker, then the read loop. Blocks until the connection
 // dies.
 func (s *session) run(reqCtx context.Context) {
+	// Presence cleanup is a DEDICATED defer, not part of teardown: when a
+	// server-side disconnect wins beginClose (handleTransportClose first,
+	// e.g. node shutdown), teardown early-returns — but the reader loop
+	// always exits, so this defer is the one guaranteed cleanup point.
+	defer s.leavePresence()
 	defer s.teardown()
 
 	// Refuse new sessions when the node is already shutting down, as the
@@ -330,7 +338,10 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 		return true
 	case protocol.ActionClose:
 		// RTN12a: confirm the close request with CLOSED, then drop the
-		// connection.
+		// connection. A clean close leaves presence immediately.
+		s.closeMu.Lock()
+		s.cleanClose = true
+		s.closeMu.Unlock()
 		_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionClosed})
 		return false
 	default:
@@ -582,7 +593,7 @@ func (s *session) handlePresence(m *protocol.ProtocolMessage) {
 			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "presence failed: unsupported action")
 			return
 		}
-		if err := s.publishPresenceEvent(m.Channel, &entry); err != nil {
+		if err := publishPresenceEvent(s.node, m.Channel, &entry); err != nil {
 			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("presence publish failed")
 			s.writeNack(m.MsgSerial, errCodeInternal, 500, "presence failed")
 			return
@@ -594,13 +605,14 @@ func (s *session) handlePresence(m *protocol.ProtocolMessage) {
 // publishPresenceEvent fans a presence event out as a presence-tagged
 // publication: no history options (presence never pollutes message
 // history) and no origin tag (presence events reach everyone, including
-// the originator, regardless of the echo=false message filter).
-func (s *session) publishPresenceEvent(channel string, entry *protocol.PresenceMessage) error {
+// the originator, regardless of the echo=false message filter). Package
+// level so grace timers outliving their session can use it.
+func publishPresenceEvent(node *centrifuge.Node, channel string, entry *protocol.PresenceMessage) error {
 	data, err := json.Marshal(entry)
 	if err != nil {
 		return err
 	}
-	_, err = s.node.Publish(channel, data,
+	_, err = node.Publish(channel, data,
 		centrifuge.WithTags(map[string]string{pubTagKind: pubTagKindPresence}))
 	return err
 }
@@ -842,18 +854,31 @@ func (s *session) teardown() {
 	if !s.beginClose() {
 		return
 	}
-	s.leavePresence()
 	if s.closeFn != nil {
 		_ = s.closeFn()
 	}
 	_ = s.conn.Close()
 }
 
-// leavePresence removes every member this connection holds and fans out
-// synthesized LEAVE events (RTP territory: members do not outlive their
-// connection; the 15s abrupt-disconnect grace is the M5.2 refinement).
+// leavePresence handles the connection's members at teardown: a clean
+// CLOSE leaves immediately; an abrupt drop keeps members present for the
+// grace window (advertised ~15s) so a reconnecting client never flickers,
+// with synthesized LEAVEs only for identities that did not re-enter.
 func (s *session) leavePresence() {
 	if s.client == nil {
+		return
+	}
+	s.closeMu.Lock()
+	clean := s.cleanClose
+	s.closeMu.Unlock()
+	node := s.node
+	fanout := func(channel string, member *protocol.PresenceMessage) {
+		if err := publishPresenceEvent(node, channel, member); err != nil {
+			log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("leave fan-out failed")
+		}
+	}
+	if !clean {
+		s.presence.scheduleExpiry(s.client.ID(), fanout)
 		return
 	}
 	now := time.Now().UnixMilli()
@@ -862,9 +887,7 @@ func (s *session) leavePresence() {
 			leave := *m
 			leave.Action = protocol.PresenceLeave
 			leave.Timestamp = now
-			if err := s.publishPresenceEvent(channel, &leave); err != nil {
-				log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("leave fan-out failed")
-			}
+			fanout(channel, &leave)
 		}
 	}
 }

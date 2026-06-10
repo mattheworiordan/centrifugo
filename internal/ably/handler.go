@@ -7,8 +7,11 @@
 package ably
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -57,14 +60,58 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 	if checkOrigin != nil {
 		upgrade.CheckOrigin = checkOrigin
 	}
-	return &Handler{
+	h := &Handler{
 		node:     n,
 		config:   c,
 		keys:     keys,
 		upgrade:  upgrade,
 		nonces:   newNonceCache(),
 		presence: newPresenceStore(),
-	}, nil
+	}
+	if err := h.seedPresenceFixtures(c.KeysFile); err != nil {
+		return nil, err
+	}
+	return h, nil
+}
+
+// seedPresenceFixtures loads the app fixture's channels block (the
+// sandbox seeds presence members at app creation — e.g.
+// persisted:presence_fixtures with six members, one cipher-encoded) so
+// the pinned rest/presence fixture tests see the same world. Synthetic
+// members carry fixture connectionIds; encodings pass through verbatim.
+func (h *Handler) seedPresenceFixtures(path string) error {
+	data, err := os.ReadFile(path) //nolint:gosec // operator-provided config path, read once at startup
+	if err != nil {
+		return err
+	}
+	var fixture struct {
+		Channels []struct {
+			Name     string `json:"name"`
+			Presence []struct {
+				ClientID string `json:"clientId"`
+				Data     any    `json:"data"`
+				Encoding string `json:"encoding"`
+			} `json:"presence"`
+		} `json:"channels"`
+	}
+	if err := json.Unmarshal(data, &fixture); err != nil {
+		return fmt.Errorf("ably presence fixtures: %w", err)
+	}
+	now := time.Now().UnixMilli()
+	for _, ch := range fixture.Channels {
+		for i, m := range ch.Presence {
+			h.presence.set(ch.Name, &protocol.PresenceMessage{
+				ID:           fmt.Sprintf("fixture:%d", i),
+				Action:       protocol.PresencePresent,
+				ClientID:     m.ClientID,
+				ConnectionID: fmt.Sprintf("fixture:%d", i),
+				Data:         m.Data,
+				Encoding:     m.Encoding,
+				Timestamp:    now,
+			})
+		}
+	}
+	return nil
 }
 
 func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {

@@ -18,6 +18,7 @@ package ably
 
 import (
 	"sync"
+	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 )
@@ -29,14 +30,24 @@ const (
 	pubTagKindPresence = "p"
 )
 
+// defaultPresenceGrace is how long an abruptly-disconnected connection's
+// members remain present before synthesized LEAVEs fan out — the
+// advertised ~15s window that prevents presence flicker across client
+// reconnects. A clean CLOSE leaves immediately.
+const defaultPresenceGrace = 15 * time.Second
+
 // presenceStore is the in-memory member set.
 type presenceStore struct {
 	mu       sync.Mutex
+	grace    time.Duration
 	channels map[string]map[string]*protocol.PresenceMessage
 }
 
 func newPresenceStore() *presenceStore {
-	return &presenceStore{channels: make(map[string]map[string]*protocol.PresenceMessage)}
+	return &presenceStore{
+		grace:    defaultPresenceGrace,
+		channels: make(map[string]map[string]*protocol.PresenceMessage),
+	}
 }
 
 func memberKey(connectionID, clientID string) string {
@@ -108,4 +119,53 @@ func (s *presenceStore) removeConnection(connectionID string) map[string][]*prot
 		}
 	}
 	return removed
+}
+
+// expireConnection implements the post-grace reconciliation: every member
+// the dead connection still holds is removed, but a synthesized LEAVE is
+// only reported for clientIds that have NOT re-entered the channel on
+// another connection in the meantime — the whole point of the grace
+// window is that a reconnecting client never flickers.
+func (s *presenceStore) expireConnection(connectionID string) map[string][]*protocol.PresenceMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	leaves := make(map[string][]*protocol.PresenceMessage)
+	for channel, members := range s.channels {
+		for key, m := range members {
+			if m.ConnectionID != connectionID {
+				continue
+			}
+			delete(members, key)
+			reentered := false
+			for _, other := range members {
+				if other.ClientID == m.ClientID {
+					reentered = true
+					break
+				}
+			}
+			if !reentered {
+				leaves[channel] = append(leaves[channel], m)
+			}
+		}
+		if len(members) == 0 {
+			delete(s.channels, channel)
+		}
+	}
+	return leaves
+}
+
+// scheduleExpiry arms the grace timer for an abruptly-disconnected
+// connection; fanout receives each synthesized LEAVE after the window.
+func (s *presenceStore) scheduleExpiry(connectionID string, fanout func(channel string, member *protocol.PresenceMessage)) {
+	time.AfterFunc(s.grace, func() {
+		now := time.Now().UnixMilli()
+		for channel, members := range s.expireConnection(connectionID) {
+			for _, m := range members {
+				leave := *m
+				leave.Action = protocol.PresenceLeave
+				leave.Timestamp = now
+				fanout(channel, &leave)
+			}
+		}
+	})
 }

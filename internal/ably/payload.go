@@ -93,3 +93,27 @@ func normalizePresenceData(pm *protocol.PresenceMessage) {
 		pm.Encoding += "/" + encodingBase64
 	}
 }
+
+// denormalizePresenceData mirrors denormalizeMessageData for presence
+// payloads (RSL4c1 semantics on msgpack delivery).
+func denormalizePresenceData(pm *protocol.PresenceMessage) {
+	var remainder string
+	switch {
+	case pm.Encoding == encodingBase64:
+		remainder = ""
+	case strings.HasSuffix(pm.Encoding, "/"+encodingBase64):
+		remainder = strings.TrimSuffix(pm.Encoding, "/"+encodingBase64)
+	default:
+		return
+	}
+	str, ok := pm.Data.(string)
+	if !ok {
+		return
+	}
+	raw, err := base64.StdEncoding.DecodeString(str)
+	if err != nil {
+		return
+	}
+	pm.Data = raw
+	pm.Encoding = remainder
+}
