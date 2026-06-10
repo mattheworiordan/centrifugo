@@ -29,11 +29,6 @@ const (
 	historyMaxLimit     = 1000
 )
 
-// connectionKeySuffix is the opaque tail of the connectionKey this adapter
-// mints in connectionDetails (CD2b): "<connectionId>!key". A REST publish
-// carrying Message.connectionKey (TM2h) is attributed to that connection.
-const connectionKeySuffix = "!key"
-
 // channelRoute splits an /channels/... request into the channel name and
 // the trailing subresource ("" or "messages"). The channel segment is
 // taken from the ESCAPED path: Ably channel names may contain characters
@@ -157,9 +152,9 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 
 	// TM2h: Message.connectionKey lets a REST publisher attribute the
 	// message to an existing realtime connection. This adapter's keys are
-	// "<connectionId>!key" (see session CONNECTED), so attribution is a
-	// suffix strip; the key is request-scoped and never stored (the shared
-	// core clears it).
+	// "<connectionId>!<token>" (see session CONNECTED), so attribution is
+	// everything before the first '!'; the key is request-scoped and never
+	// stored (the shared core clears it).
 	for _, msg := range messages {
 		if msg == nil {
 			continue
@@ -171,11 +166,14 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		if msg.ConnectionKey == "" {
 			continue
 		}
-		connID := strings.TrimSuffix(msg.ConnectionKey, connectionKeySuffix)
-		if connID == msg.ConnectionKey || connID == "" {
+		// "<connectionId>!<token>" — attribution is everything before the
+		// first '!' (the token half is per-session, see session CONNECTED).
+		bang := strings.IndexByte(msg.ConnectionKey, '!')
+		if bang <= 0 {
 			h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidConnectionID, "invalid connection key")
 			return
 		}
+		connID := msg.ConnectionKey[:bang]
 		// The connection's existence is NOT verified (centrifuge exposes no
 		// per-ID client lookup): a well-formed key for a dead connection
 		// attributes silently rather than erroring — PoC divergence from

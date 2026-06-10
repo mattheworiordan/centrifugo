@@ -49,12 +49,17 @@ type presenceStore struct {
 	mu       sync.Mutex
 	grace    time.Duration
 	channels map[string]map[string]*protocol.PresenceMessage
+	// timers holds the pending grace-expiry timer per abruptly-dropped
+	// connectionId, so a recovery inside the window can cancel it (the
+	// connection never died — its members must neither vanish nor LEAVE).
+	timers map[string]*time.Timer
 }
 
 func newPresenceStore() *presenceStore {
 	return &presenceStore{
 		grace:    defaultPresenceGrace,
 		channels: make(map[string]map[string]*protocol.PresenceMessage),
+		timers:   make(map[string]*time.Timer),
 	}
 }
 
@@ -164,8 +169,23 @@ func (s *presenceStore) expireConnection(connectionID string) map[string][]*prot
 
 // scheduleExpiry arms the grace timer for an abruptly-disconnected
 // connection; fanout receives each synthesized LEAVE after the window.
+// A timer already pending for the connection is replaced.
 func (s *presenceStore) scheduleExpiry(connectionID string, fanout func(channel string, member *protocol.PresenceMessage)) {
-	time.AfterFunc(s.grace, func() {
+	// Registration happens under the lock BEFORE the timer can fire, and
+	// the callback only deregisters ITSELF (a replacement timer registered
+	// for the same id survives an old callback's cleanup).
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.timers[connectionID]; ok {
+		prev.Stop()
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(s.grace, func() {
+		s.mu.Lock()
+		if s.timers[connectionID] == timer {
+			delete(s.timers, connectionID)
+		}
+		s.mu.Unlock()
 		now := time.Now().UnixMilli()
 		for channel, members := range s.expireConnection(connectionID) {
 			for _, m := range members {
@@ -176,4 +196,20 @@ func (s *presenceStore) scheduleExpiry(connectionID string, fanout func(channel 
 			}
 		}
 	})
+	s.timers[connectionID] = timer
+}
+
+// cancelExpiry disarms a pending grace timer: called when a connection
+// recovers inside the window (RTN16-lite) — the connection never died, so
+// its members stay present and no LEAVE is synthesized. A timer whose
+// callback already started may still run; expireConnection then removes
+// whatever is left, which the recovered session re-enters as usual (the
+// pre-recovery behavior).
+func (s *presenceStore) cancelExpiry(connectionID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if timer, ok := s.timers[connectionID]; ok {
+		timer.Stop()
+		delete(s.timers, connectionID)
+	}
 }

@@ -126,6 +126,14 @@ type sessionParams struct {
 	// capability governs this connection (see authResult.capability),
 	// enforced on attach and publish.
 	capability auth.Capability
+	// recoverID is the connectionId recovered from the recover query
+	// param (RTN16): the client presents its previous connectionKey and
+	// the session adopts that identity — CONNECTED echoes the SAME
+	// connectionId with a NEW connectionKey (RTN16d). Empty for fresh
+	// connections. PoC posture: the claim is not verified against any
+	// connection registry (single-node, no connection-state store) —
+	// divergence documented for M9.
+	recoverID string
 	// format is the wire encoding selected by the format query param
 	// (RTN2a): every outbound frame is marshaled in it (msgpack frames
 	// travel as WS binary messages, JSON as text) and every inbound frame
@@ -159,6 +167,10 @@ type pendingOp struct {
 	// recovery machinery replays the backlog, but ATTACHED carries
 	// HAS_BACKLOG (when non-empty) instead of RESUMED (RTL2i).
 	rewinding bool
+	// claimResume marks an ATTACH_RESUME attach without a cursor: the
+	// client claims prior attachment; ATTACHED grants RESUMED on the
+	// claim (RTN16-lite, unverified — see attach).
+	claimResume bool
 }
 
 type session struct {
@@ -252,18 +264,23 @@ func (s *session) run(reqCtx context.Context) {
 		// behalf of any clientId. Messages stay unstamped.
 		detailsClientID = "*"
 	}
-	connectionID := s.client.ID()
+	connectionID := s.connectionID()
 	err := s.writeFrame(&protocol.ProtocolMessage{
 		Action:       protocol.ActionConnected,
 		ConnectionID: connectionID,
 		ConnectionDetails: &protocol.ConnectionDetails{ // TR4o, CD1
-			ClientID:           detailsClientID,       // CD2a
-			ConnectionKey:      connectionID + "!key", // CD2b; resume is M3, any opaque string
-			MaxMessageSize:     maxMessageSize,        // CD2c
-			MaxFrameSize:       maxFrameSize,          // CD2d
-			MaxInboundRate:     maxInboundRate,        // CD2e
-			ConnectionStateTTL: connectionStateTTL,    // CD2f
-			MaxIdleInterval:    maxIdleIntervalMS,     // CD2h
+			ClientID: detailsClientID, // CD2a
+			// CD2b: "<connectionId>!<token>". The token is the per-session
+			// centrifuge id, so a recovered connection keeps its
+			// connectionId but gets a FRESH key (RTN16d asserts the key
+			// changes across recovery). REST TM2h attribution strips at
+			// the first '!'.
+			ConnectionKey:      connectionID + "!" + s.client.ID(),
+			MaxMessageSize:     maxMessageSize,     // CD2c
+			MaxFrameSize:       maxFrameSize,       // CD2d
+			MaxInboundRate:     maxInboundRate,     // CD2e
+			ConnectionStateTTL: connectionStateTTL, // CD2f
+			MaxIdleInterval:    maxIdleIntervalMS,  // CD2h
 		},
 	})
 	if err != nil {
@@ -407,7 +424,7 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		return
 	}
 
-	connectionID := s.client.ID()
+	connectionID := s.connectionID()
 
 	// Validation, envelope rules (CD2c/TO3l8 size accounting included) and
 	// payload normalization live in the shared publish core (publish.go),
@@ -563,6 +580,19 @@ func modesFromAttach(m *protocol.ProtocolMessage) int64 {
 	}
 	return m.Flags & (protocol.FlagModePresence | protocol.FlagModePublish |
 		protocol.FlagModeSubscribe | protocol.FlagModePresenceSubscribe)
+}
+
+// connectionID is the connection identity advertised to the client and
+// stamped on everything it publishes: the recovered id when the
+// connection presented a recover key (RTN16d), the per-session
+// centrifuge client id otherwise. The echo=false subscription filter
+// uses the same value as the publication origin tag, so echo
+// suppression survives recovery.
+func (s *session) connectionID() string {
+	if s.params.recoverID != "" {
+		return s.params.recoverID
+	}
+	return s.client.ID()
 }
 
 // channelModes returns the granted mode bits for a channel (0 =
@@ -766,6 +796,17 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	// attaches fresh (no RESUMED flag = discontinuity, the Ably signal).
 	resuming := false
 	rewinding := false
+	// RTN16-lite: an ATTACH carrying ATTACH_RESUME — or any cursor-less
+	// ATTACH on a RECOVERED connection (ably-js re-attaches recovered
+	// channels bare when they had no channelSerial; real Ably derives
+	// RESUMED from the recovered connection's channel state) — claims a
+	// prior attachment. Without a cursor there is no gap to bridge or
+	// verify, so the PoC grants continuity (RESUMED) on the claim alone
+	// (divergence noted for M9: a genuinely-new channel attached after
+	// recovery is also granted RESUMED). With a cursor, the resolved
+	// recovery below decides RESUMED honestly.
+	claimResume := m.ChannelSerial == "" &&
+		(m.Flags&protocol.FlagAttachResume != 0 || s.params.recoverID != "")
 	switch {
 	case m.ChannelSerial != "":
 		if pos, ok := s.resolveCursor(channel, m.ChannelSerial); ok {
@@ -780,7 +821,7 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 			sub.Epoch = pos.Epoch
 			resuming = true
 		}
-	case m.Params["rewind"] != "" && m.Flags&protocol.FlagAttachResume == 0:
+	case m.Params["rewind"] != "" && m.Flags&protocol.FlagAttachResume == 0 && s.params.recoverID == "":
 		// RTL2i: rewind replays a backlog of retained messages on a FRESH
 		// attach only — an ATTACH_RESUME attach (or one presenting a
 		// cursor, above) suppresses it (pinned by resume_rewind_1). The
@@ -813,16 +854,17 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 		//     tracking (hub.go broadcastPublication), so the subscriber's
 		//     stream position advances and a future resume (M3) sees no
 		//     false discontinuity.
-		sub.Tf = &cproto.FilterNode{Cmp: "neq", Key: pubTagOrigin, Val: s.client.ID()}
+		sub.Tf = &cproto.FilterNode{Cmp: "neq", Key: pubTagOrigin, Val: s.connectionID()}
 	}
 	cmd := &cproto.Command{
 		Id: s.addPending(pendingOp{
-			kind:      opSubscribe,
-			channel:   channel,
-			params:    m.Params,
-			modes:     modesFromAttach(m),
-			resuming:  resuming,
-			rewinding: rewinding,
+			kind:        opSubscribe,
+			channel:     channel,
+			params:      m.Params,
+			modes:       modesFromAttach(m),
+			resuming:    resuming,
+			rewinding:   rewinding,
+			claimResume: claimResume,
 		}),
 		Subscribe: sub,
 	}
@@ -867,7 +909,7 @@ func (s *session) handlePresence(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeOperationNotPermitted, 401, "presence failed: channel mode does not permit presence")
 		return
 	}
-	connectionID := s.client.ID()
+	connectionID := s.connectionID()
 	now := time.Now().UnixMilli()
 	for idx, pm := range m.Presence {
 		if pm == nil {
@@ -970,6 +1012,9 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			// (RTL2i; never RESUMED — rewind is a fresh attach).
 			var extraFlags int64
 			var replay []*cproto.Publication
+			if op.claimResume {
+				extraFlags |= protocol.FlagResumed
+			}
 			if reply.Subscribe != nil && reply.Subscribe.Recovered {
 				switch {
 				case op.resuming:
@@ -1217,11 +1262,11 @@ func (s *session) leavePresence() {
 		}
 	}
 	if !clean {
-		s.presence.scheduleExpiry(s.client.ID(), fanout)
+		s.presence.scheduleExpiry(s.connectionID(), fanout)
 		return
 	}
 	now := time.Now().UnixMilli()
-	for channel, members := range s.presence.removeConnection(s.client.ID()) {
+	for channel, members := range s.presence.removeConnection(s.connectionID()) {
 		for _, m := range members {
 			leave := *m
 			leave.Action = protocol.PresenceLeave

@@ -153,3 +153,88 @@ func TestReattachAtHeadResumesEmpty(t *testing.T) {
 	}
 	require.Equal(t, "after-resume", delivered.Messages[0].Name)
 }
+
+// RTN16d: a connection presenting its previous connectionKey as the
+// recover param keeps its connectionId — and gets a fresh connectionKey.
+func TestConnectionRecoverKeepsConnectionID_RTN16d(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	params := defaultDialParams()
+	first := dialRealtime(t, ts.wsURL, params)
+	connected := readFrame(t, first)
+	require.Equal(t, protocol.ActionConnected, connected.Action)
+	firstID := connected.ConnectionID
+	firstKey := connected.ConnectionDetails.ConnectionKey
+	require.NotEmpty(t, firstID)
+	require.Contains(t, firstKey, "!")
+
+	params = defaultDialParams()
+	params.Set("recover", firstKey)
+	second := dialRealtime(t, ts.wsURL, params)
+	reconnected := readFrame(t, second)
+	require.Equal(t, protocol.ActionConnected, reconnected.Action)
+	require.Equal(t, firstID, reconnected.ConnectionID, "RTN16d: connectionId preserved")
+	require.NotEqual(t, firstKey, reconnected.ConnectionDetails.ConnectionKey, "RTN16d: key rotates")
+
+	// The recovered identity attributes publishes.
+	writeFrame(t, second, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "recover-id-test"})
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, second).Action)
+	writeFrame(t, second, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "recover-id-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "attributed", Data: "x"}},
+	})
+	var delivered *protocol.ProtocolMessage
+	for range 2 {
+		switch m := readNonHeartbeatFrame(t, second); m.Action {
+		case protocol.ActionAck:
+		case protocol.ActionMessage:
+			delivered = m
+		default:
+			t.Fatalf("unexpected frame action %d", m.Action)
+		}
+	}
+	require.Equal(t, firstID, delivered.Messages[0].ConnectionID)
+}
+
+// RTN16-lite: an ATTACH_RESUME attach without a cursor is granted
+// RESUMED on the claim (no gap to verify on this single-node PoC).
+func TestAttachResumeClaimGrantsResumed(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: "claim-resume-test",
+		Flags:   protocol.FlagAttachResume,
+	})
+	attached := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.Equal(t, protocol.FlagResumed, attached.Flags&protocol.FlagResumed)
+}
+
+// RTN16-lite: cursor-less attaches on a RECOVERED connection are granted
+// RESUMED (ably-js re-attaches recovered channels bare when they carried
+// no channelSerial).
+func TestRecoveredConnectionGrantsResumedOnBareAttach(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	params := defaultDialParams()
+	first := dialRealtime(t, ts.wsURL, params)
+	connected := readFrame(t, first)
+	require.Equal(t, protocol.ActionConnected, connected.Action)
+
+	params = defaultDialParams()
+	params.Set("recover", connected.ConnectionDetails.ConnectionKey)
+	second := dialRealtime(t, ts.wsURL, params)
+	require.Equal(t, protocol.ActionConnected, readFrame(t, second).Action)
+
+	writeFrame(t, second, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "recover-bare-test"})
+	attached := readNonHeartbeatFrame(t, second)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.Equal(t, protocol.FlagResumed, attached.Flags&protocol.FlagResumed)
+}

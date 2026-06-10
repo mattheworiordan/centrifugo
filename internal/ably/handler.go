@@ -230,6 +230,24 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		userID = clientID
 	}
 
+	// RTN16-lite: a recovering client presents its previous connectionKey
+	// ("<connectionId>!<token>") as the recover query param; the session
+	// adopts the embedded connectionId so CONNECTED preserves it (RTN16d).
+	// Malformed values are ignored — the connection proceeds fresh, which
+	// is the correct recovery-failure posture.
+	recoverID := ""
+	if rec := q.Get("recover"); rec != "" {
+		if i := strings.IndexByte(rec, '!'); i > 0 {
+			recoverID = rec[:i]
+		}
+	}
+	if recoverID != "" {
+		// The connection recovered inside the grace window: it never died.
+		// Disarm the pending presence expiry so its members neither vanish
+		// nor LEAVE (the timer would otherwise delete the recovered
+		// session's re-entered members — they share the connectionId key).
+		h.presence.cancelExpiry(recoverID)
+	}
 	sess := newSession(h.node, conn, sessionParams{
 		userID:           userID,
 		clientID:         clientID,
@@ -238,6 +256,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		echo:             q.Get("echo") != "false", // RTN2b: echo is on unless explicitly disabled
 		protocolVersion:  q.Get("v"),               // RTN2f
 		format:           format,                   // RTN2a
+		recoverID:        recoverID,                // RTN16d
 	}, h.presence, h.mint)
 	sess.run(r.Context())
 }
