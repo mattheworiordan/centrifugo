@@ -34,6 +34,10 @@ type authResult struct {
 	capability auth.Capability
 	// keyName is the authenticating key (Basic) or signing key (token).
 	keyName string
+	// expires is the token exp in ms since epoch (0 = no expiry / Basic
+	// auth): the realtime session disconnects with 40142 when it passes
+	// (RTN15-territory) unless an AUTH renewal extends it first.
+	expires int64
 }
 
 // authProblem is the Ably error verdict of a failed authentication,
@@ -42,6 +46,43 @@ type authProblem struct {
 	code       int
 	statusCode int
 	message    string
+}
+
+// verifyTokenString resolves an Ably-JWT into an identity — the token
+// half of authenticate, reused verbatim by the AUTH reauth frame (RTC8).
+func (h *Handler) verifyTokenString(token string) (authResult, *authProblem) {
+	claims, err := h.keys.VerifyToken(token)
+	switch {
+	case errors.Is(err, auth.ErrTokenExpired):
+		// 40142: the client is expected to renew and retry (RSA4b).
+		return authResult{}, &authProblem{code: 40142, statusCode: http.StatusUnauthorized, message: "token expired"}
+	case err != nil:
+		return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: "invalid token"}
+	}
+	capabilityJSON := claims.Capability
+	if capabilityJSON == "" {
+		// A token without an x-ably-capability claim inherits the
+		// signing key's capability.
+		if key, ok := h.keys.Lookup(claims.KeyName); ok {
+			capabilityJSON = key.Capability
+		}
+	}
+	capability, err := auth.ParseCapability(capabilityJSON)
+	if err != nil {
+		return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: "invalid token capability"}
+	}
+	res := authResult{
+		viaToken:   true,
+		capability: capability,
+		keyName:    claims.KeyName,
+		expires:    claims.Expires,
+	}
+	if claims.ClientID == "*" {
+		res.wildcardClientID = true // RSA7b4
+	} else {
+		res.clientID = claims.ClientID
+	}
+	return res, nil
 }
 
 // authenticate resolves the caller's identity. Token credentials win when
@@ -64,37 +105,7 @@ func (h *Handler) authenticate(r *http.Request) (authResult, *authProblem) {
 		}
 	}
 	if token != "" {
-		claims, err := h.keys.VerifyToken(token)
-		switch {
-		case errors.Is(err, auth.ErrTokenExpired):
-			// 40142: the client is expected to renew and retry (RSA4b).
-			return authResult{}, &authProblem{code: 40142, statusCode: http.StatusUnauthorized, message: "token expired"}
-		case err != nil:
-			return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: "invalid token"}
-		}
-		capabilityJSON := claims.Capability
-		if capabilityJSON == "" {
-			// A token without an x-ably-capability claim inherits the
-			// signing key's capability.
-			if key, ok := h.keys.Lookup(claims.KeyName); ok {
-				capabilityJSON = key.Capability
-			}
-		}
-		capability, err := auth.ParseCapability(capabilityJSON)
-		if err != nil {
-			return authResult{}, &authProblem{code: errCodeInvalidCredentials, statusCode: http.StatusUnauthorized, message: "invalid token capability"}
-		}
-		res := authResult{
-			viaToken:   true,
-			capability: capability,
-			keyName:    claims.KeyName,
-		}
-		if claims.ClientID == "*" {
-			res.wildcardClientID = true // RSA7b4
-		} else {
-			res.clientID = claims.ClientID
-		}
-		return res, nil
+		return h.verifyTokenString(token)
 	}
 
 	key, err := h.keys.Authenticate(r)

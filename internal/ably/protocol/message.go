@@ -44,6 +44,13 @@ type ChannelMessage struct {
 	Messages      []*Message `json:"messages,omitempty"      msgpack:"messages,omitempty"`
 }
 
+// AuthDetails carries credentials on an AUTH frame (TR4p/AD1): the
+// client presents a fresh token mid-connection (RTC8) and the server
+// acknowledges with an updated CONNECTED.
+type AuthDetails struct {
+	AccessToken string `json:"accessToken,omitempty" msgpack:"accessToken,omitempty"`
+}
+
 // ProtocolMessage is one frame on the realtime WebSocket connection.
 //
 // MsgSerial keeps omitempty so frames where the serial is meaningless
@@ -66,6 +73,7 @@ type ProtocolMessage struct {
 	Messages          []*Message         `json:"messages,omitempty"          msgpack:"messages,omitempty"`
 	Error             *ErrorInfo         `json:"error,omitempty"             msgpack:"error,omitempty"`
 	Params            ParamsMap          `json:"params,omitempty"            msgpack:"params,omitempty"`
+	Auth              *AuthDetails       `json:"auth,omitempty"              msgpack:"auth,omitempty"`
 	Presence          []*PresenceMessage `json:"presence,omitempty"          msgpack:"presence,omitempty"`          // TR4l
 	ConnectionDetails *ConnectionDetails `json:"connectionDetails,omitempty" msgpack:"connectionDetails,omitempty"` // TR4o
 }

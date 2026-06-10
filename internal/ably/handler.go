@@ -257,6 +257,8 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		protocolVersion:  q.Get("v"),               // RTN2f
 		format:           format,                   // RTN2a
 		recoverID:        recoverID,                // RTN16d
+		tokenExpires:     identity.expires,         // RTN15-territory: 40142 disconnect at exp
+		reauth:           h.verifyTokenString,      // RTC8 AUTH frames
 	}, h.presence, h.mint)
 	sess.run(r.Context())
 }

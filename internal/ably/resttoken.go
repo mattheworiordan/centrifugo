@@ -7,6 +7,7 @@ package ably
 // verifier consumes on later connections.
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 
 	"github.com/rs/zerolog/log"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
 // defaultTokenTTL is Ably's default token lifetime (TK2a: 60 minutes);
@@ -31,17 +33,84 @@ const (
 	timestampTolerance = 15 * time.Minute
 )
 
+// flexInt64 tolerates a number arriving as either a JSON/msgpack number
+// or a numeric string: authUrl indirection delivers token requests with
+// query-string-typed values (echo's /qs_to_body — pinned by ably-js
+// auth_useAuthUrl_mixed_authParams_qsParams), and the real service
+// accepts them.
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(data []byte) error {
+	raw := strings.Trim(string(data), "\"")
+	if raw == "null" || raw == "" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return err
+	}
+	*f = flexInt64(v)
+	return nil
+}
+
+var _ msgpack.CustomDecoder = (*flexInt64)(nil)
+
+func (f *flexInt64) DecodeMsgpack(dec *msgpack.Decoder) error {
+	v, err := dec.DecodeInterface()
+	if err != nil {
+		return err
+	}
+	switch t := v.(type) {
+	case nil:
+		*f = 0
+	case string:
+		if t == "" {
+			*f = 0
+			return nil
+		}
+		n, err := strconv.ParseInt(t, 10, 64)
+		if err != nil {
+			return err
+		}
+		*f = flexInt64(n)
+	case int8:
+		*f = flexInt64(t)
+	case int16:
+		*f = flexInt64(t)
+	case int32:
+		*f = flexInt64(t)
+	case int64:
+		*f = flexInt64(t)
+	case uint8:
+		*f = flexInt64(t)
+	case uint16:
+		*f = flexInt64(t)
+	case uint32:
+		*f = flexInt64(t)
+	case uint64:
+		*f = flexInt64(t)
+	case float64:
+		*f = flexInt64(int64(t))
+	case float32:
+		*f = flexInt64(int64(t))
+	default:
+		return fmt.Errorf("flexInt64: unsupported type %T", v)
+	}
+	return nil
+}
+
 // tokenRequestBody is a signed TokenRequest (TE2-TE6 wire shape). Pointer
 // fields distinguish absent from zero: an absent ttl signs as the empty
 // string and defaults to one hour.
 type tokenRequestBody struct {
-	KeyName    string `json:"keyName"    msgpack:"keyName"`
-	TTL        *int64 `json:"ttl"        msgpack:"ttl"`
-	Capability string `json:"capability" msgpack:"capability"`
-	ClientID   string `json:"clientId"   msgpack:"clientId"`
-	Timestamp  int64  `json:"timestamp"  msgpack:"timestamp"`
-	Nonce      string `json:"nonce"      msgpack:"nonce"`
-	MAC        string `json:"mac"        msgpack:"mac"`
+	KeyName    string     `json:"keyName"    msgpack:"keyName"`
+	TTL        *flexInt64 `json:"ttl"        msgpack:"ttl"`
+	Capability string     `json:"capability" msgpack:"capability"`
+	ClientID   string     `json:"clientId"   msgpack:"clientId"`
+	Timestamp  flexInt64  `json:"timestamp"  msgpack:"timestamp"`
+	Nonce      string     `json:"nonce"      msgpack:"nonce"`
+	MAC        string     `json:"mac"        msgpack:"mac"`
 }
 
 // tokenDetails is the response document (TD wire shape).
@@ -89,14 +158,14 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 
 	// A present ttl must be positive and within the 24h maximum: out of
 	// range would sign one thing and issue another.
-	if req.TTL != nil && (*req.TTL <= 0 || *req.TTL > maxTokenTTL.Milliseconds()) {
+	if req.TTL != nil && (int64(*req.TTL) <= 0 || int64(*req.TTL) > maxTokenTTL.Milliseconds()) {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid ttl")
 		return
 	}
 	// RSA9d: the request timestamp must be within tolerance of server
 	// time; nonce reuse within the window is rejected (replay protection,
 	// pinned by rest/auth "duplicate nonce" → 401).
-	if skew := time.Since(time.UnixMilli(req.Timestamp)); skew > timestampTolerance || skew < -timestampTolerance {
+	if skew := time.Since(time.UnixMilli(int64(req.Timestamp))); skew > timestampTolerance || skew < -timestampTolerance {
 		h.writeError(rw, r, http.StatusUnauthorized, errCodeInvalidCredentials, "token request timestamp out of range")
 		return
 	}
@@ -114,10 +183,10 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 	// cannot deny a nonce to its legitimate owner.
 	ttlStr := ""
 	if req.TTL != nil {
-		ttlStr = strconv.FormatInt(*req.TTL, 10)
+		ttlStr = strconv.FormatInt(int64(*req.TTL), 10)
 	}
 	if !h.keys.VerifyTokenRequestMAC(keyName, ttlStr, req.Capability, req.ClientID,
-		strconv.FormatInt(req.Timestamp, 10), req.Nonce, req.MAC) {
+		strconv.FormatInt(int64(req.Timestamp), 10), req.Nonce, req.MAC) {
 		h.writeError(rw, r, http.StatusUnauthorized, errCodeInvalidCredentials, "invalid token request mac")
 		return
 	}
@@ -140,8 +209,8 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	ttl := defaultTokenTTL
-	if req.TTL != nil && *req.TTL > 0 {
-		ttl = time.Duration(*req.TTL) * time.Millisecond
+	if req.TTL != nil && int64(*req.TTL) > 0 {
+		ttl = time.Duration(int64(*req.TTL)) * time.Millisecond
 	}
 	minted, err := h.keys.MintToken(keyName, req.ClientID, effectiveCapability, ttl)
 	if err != nil {

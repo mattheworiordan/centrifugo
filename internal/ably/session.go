@@ -126,6 +126,14 @@ type sessionParams struct {
 	// capability governs this connection (see authResult.capability),
 	// enforced on attach and publish.
 	capability auth.Capability
+	// tokenExpires is the connection token's exp (ms since epoch, 0 =
+	// never): when it passes without an AUTH renewal, the session sends
+	// DISCONNECTED 40142 and drops — the SDK renews and reconnects.
+	tokenExpires int64
+	// reauth verifies a mid-connection AUTH token (RTC8), returning the
+	// refreshed identity. Built by the handler over the same verifier as
+	// connect-time auth.
+	reauth func(token string) (authResult, *authProblem)
 	// recoverID is the connectionId recovered from the recover query
 	// param (RTN16): the client presents its previous connectionKey and
 	// the session adopts that identity — CONNECTED echoes the SAME
@@ -201,6 +209,13 @@ type session struct {
 	modesMu       sync.Mutex
 	attachedModes map[string]int64
 
+	// authMu guards the token-expiry timers: armed at connect, re-armed by
+	// a successful AUTH (its handler runs on the frame-reader goroutine,
+	// the timers fire on their own goroutines).
+	authMu       sync.Mutex
+	expiryTimer  *time.Timer
+	preAuthTimer *time.Timer
+
 	closeMu sync.Mutex
 	closed  bool
 	// cleanClose marks a client-initiated CLOSE (RTN12a): presence leaves
@@ -257,35 +272,12 @@ func (s *session) run(reqCtx context.Context) {
 	// ProtocolMessage is sent. The Ably WS protocol has no client→server
 	// CONNECT frame: the upgrade itself, with auth and options in query
 	// params (RTN2), is the connect request.
-	detailsClientID := s.params.clientID
-	if s.params.wildcardClientID {
-		// RSA15b: a wildcard-token connection that assumed no identity
-		// advertises the literal "*" — the SDK knows it may publish on
-		// behalf of any clientId. Messages stay unstamped.
-		detailsClientID = "*"
-	}
-	connectionID := s.connectionID()
-	err := s.writeFrame(&protocol.ProtocolMessage{
-		Action:       protocol.ActionConnected,
-		ConnectionID: connectionID,
-		ConnectionDetails: &protocol.ConnectionDetails{ // TR4o, CD1
-			ClientID: detailsClientID, // CD2a
-			// CD2b: "<connectionId>!<token>". The token is the per-session
-			// centrifuge id, so a recovered connection keeps its
-			// connectionId but gets a FRESH key (RTN16d asserts the key
-			// changes across recovery). REST TM2h attribution strips at
-			// the first '!'.
-			ConnectionKey:      connectionID + "!" + s.client.ID(),
-			MaxMessageSize:     maxMessageSize,     // CD2c
-			MaxFrameSize:       maxFrameSize,       // CD2d
-			MaxInboundRate:     maxInboundRate,     // CD2e
-			ConnectionStateTTL: connectionStateTTL, // CD2f
-			MaxIdleInterval:    maxIdleIntervalMS,  // CD2h
-		},
-	})
-	if err != nil {
+	if err := s.writeConnected(); err != nil {
 		return
 	}
+	// RTN15-territory: a token-authenticated session disconnects with
+	// 40142 when the token's exp passes without an AUTH renewal.
+	s.armTokenExpiry()
 
 	go s.heartbeatLoop()
 
@@ -377,6 +369,10 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 		// RTP territory: presence operations consume the frame's msgSerial
 		// and are confirmed with ACK like publishes.
 		s.handlePresence(m)
+		return true
+	case protocol.ActionAuth:
+		// RTC8: mid-connection token renewal.
+		s.handleAuth(m)
 		return true
 	case protocol.ActionClose:
 		// RTN12a: confirm the close request with CLOSED, then drop the
@@ -492,6 +488,145 @@ type ackFrame struct {
 	MsgSerial int64               `json:"msgSerial"       msgpack:"msgSerial"`
 	Count     int                 `json:"count"           msgpack:"count"`
 	Error     *protocol.ErrorInfo `json:"error,omitempty" msgpack:"error,omitempty"`
+}
+
+// writeConnected sends the CONNECTED frame (RTN6 at connect; RTC8a-ack
+// on a successful AUTH — same connectionId, same key: an update, not a
+// new connection).
+func (s *session) writeConnected() error {
+	detailsClientID := s.params.clientID
+	if s.params.wildcardClientID {
+		// RSA15b: a wildcard-token connection that assumed no identity
+		// advertises the literal "*" — the SDK knows it may publish on
+		// behalf of any clientId. Messages stay unstamped.
+		detailsClientID = "*"
+	}
+	connectionID := s.connectionID()
+	return s.writeFrame(&protocol.ProtocolMessage{
+		Action:       protocol.ActionConnected,
+		ConnectionID: connectionID,
+		ConnectionDetails: &protocol.ConnectionDetails{ // TR4o, CD1
+			ClientID: detailsClientID, // CD2a
+			// CD2b: "<connectionId>!<token>". The token is the per-session
+			// centrifuge id, so a recovered connection keeps its
+			// connectionId but gets a FRESH key (RTN16d asserts the key
+			// changes across recovery). REST TM2h attribution strips at
+			// the first '!'.
+			ConnectionKey:      connectionID + "!" + s.client.ID(),
+			MaxMessageSize:     maxMessageSize,     // CD2c
+			MaxFrameSize:       maxFrameSize,       // CD2d
+			MaxInboundRate:     maxInboundRate,     // CD2e
+			ConnectionStateTTL: connectionStateTTL, // CD2f
+			MaxIdleInterval:    maxIdleIntervalMS,  // CD2h
+		},
+	})
+}
+
+// armTokenExpiry (re)arms the disconnect-at-token-expiry timer from
+// params.tokenExpires. RTN15-territory: when the token expires without
+// renewal the server sends DISCONNECTED 40142 and drops the transport —
+// the SDK renews via its authCallback/authUrl and reconnects. A
+// successful AUTH re-arms with the new exp (or disarms it for an exp-less
+// token).
+// serverAuthLeadTime is how far before token expiry the server sends a
+// client-bound AUTH asking for renewal (RTN22) — matching the Ably
+// service's ~30s lead. Tokens shorter-lived than the lead get no warning,
+// only the 40142 disconnect at expiry (the renew-on-disconnect path).
+const serverAuthLeadTime = 30 * time.Second
+
+func (s *session) armTokenExpiry() {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.expiryTimer != nil {
+		s.expiryTimer.Stop()
+		s.expiryTimer = nil
+	}
+	if s.preAuthTimer != nil {
+		s.preAuthTimer.Stop()
+		s.preAuthTimer = nil
+	}
+	if s.params.tokenExpires == 0 {
+		return
+	}
+	wait := time.Until(time.UnixMilli(s.params.tokenExpires))
+	if wait < 0 {
+		wait = 0
+	}
+	if wait > serverAuthLeadTime {
+		// RTN22: a server-initiated AUTH tells the client to renew now;
+		// the client answers with an AUTH carrying the fresh token
+		// (handled by handleAuth → CONNECTED update, which re-arms both
+		// timers from the new exp).
+		s.preAuthTimer = time.AfterFunc(wait-serverAuthLeadTime, func() {
+			_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionAuth})
+		})
+	}
+	s.expiryTimer = time.AfterFunc(wait, func() {
+		_ = s.writeFrame(&protocol.ProtocolMessage{
+			Action: protocol.ActionDisconnected,
+			Error: &protocol.ErrorInfo{
+				Code:       40142,
+				StatusCode: 401,
+				Message:    "token expired",
+			},
+		})
+		s.beginClose()
+	})
+}
+
+// handleAuth serves a mid-connection AUTH frame (RTC8): the presented
+// token is verified by the same path as connect-time auth; success
+// adopts the refreshed capability/expiry and acknowledges with CONNECTED
+// (an update — same connectionId and key); failure fails the CONNECTION
+// with an ERROR frame (no channel attribute), the RTC8a3 posture.
+// Capability and identity writes are frame-reader-goroutine-local, the
+// same goroutine every enforcement read runs on.
+func (s *session) handleAuth(m *protocol.ProtocolMessage) {
+	if s.params.reauth == nil || m.Auth == nil || m.Auth.AccessToken == "" {
+		s.writeConnectionError(errCodeBadRequest, 400, "auth failed: no token presented")
+		return
+	}
+	res, prob := s.params.reauth(m.Auth.AccessToken)
+	if prob != nil {
+		s.writeConnectionError(prob.code, prob.statusCode, "auth failed: "+prob.message)
+		return
+	}
+	// RTC8a1-lite: an identified connection cannot assume a different
+	// identity mid-flight; a wildcard token keeps the bound identity.
+	if res.clientID != "" && s.params.clientID != "" && res.clientID != s.params.clientID {
+		s.writeConnectionError(errCodeIncompatibleCredentials, 401, "auth failed: token clientId incompatible with connection clientId")
+		return
+	}
+	s.params.capability = res.capability
+	s.params.tokenExpires = res.expires
+	if s.params.clientID == "" && res.clientID != "" {
+		// An unidentified connection may adopt the renewed token's
+		// identity (RTC8a2-adjacent).
+		s.params.clientID = res.clientID
+		s.params.wildcardClientID = false
+	}
+	if s.params.clientID == "" {
+		// RSA7b4 advertisement tracks the CURRENT token: wildcard only
+		// while the renewed token grants it and no identity was assumed.
+		s.params.wildcardClientID = res.wildcardClientID
+	}
+	s.armTokenExpiry()
+	_ = s.writeConnected()
+}
+
+// writeConnectionError fails the whole connection with an ERROR frame
+// carrying NO channel attribute (RTN14g territory: ably-js routes a
+// channel-less ERROR to the connection).
+func (s *session) writeConnectionError(code int, statusCode int, message string) {
+	_ = s.writeFrame(&protocol.ProtocolMessage{
+		Action: protocol.ActionError,
+		Error: &protocol.ErrorInfo{
+			Code:       code,
+			StatusCode: statusCode,
+			Message:    message,
+		},
+	})
+	s.beginClose()
 }
 
 // writeAck confirms one inbound MESSAGE frame (RTN7a). msgSerial
@@ -1222,6 +1357,19 @@ func (s *session) heartbeatLoop() {
 // this idempotency: teardown's closeFn() synchronously drives centrifuge's
 // client close into Transport.Close → handleTransportClose → back here,
 // and a re-entrant Once.Do deadlocks.
+func (s *session) stopTokenExpiry() {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	if s.expiryTimer != nil {
+		s.expiryTimer.Stop()
+		s.expiryTimer = nil
+	}
+	if s.preAuthTimer != nil {
+		s.preAuthTimer.Stop()
+		s.preAuthTimer = nil
+	}
+}
+
 func (s *session) beginClose() bool {
 	s.closeMu.Lock()
 	defer s.closeMu.Unlock()
@@ -1237,6 +1385,7 @@ func (s *session) teardown() {
 	if !s.beginClose() {
 		return
 	}
+	s.stopTokenExpiry()
 	if s.closeFn != nil {
 		_ = s.closeFn()
 	}
