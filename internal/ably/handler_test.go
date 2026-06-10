@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -864,4 +865,84 @@ func TestRealtimeWildcardClientIDRejected_RSA7c(t *testing.T) {
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
 	_, _, err := conn.ReadMessage()
 	require.Error(t, err)
+}
+
+// readRawFrame reads one WS frame and returns both the raw JSON bytes and
+// the decoded form — for asserting wire shape (field presence), not just
+// decoded values.
+func readRawFrame(t *testing.T, conn *websocket.Conn) (map[string]json.RawMessage, *protocol.ProtocolMessage) {
+	t.Helper()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, data, err := conn.ReadMessage()
+	require.NoError(t, err)
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(data, &fields))
+	var m protocol.ProtocolMessage
+	require.NoError(t, protocol.Unmarshal(data, protocol.FormatJSON, &m))
+	return fields, &m
+}
+
+// TR4j/RTN7b: ACK frames must carry msgSerial and count explicitly even
+// for serial 0 — ably-js correlates pending publishes by the literal
+// field and a missing msgSerial never settles the publish (found via the
+// publish_no_attach probe; regression guard on the raw wire shape).
+func TestRealtimeAckExplicitMsgSerial_TR4j(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   "serial-wire-test",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "n", Data: "d"}},
+	})
+	for {
+		fields, m := readRawFrame(t, conn)
+		if m.Action == protocol.ActionHeartbeat {
+			continue
+		}
+		require.Equal(t, protocol.ActionAck, m.Action)
+		require.Contains(t, fields, "msgSerial", "ACK must carry msgSerial even when 0")
+		require.Contains(t, fields, "count")
+		require.JSONEq(t, "0", string(fields["msgSerial"]))
+		require.JSONEq(t, "1", string(fields["count"]))
+		break
+	}
+}
+
+// RTL4d territory, pinned by ably-js channelattachempty/channelattachinvalid:
+// an empty or ':'-prefixed channel name fails the CHANNEL with 40010 — the
+// ERROR frame carries the channel attribute explicitly (even "" — ably-js
+// routes channel-less ERRORs to the connection) — and the connection
+// survives.
+func TestRealtimeAttachInvalidChannelName_RTL4d(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	for _, name := range []string{"", ":hell"} {
+		writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: name})
+		for {
+			fields, m := readRawFrame(t, conn)
+			if m.Action == protocol.ActionHeartbeat {
+				continue
+			}
+			require.Equal(t, protocol.ActionError, m.Action)
+			require.Contains(t, fields, "channel", "channel-scoped ERROR must carry the channel attribute (name %q)", name)
+			require.JSONEq(t, strconv.Quote(name), string(fields["channel"]))
+			require.NotNil(t, m.Error)
+			require.Equal(t, errCodeInvalidChannelName, m.Error.Code)
+			break
+		}
+	}
+
+	// The connection survives: a heartbeat still echoes (RTN13a).
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionHeartbeat, ID: "alive"})
+	for {
+		m := readFrame(t, conn)
+		if m.Action == protocol.ActionHeartbeat && m.ID == "alive" {
+			return
+		}
+	}
 }

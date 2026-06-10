@@ -43,6 +43,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -74,6 +75,7 @@ const (
 const (
 	errCodeBadRequest             = 40000 // bad request
 	errCodeMaxMessageLength       = 40009 // maximum message length exceeded
+	errCodeInvalidChannelName     = 40010 // invalid channel name
 	errCodeInvalidClientID        = 40012 // invalid client id
 	errCodeInvalidCredentials     = 40101 // invalid credentials
 	errCodeOperationNotPermitted  = 40160 // operation not permitted with provided capability
@@ -411,13 +413,26 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	s.writeAck(m.MsgSerial)
 }
 
+// ackFrame is the ACK/NACK wire shape. Unlike ProtocolMessage, msgSerial
+// and count are NOT omitempty: ably-js correlates pending publishes via
+// completeMessages({serial, count}) (src/common/lib/transport/protocol.ts
+// onAck) and an omitted msgSerial — the first publish on a connection is
+// serial 0 (RTN7b) — makes that lookup undefined and the publish promise
+// never settles (found empirically via the publish_no_attach probe;
+// ably-go tolerated missing-as-0). TR4j-faithful: the serial is always
+// present on ACK/NACK.
+type ackFrame struct {
+	Action    protocol.Action     `json:"action"`
+	MsgSerial int64               `json:"msgSerial"`
+	Count     int                 `json:"count"`
+	Error     *protocol.ErrorInfo `json:"error,omitempty"`
+}
+
 // writeAck confirms one inbound MESSAGE frame (RTN7a). msgSerial
-// round-trips exactly — the first publish on a connection is msgSerial 0
-// (RTN7b); the omitempty consequence (an ACK for serial 0 omits the field,
-// read back as 0) is documented in protocol/message.go. count is 1: one
-// inbound frame is one serial (RTN7b).
+// round-trips exactly; count is 1: one inbound frame is one serial
+// (RTN7b).
 func (s *session) writeAck(msgSerial int64) {
-	_ = s.writeFrame(&protocol.ProtocolMessage{
+	s.writeJSON(&ackFrame{
 		Action:    protocol.ActionAck,
 		MsgSerial: msgSerial,
 		Count:     1,
@@ -427,7 +442,7 @@ func (s *session) writeAck(msgSerial int64) {
 // writeNack fails one inbound MESSAGE frame (RTN7a), consuming its
 // msgSerial.
 func (s *session) writeNack(msgSerial int64, code int, statusCode int, message string) {
-	_ = s.writeFrame(&protocol.ProtocolMessage{
+	s.writeJSON(&ackFrame{
 		Action:    protocol.ActionNack,
 		MsgSerial: msgSerial,
 		Count:     1,
@@ -440,6 +455,19 @@ func (s *session) writeNack(msgSerial int64, code int, statusCode int, message s
 }
 
 func (s *session) attach(channel string) {
+	// Channel-name validation, failing the CHANNEL — never the connection
+	// (pinned by ably-js channelattachempty/channelattachinvalid, RTL4d
+	// territory): empty names and names beginning with ':' are invalid,
+	// code 40010. Validated here so the bad name never reaches centrifuge,
+	// whose empty-channel handling disconnects the whole client. The full
+	// Ably channel-name grammar is not enforced. detach() deliberately has
+	// no such guard: after the 40010 the channel is FAILED client-side and
+	// conforming SDKs never send DETACH for it (an empty-name DETACH from a
+	// non-conforming client gets centrifuge's bad-request disconnect).
+	if channel == "" || strings.HasPrefix(channel, ":") {
+		s.writeChannelError(channel, errCodeInvalidChannelName, 400, "invalid channel name")
+		return
+	}
 	sub := &cproto.SubscribeRequest{Channel: channel}
 	if !s.params.echo {
 		// RTL7f: an echo=false connection (RTN2b; RTC1a — echo defaults to
@@ -583,13 +611,32 @@ func (s *session) writeAttachError(channel string, replyErr *cproto.Error) {
 			code, statusCode = errCodeOperationNotPermitted, 401
 		}
 	}
-	_ = s.writeFrame(&protocol.ProtocolMessage{
+	s.writeChannelError(channel, code, statusCode, fmt.Sprintf("attach failed: %s", detail))
+}
+
+// channelErrorFrame is the wire shape of a channel-scoped ERROR. Unlike
+// ProtocolMessage, channel is NOT omitempty: ably-js routes an ERROR to a
+// channel only when the channel attribute is present (otherwise it fails
+// the whole connection, RTN14g semantics), and the empty channel name ""
+// is itself attachable — its attach error must carry "channel":""
+// explicitly (pinned by ably-js channelattachempty).
+type channelErrorFrame struct {
+	Action  protocol.Action     `json:"action"`
+	Channel string              `json:"channel"`
+	Error   *protocol.ErrorInfo `json:"error"`
+}
+
+// writeChannelError fails one channel on the client with an ERROR frame
+// carrying the channel attribute (RTL14: the channel transitions to
+// FAILED; the connection stays up).
+func (s *session) writeChannelError(channel string, code int, statusCode int, message string) {
+	s.writeJSON(&channelErrorFrame{
 		Action:  protocol.ActionError,
 		Channel: channel,
 		Error: &protocol.ErrorInfo{
 			Code:       code,
 			StatusCode: statusCode,
-			Message:    fmt.Sprintf("attach failed: %s", detail),
+			Message:    message,
 		},
 	})
 }
@@ -674,6 +721,23 @@ func (s *session) writeFrame(m *protocol.ProtocolMessage) error {
 	if err != nil {
 		return err
 	}
+	return s.writeBytes(data)
+}
+
+// writeJSON marshals and writes a bespoke wire frame — used where the
+// shared ProtocolMessage omitempty tags would drop a field that must be
+// present on the wire (ackFrame, channelErrorFrame). The msgpack
+// equivalents land with the M2 codec.
+func (s *session) writeJSON(v any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		log.Error().Err(err).Str("transport", transportName).Msg("marshal wire frame")
+		return
+	}
+	_ = s.writeBytes(data)
+}
+
+func (s *session) writeBytes(data []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))

@@ -41,11 +41,11 @@ type ChannelMessage struct {
 //
 // MsgSerial keeps omitempty so frames where the serial is meaningless
 // (HEARTBEAT, CONNECTED, ...) match the wire shape of the real Ably
-// service. The one observable consequence: an ACK for msgSerial 0 omits
-// the field — SDK decoders read the missing field as 0, which is the
-// correct value (verified against ably-go's pendingEmitter.Ack). A
-// per-action conditional encoder can make this strictly TR4j-faithful
-// later if a stricter SDK demands it.
+// service. ACK/NACK frames — where the serial must be present even when
+// 0 (ably-js correlates pending publishes by the literal field) — do NOT
+// encode through this struct: the adapter session owns a bespoke ackFrame
+// wire shape for them, as it does for channel-scoped ERRORs (explicit
+// channel attribute).
 type ProtocolMessage struct {
 	Action            Action             `json:"action"                      msgpack:"action"`
 	ID                string             `json:"id,omitempty"                msgpack:"id,omitempty"`
