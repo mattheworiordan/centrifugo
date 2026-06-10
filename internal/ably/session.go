@@ -317,6 +317,14 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "publish failed: channel attribute missing")
 		return
 	}
+	// Same channel-name validation as attach (40010): publishing to an
+	// invalid name must NACK, not reach centrifuge (pinned by ably-js
+	// channelattach_publish_invalid).
+	if strings.HasPrefix(m.Channel, ":") {
+		s.writeNack(m.MsgSerial, errCodeInvalidChannelName, 400, "publish failed: invalid channel name")
+		return
+	}
+
 	connectionID := s.client.ID()
 	now := time.Now().UnixMilli()
 

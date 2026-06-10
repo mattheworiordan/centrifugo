@@ -946,3 +946,22 @@ func TestRealtimeAttachInvalidChannelName_RTL4d(t *testing.T) {
 		}
 	}
 }
+
+// Publishing to an invalid channel name NACKs with 40010 — same
+// validation as attach, pinned by ably-js channelattach_publish_invalid.
+func TestRealtimePublishInvalidChannelName(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	conn := connectRealtime(t, ts)
+
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:    protocol.ActionMessage,
+		Channel:   ":hell",
+		MsgSerial: 0,
+		Messages:  []*protocol.Message{{Name: "n", Data: "d"}},
+	})
+	nack := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionNack, nack.Action)
+	require.NotNil(t, nack.Error)
+	require.Equal(t, errCodeInvalidChannelName, nack.Error.Code)
+}
