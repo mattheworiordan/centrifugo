@@ -67,25 +67,31 @@ func (cometClosedError) Error() string { return "comet transport closed" }
 // fed by /send (C3) and read by the session's run loop, preserving the
 // single-dispatcher invariant that keeps reauth state goroutine-local.
 type cometConn struct {
-	mu     sync.Mutex
-	buf    [][]byte      // pre-encoded outbound frames awaiting a recv
-	waiter chan [][]byte // the parked recv's completion channel (buffered 1)
-	closed bool
-	reaper *time.Timer
+	mu        sync.Mutex
+	buf       [][]byte      // pre-encoded outbound frames awaiting a recv
+	waiter    chan [][]byte // the parked recv's completion channel (buffered 1)
+	closed    bool
+	reaper    *time.Timer
+	reapAfter time.Duration // abandonment window (per-conn so tests can shorten it)
 
 	inbound chan *protocol.ProtocolMessage
 	closeCh chan struct{}
 }
 
-func newCometConn() *cometConn {
+func newCometConn() *cometConn { return newCometConnReap(cometReapAfter) }
+
+// newCometConnReap builds a cometConn with an explicit abandonment window —
+// the default for production, a short one for reaper tests.
+func newCometConnReap(reapAfter time.Duration) *cometConn {
 	c := &cometConn{
-		inbound: make(chan *protocol.ProtocolMessage, 16),
-		closeCh: make(chan struct{}),
+		inbound:   make(chan *protocol.ProtocolMessage, 16),
+		closeCh:   make(chan struct{}),
+		reapAfter: reapAfter,
 	}
 	// Armed from birth: a client that connects and never polls is
 	// abandoned. parkRecv suspends it (the production recvTimeout
 	// discipline: the clock never runs while a poll is parked).
-	c.reaper = time.AfterFunc(cometReapAfter, func() { _ = c.close() })
+	c.reaper = time.AfterFunc(reapAfter, func() { _ = c.close() })
 	return c
 }
 
@@ -149,8 +155,15 @@ func (c *cometConn) parkRecv(ctx context.Context) [][]byte {
 	c.reaper.Stop()
 	defer func() {
 		c.mu.Lock()
-		if !c.closed {
-			c.reaper.Reset(cometReapAfter)
+		// B6: re-arm the reaper ONLY when no poll is parked. When this recv
+		// was superseded by a successor (c.waiter now holds the successor's
+		// channel), re-arming would run the abandonment clock while a poll is
+		// actively parked — contradicting "the clock never runs while
+		// parked" and risking a spurious reap of a continuously-polling
+		// client. The successor's own parkRecv already stopped the clock on
+		// entry and will re-arm when IT returns to an idle state.
+		if !c.closed && c.waiter == nil {
+			c.reaper.Reset(c.reapAfter)
 		}
 		c.mu.Unlock()
 	}()
