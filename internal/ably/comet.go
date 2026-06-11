@@ -431,6 +431,12 @@ func (h *Handler) serveCometConnect(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	cc := newCometConn()
+	// B2/M2: this only SETS the callback — the key is not registered here.
+	// registerKey runs inside writeConnected on the RUN goroutine, before
+	// the CONNECTED frame the client learns the key from is flushed (see
+	// writeConnected). So there is no "registered before the run loop starts"
+	// window: by the time any per-key request can carry this key, the run
+	// loop is already serving and the key is indexed.
 	params.onConnected = func(key string, s *session) { h.registry.registerKey(key, s) }
 	sess := newSession(h.node, cc, params, h.presence, h.mint, h.materialized)
 	h.registry.register(sess, sessionRecord{
