@@ -46,24 +46,33 @@ type statsRecord struct {
 	entries map[string]float64
 }
 
+// statsStore keys records by interval start: injecting an intervalId
+// again REPLACES its record. The real harness gets a fresh app (and so
+// an empty stats store) per suite run; the static-app server lives
+// across runs, and replace semantics keep repeated fixture injection
+// idempotent instead of accumulating duplicates.
 type statsStore struct {
 	mu      sync.Mutex
-	records []statsRecord
+	records map[int64]statsRecord
 }
 
-func newStatsStore() *statsStore { return &statsStore{} }
+func newStatsStore() *statsStore {
+	return &statsStore{records: make(map[int64]statsRecord)}
+}
 
 func (s *statsStore) add(rec statsRecord) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.records = append(s.records, rec)
+	s.records[rec.start] = rec
 }
 
 func (s *statsStore) snapshot() []statsRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]statsRecord, len(s.records))
-	copy(out, s.records)
+	out := make([]statsRecord, 0, len(s.records))
+	for _, rec := range s.records {
+		out = append(out, rec)
+	}
 	return out
 }
 
@@ -304,6 +313,31 @@ func (h *Handler) serveStats(rw http.ResponseWriter, r *http.Request) {
 		limit = n
 	}
 
+	// Pagination cursors (adapter-internal, carried only in Link URLs —
+	// SDKs treat them as opaque): they tighten the effective window for
+	// pages 2+ while start/end keep the ORIGINAL query bounds, so a
+	// rel="first" link from any page reproduces page one (the same split
+	// writeHistoryPage uses: bounds stay, the cursor advances).
+	filterStart, filterEnd := start, end
+	if raw := q.Get("cursorStart"); raw != "" {
+		ms, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid cursorStart parameter")
+			return
+		}
+		// Cursors only ever TIGHTEN the window: a hand-crafted cursor
+		// cannot widen a page past the original query bounds.
+		filterStart = max(filterStart, ms)
+	}
+	if raw := q.Get("cursorEnd"); raw != "" {
+		ms, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid cursorEnd parameter")
+			return
+		}
+		filterEnd = min(filterEnd, ms)
+	}
+
 	// Aggregate stored minute records into unit buckets, then keep the
 	// buckets whose interval overlaps [start, end].
 	type bucket struct {
@@ -314,7 +348,7 @@ func (h *Handler) serveStats(rw http.ResponseWriter, r *http.Request) {
 	for _, rec := range h.stats.snapshot() {
 		bs := bucketStart(rec.start, unit)
 		be := bucketEnd(bs, unit).UnixMilli() - 1
-		if bs.UnixMilli() > end || be < start {
+		if bs.UnixMilli() > filterEnd || be < filterStart {
 			continue
 		}
 		b := buckets[bs.UnixMilli()]
@@ -360,25 +394,24 @@ func (h *Handler) serveStats(rw http.ResponseWriter, r *http.Request) {
 
 	// Link pagination, same contract as writeHistoryPage: ably-js only
 	// accepts `./<word>?<query>` and reuses just the QUERY on the
-	// resource's own path. Page state lives in the start/end bounds: the
-	// next page tightens the bound past the last bucket served.
+	// resource's own path. start/end always carry the ORIGINAL bounds
+	// (so rel="first" works from any page); the next link advances a
+	// cursor past the last bucket served.
 	direction := "forwards"
 	if backwards {
 		direction = "backwards"
 	}
-	first := fmt.Sprintf("./stats?limit=%d&direction=%s&by=%s&start=%d&end=%d",
+	base := fmt.Sprintf("./stats?limit=%d&direction=%s&by=%s&start=%d&end=%d",
 		limit, direction, url.QueryEscape(unit), start, end)
-	links := []string{fmt.Sprintf("<%s>; rel=\"first\"", first)}
+	links := []string{fmt.Sprintf("<%s>; rel=\"first\"", base)}
 	if hasNext {
 		last := page[len(page)-1]
-		nextStart, nextEnd := start, end
+		var next string
 		if backwards {
-			nextEnd = last.start.UnixMilli() - 1
+			next = fmt.Sprintf("%s&cursorEnd=%d", base, last.start.UnixMilli()-1)
 		} else {
-			nextStart = bucketEnd(last.start, unit).UnixMilli()
+			next = fmt.Sprintf("%s&cursorStart=%d", base, bucketEnd(last.start, unit).UnixMilli())
 		}
-		next := fmt.Sprintf("./stats?limit=%d&direction=%s&by=%s&start=%d&end=%d",
-			limit, direction, url.QueryEscape(unit), nextStart, nextEnd)
 		links = append(links, fmt.Sprintf("<%s>; rel=\"next\"", next))
 	}
 	for _, l := range links {

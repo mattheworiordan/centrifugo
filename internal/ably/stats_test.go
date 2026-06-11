@@ -54,11 +54,11 @@ func getStats(t *testing.T, ts *realtimeTestServer, query string) ([]statsItem, 
 	return items, resp
 }
 
-// statsNextQuery extracts the rel="next" Link query ("" when absent).
-func statsNextQuery(t *testing.T, resp *http.Response) string {
+// statsLinkQuery extracts the Link query for a rel ("" when absent).
+func statsLinkQuery(t *testing.T, resp *http.Response, rel string) string {
 	t.Helper()
 	for _, l := range resp.Header.Values("Link") {
-		if !strings.Contains(l, `rel="next"`) {
+		if !strings.Contains(l, fmt.Sprintf("rel=%q", rel)) {
 			continue
 		}
 		start, end := strings.Index(l, "<"), strings.Index(l, ">")
@@ -70,16 +70,26 @@ func statsNextQuery(t *testing.T, resp *http.Response) string {
 	return ""
 }
 
+func statsNextQuery(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	return statsLinkQuery(t, resp, "next")
+}
+
 func TestStatsQueryAggregationAndPagination(t *testing.T) {
 	t.Parallel()
 	ts := newRealtimeServer(t)
 
-	postStatsFixtures(t, ts, []map[string]any{
+	fixtures := []map[string]any{
 		statsFixtureDoc("2025-02-03:15:03", 50, 5000, 20, 2000),
 		statsFixtureDoc("2025-02-03:15:04", 60, 6000, 10, 1000),
 		statsFixtureDoc("2025-02-03:15:05", 70, 7000, 40, 4000),
 		statsFixtureDoc("2025-03-03:15:07", 15, 4000, 33, 3000),
-	})
+	}
+	postStatsFixtures(t, ts, fixtures)
+	// Re-injection replaces by intervalId rather than accumulating: the
+	// suite is rerun against a long-lived server (a fresh sandbox app
+	// would have reset the store), so injection must be idempotent.
+	postStatsFixtures(t, ts, fixtures)
 
 	// intervalId bounds, forwards: the three February minutes, schema
 	// fields populated, legacy counters rolled up under .all.
@@ -132,6 +142,11 @@ func TestStatsQueryAggregationAndPagination(t *testing.T) {
 	require.Len(t, items, 1)
 	require.Equal(t, float64(5000), items[0].Entries["messages.inbound.all.messages.data"])
 	require.Empty(t, statsNextQuery(t, resp), "last page carries no next link")
+	// rel="first" from the LAST page must reproduce page one — the link
+	// carries the original bounds, not the page's tightened cursor.
+	items, _ = getStats(t, ts, statsLinkQuery(t, resp, "first"))
+	require.Len(t, items, 1)
+	require.Equal(t, float64(7000), items[0].Entries["messages.inbound.all.messages.data"])
 
 	// Forwards pagination from the same bound starts at 15:03.
 	items, resp = getStats(t, ts, "end=2025-02-03:15:05&direction=forwards&limit=1")

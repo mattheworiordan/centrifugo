@@ -112,14 +112,20 @@ func TestTimeMsgPack_RSC16(t *testing.T) {
 	}
 }
 
-// Catch-all REST error contract: 404 with code 40400 and Ably error headers.
+// Catch-all REST error contract: the auth gate runs before routing
+// (matching the real service — RTN14a's comet fallback depends on bad
+// credentials being 40101 on ANY path), so an unknown path is 40400
+// only for an authenticated caller and a credential error otherwise.
 func TestNotFoundError(t *testing.T) {
 	t.Parallel()
 	h := newTestHandler(t)
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := http.Get(srv.URL + "/nonexistent")
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/nonexistent", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
+	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusNotFound, resp.StatusCode)
@@ -135,6 +141,56 @@ func TestNotFoundError(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&envelope))
 	require.Equal(t, 40400, envelope.Error.Code)
 	require.Equal(t, http.StatusNotFound, envelope.Error.StatusCode)
+
+	// Without (or with bad) credentials the same path is a credential
+	// error, not a 404.
+	for name, setAuth := range map[string]func(*http.Request){
+		"no credentials":  func(r *http.Request) {},
+		"bad credentials": func(r *http.Request) { r.SetBasicAuth("this.is", "wrong") },
+	} {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+"/nonexistent", nil)
+		require.NoError(t, err)
+		setAuth(req)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusUnauthorized, resp.StatusCode, name)
+		require.Equal(t, "40101", resp.Header.Get("X-Ably-Errorcode"), name)
+		_ = resp.Body.Close()
+	}
+}
+
+// Comet transport probes are declined WITHOUT an Ably error envelope:
+// ably-js fails the whole connection on a coded envelope from
+// /comet/connect but soft-drops the candidate on a code-less error, so
+// a client trialling [web_socket, comet] keeps its WebSocket. Invalid
+// credentials still get the coded 40101 (RTN14a).
+func TestCometDeclinedWithoutEnvelope(t *testing.T) {
+	t.Parallel()
+	h := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/comet/connect", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNotImplemented, resp.StatusCode)
+	require.Empty(t, resp.Header.Get("X-Ably-Errorcode"))
+	require.NotContains(t, resp.Header.Get("Content-Type"), "json")
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NotContains(t, string(body), `"error"`, "no Ably error envelope")
+
+	req, err = http.NewRequest(http.MethodGet, srv.URL+"/comet/connect", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth("this.is", "wrong")
+	resp2, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	require.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
+	require.Equal(t, "40101", resp2.Header.Get("X-Ably-Errorcode"))
 }
 
 // The adapter enabled without a keys file is a startup error: it cannot
@@ -1492,4 +1548,48 @@ func TestRealtimePresenceLifecycle(t *testing.T) {
 	require.Equal(t, protocol.ActionPresence, leave.Action)
 	require.Equal(t, protocol.PresenceLeave, leave.Presence[0].Action)
 	require.Equal(t, "bob", leave.Presence[0].ClientID)
+}
+
+// RTP4: presence sets larger than one page (100 members) sync as
+// multiple SYNC frames with channelSerial cursors; the final page's
+// empty cursor ends the sequence. (Single-page syncs omit channelSerial
+// — asserted in the lifecycle test above.) Paging is behavioral, not
+// cosmetic: presence events interleaved between pages must apply
+// mid-sync (pinned by ably-js presence_sync_interruptus).
+func TestPresenceSyncPagination(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	enterer := connectRealtime(t, ts)
+	for i := 0; i < 105; i++ {
+		writeFrame(t, enterer, &protocol.ProtocolMessage{
+			Action: protocol.ActionPresence, Channel: "bigpres", MsgSerial: int64(i),
+			Presence: []*protocol.PresenceMessage{{
+				Action: protocol.PresenceEnter, ClientID: "m" + strconv.Itoa(i),
+			}},
+		})
+		require.Equal(t, protocol.ActionAck, readNonHeartbeatFrame(t, enterer).Action)
+	}
+
+	syncer := connectRealtime(t, ts)
+	writeFrame(t, syncer, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "bigpres"})
+	attached := readNonHeartbeatFrame(t, syncer)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.NotZero(t, attached.Flags&protocol.FlagHasPresence)
+
+	page1 := readNonHeartbeatFrame(t, syncer)
+	require.Equal(t, protocol.ActionSync, page1.Action)
+	require.Equal(t, "presence:100", page1.ChannelSerial, "non-final page carries a cursor")
+	require.Len(t, page1.Presence, 100)
+	page2 := readNonHeartbeatFrame(t, syncer)
+	require.Equal(t, protocol.ActionSync, page2.Action)
+	require.Equal(t, "presence:", page2.ChannelSerial, "final page's empty cursor ends the sync")
+	require.Len(t, page2.Presence, 5)
+
+	seen := map[string]bool{}
+	for _, p := range append(page1.Presence, page2.Presence...) {
+		require.Equal(t, protocol.PresencePresent, p.Action)
+		seen[p.ClientID] = true
+	}
+	require.Len(t, seen, 105, "every member present exactly once across pages")
 }

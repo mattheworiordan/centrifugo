@@ -176,7 +176,30 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		h.serveStatsFixtures(rw, r)
 	default:
 		// Catch-all REST error per the Ably error contract; route surface
-		// grows milestone by milestone.
+		// grows milestone by milestone. Like the real service, the auth
+		// gate runs BEFORE routing: bad credentials on any path are 40101,
+		// not 40400 — RTN14a depends on this when a comet transport
+		// fallback probes /comet/connect with the same (invalid) key the
+		// WebSocket attempt failed with: a 404 would read as a retryable
+		// transport error and mask the credential failure.
+		if _, authErr := h.authenticate(r); authErr != nil {
+			h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/comet/") {
+			// WS-only adapter: decline the comet transport WITHOUT an Ably
+			// error envelope. ably-js turns a coded envelope from
+			// /comet/connect into an ERROR ProtocolMessage and FAILS the
+			// whole connection (comettransport.ts 'complete' handler);
+			// a code-less error just disconnects the candidate, so a
+			// client trialling [web_socket, comet] keeps its WebSocket.
+			// (Invalid credentials never reach here — the auth gate above
+			// answers with the coded 40101 RTN14a depends on.)
+			rw.Header().Set("Content-Type", "text/plain")
+			rw.WriteHeader(http.StatusNotImplemented)
+			_, _ = rw.Write([]byte("comet transport is not supported (WebSocket-only server)"))
+			return
+		}
 		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "not found")
 	}
 }

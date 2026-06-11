@@ -1042,11 +1042,37 @@ func (s *session) writeAttached(channel string, params map[string]string, modes 
 			present.Action = protocol.PresencePresent
 			snapshot = append(snapshot, &present)
 		}
-		_ = s.writeFrame(&protocol.ProtocolMessage{
-			Action:   protocol.ActionSync,
-			Channel:  channel,
-			Presence: snapshot,
-		})
+		// RTP4: large presence sets page at 100 members per SYNC. Pages
+		// in a sequence carry channelSerial "<sequence>:<cursor>"; the
+		// final page's empty cursor ("presence:") ends the sync. A
+		// single-page sync omits channelSerial entirely (RTP18-lite, as
+		// before) — both forms complete ably-js's setPresence. The paging
+		// matters behaviorally: SDK presence.get() callers observe
+		// liveness during a paged sync (presence events interleaved
+		// between pages apply mid-sync — pinned by ably-js
+		// presence_sync_interruptus).
+		const syncPageSize = 100
+		if len(snapshot) <= syncPageSize {
+			_ = s.writeFrame(&protocol.ProtocolMessage{
+				Action:   protocol.ActionSync,
+				Channel:  channel,
+				Presence: snapshot,
+			})
+		} else {
+			for start := 0; start < len(snapshot); start += syncPageSize {
+				end := min(start+syncPageSize, len(snapshot))
+				cursor := ""
+				if end < len(snapshot) {
+					cursor = strconv.Itoa(end)
+				}
+				_ = s.writeFrame(&protocol.ProtocolMessage{
+					Action:        protocol.ActionSync,
+					Channel:       channel,
+					ChannelSerial: "presence:" + cursor,
+					Presence:      snapshot[start:end],
+				})
+			}
+		}
 	}
 }
 
