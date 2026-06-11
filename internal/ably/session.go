@@ -235,6 +235,13 @@ type session struct {
 	authMu       sync.Mutex
 	expiryTimer  *time.Timer
 	preAuthTimer *time.Timer
+	// expiryGen invalidates in-flight timer callbacks across a (re)arm or
+	// stop (A5). Timer.Stop cannot cancel an AfterFunc that has already
+	// begun running, so a token shorter-lived than the 30s pre-auth lead
+	// could let a stale expiry callback tear down a session that just
+	// reauthed. Each callback captures the generation it was armed under and
+	// no-ops if a later arm/stop has superseded it. Guarded by authMu.
+	expiryGen uint64
 
 	closeMu sync.Mutex
 	closed  bool
@@ -702,6 +709,10 @@ func (s *session) armTokenExpiry() {
 		s.preAuthTimer.Stop()
 		s.preAuthTimer = nil
 	}
+	// A5: every (re)arm advances the generation, so any AfterFunc still in
+	// flight from a prior arm (which Timer.Stop could not cancel) no-ops.
+	s.expiryGen++
+	gen := s.expiryGen
 	if s.params.tokenExpires == 0 {
 		return
 	}
@@ -714,13 +725,40 @@ func (s *session) armTokenExpiry() {
 		// the client answers with an AUTH carrying the fresh token
 		// (handled by handleAuth → CONNECTED update, which re-arms both
 		// timers from the new exp).
-		s.preAuthTimer = time.AfterFunc(wait-serverAuthLeadTime, func() {
-			_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionAuth})
-		})
+		s.preAuthTimer = time.AfterFunc(wait-serverAuthLeadTime, func() { s.firePreAuth(gen) })
 	}
-	s.expiryTimer = time.AfterFunc(wait, func() {
-		s.disconnectWithError(40142, 401, "token expired")
-	})
+	s.expiryTimer = time.AfterFunc(wait, func() { s.fireTokenExpiry(gen) })
+}
+
+// expiryGenStale reports whether a timer callback's captured generation has
+// been superseded by a later (re)arm or a stop (A5). Checked under authMu
+// so it serializes with armTokenExpiry/stopTokenExpiry.
+func (s *session) expiryGenStale(gen uint64) bool {
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	return gen != s.expiryGen
+}
+
+// firePreAuth is the pre-expiry AUTH-prompt callback (RTN22). A stale
+// generation (the client already reauthed) makes it a no-op.
+func (s *session) firePreAuth(gen uint64) {
+	if s.expiryGenStale(gen) {
+		return
+	}
+	_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionAuth})
+}
+
+// fireTokenExpiry is the token-expiry disconnect callback (40142). The
+// generation guard is the A5 fix: a callback armed before a successful
+// reauth (which re-armed under a new generation) must not tear down the
+// renewed session. The staleness check runs under authMu and is released
+// before disconnectWithError, whose teardown re-takes authMu via
+// stopTokenExpiry.
+func (s *session) fireTokenExpiry(gen uint64) {
+	if s.expiryGenStale(gen) {
+		return
+	}
+	s.disconnectWithError(40142, 401, "token expired")
 }
 
 // handleAuth serves a mid-connection AUTH frame (RTC8): the presented
@@ -1671,6 +1709,9 @@ func (s *session) heartbeatLoop() {
 func (s *session) stopTokenExpiry() {
 	s.authMu.Lock()
 	defer s.authMu.Unlock()
+	// A5: advancing the generation invalidates any expiry/pre-auth callback
+	// already in flight (Timer.Stop cannot cancel a running AfterFunc).
+	s.expiryGen++
 	if s.expiryTimer != nil {
 		s.expiryTimer.Stop()
 		s.expiryTimer = nil
