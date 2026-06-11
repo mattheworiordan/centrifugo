@@ -1,0 +1,30 @@
+diff --git a/demo/vercel/react/use-chat/src/app/api/chat/route.ts b/demo/vercel/react/use-chat/src/app/api/chat/route.ts
+index c50e27f..670844d 100644
+--- a/demo/vercel/react/use-chat/src/app/api/chat/route.ts
++++ b/demo/vercel/react/use-chat/src/app/api/chat/route.ts
+@@ -45,6 +45,9 @@ export async function POST(req: Request) {
+   const ably = new Ably.Realtime({
+     key: process.env.ABLY_API_KEY!,
+     ...(process.env.ABLY_ENDPOINT ? { endpoint: process.env.ABLY_ENDPOINT } : {}),
++    // `ABLY_PORT` points the agent at a local plain-HTTP Ably-protocol
++    // server (e.g. the Centrifugo adapter PoC).
++    ...(process.env.ABLY_PORT ? { port: Number(process.env.ABLY_PORT), tls: false } : {}),
+   });
+ 
+   const session = createAgentSession({ client: ably, channelName: invocation.sessionName });
+diff --git a/demo/vercel/react/use-chat/src/app/providers.tsx b/demo/vercel/react/use-chat/src/app/providers.tsx
+index 5e07926..d8e9acb 100644
+--- a/demo/vercel/react/use-chat/src/app/providers.tsx
++++ b/demo/vercel/react/use-chat/src/app/providers.tsx
+@@ -31,6 +31,11 @@ export function Providers({ clientId, children }: { clientId?: string; children:
+         }
+       },
+       ...(endpoint ? { endpoint } : {}),
++      // `NEXT_PUBLIC_ABLY_PORT` points the browser at a local plain-HTTP
++      // Ably-protocol server (e.g. the Centrifugo adapter PoC).
++      ...(process.env.NEXT_PUBLIC_ABLY_PORT
++        ? { port: Number(process.env.NEXT_PUBLIC_ABLY_PORT), tls: false }
++        : {}),
+     });
+     setClient(ably);
+     return () => {

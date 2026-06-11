@@ -1,11 +1,16 @@
 # Ably-on-Centrifugo PoC — conformance scorecard
 
-> Snapshot 2026-06-11. Source of truth: `.working/ably-centrifugo-poc/allowlist.json`
-> (per-test tracker, git-excluded) and the milestone log in PROGRESS.md. The
-> reproducible gate is `make ably-poc-test` (native Go suites + ably-go conformance
-> mirrors + the ably-js acceptance sweep below). All acceptance runs use **unmodified
-> SDKs**: ably-js 2.22.1 (pinned), ably-go v1.4.1 (conformance mirrors),
-> @ably/ai-transport 0.2.0 (its own integration suites).
+> What this is and why it exists: see [README.md](README.md). Current
+> behavioral gaps: [DIVERGENCES.md](DIVERGENCES.md).
+>
+> Snapshot 2026-06-11 (current). The reproducible gate is
+> `make ably-poc-test` (native Go suites + ably-go conformance mirrors +
+> the ably-js acceptance sweep below). All acceptance runs use
+> **unmodified SDKs**: ably-js 2.22.1 (pinned), ably-go v1.4.1
+> (conformance mirrors), @ably/ai-transport 0.2.0 (its own integration
+> suites). Deployed live: server `rt-poc-demo.fly.dev`, demo
+> `rt-poc-chat-demo.vercel.app` (browser-verified end-to-end, including
+> multi-tab sync).
 
 ## Headline
 
@@ -41,10 +46,12 @@
 
 | Slice | What changed | Result |
 |---|---|---|
-| T1.1 | Colon channel names: bijective broker-name escape (`:`→`~1`, `~`→`~0`) at every broker boundary | realtime/message 33/9 → 41/1; divergence #2 resolved |
-| T1.2 | Per-channel publish lock: serial mint + broker append atomic, serial order == offset order | concurrency hammer green ×18 race runs; divergences #6/#20 resolved |
-| T1.3 | RSC22 batch publish, BAR1 batch presence, RSA17 token revocation, RTC8a1 reauth capability downgrade, RSC6/TS12 stats (fixtures, aggregation, Link pagination), RTN14a auth-before-routing + comet soft-decline, RTP4 presence SYNC paging | rest/batch 6/6, reauth 16/16, rest/stats 9/9, rest/http 2/2, failure 18/18, sync 6/6, rest/init 5/5, fallbacks 3/3 |
+| T1.1 | Colon channel names: bijective broker-name escape (`:`→`~1`, `~`→`~0`) at every broker boundary | realtime/message 33/9 → 41/1 |
+| T1.2 | Per-channel publish lock: serial mint + broker append atomic, serial order == offset order | concurrency hammer green ×18 race runs |
+| T1.3 | RSC22 batch publish, BAR1 batch presence, RSA17 token revocation, RTC8a1 reauth capability downgrade, RSC6/TS12 stats (fixtures, aggregation, Link pagination), comet soft-decline, RTP4 presence SYNC paging | rest/batch 6/6, reauth 16/16, rest/stats 9/9, rest/http 2/2, failure 18/18, sync 6/6, rest/init 5/5, fallbacks 3/3 |
 | T1.4 | Acceptance gate expanded 13 → 31 suites | **413 tests GREEN** |
+| T1.5 | fly.io deployment kit + Vercel demo deploy | live and browser-verified |
+| Post-deploy | Fixes found by exercising the LIVE demo: persistent retention tier for `ai:`/`mutable:` channels, pagination truncation over size-evicted windows, CORS preflight 204 + exposed pagination headers (browser-only failure modes no server-side suite can see), REST error surface aligned with the real service (envelope shape, help links, serverId/cluster provenance, browser courtesy page) | multi-tab sync verified live; error responses mirror realtime.ably.io side-by-side |
 
 ## Known-failure categorizations (not regressions; tracked, never hidden)
 
@@ -53,7 +60,6 @@
 | comet / non-WS transports | WS-only PoC scope. `/comet/*` probes are declined 501 WITHOUT an Ably envelope so SDK transport trials soft-drop the comet candidate instead of failing the connection |
 | `break_transport` (realtime/failure) | enumerates a comet-ONLY transport branch that can never connect to a WS-only server |
 | `Init without any tls key` (rest/init), `primary domain as the first attempted` (rest/fallbacks) | assert SDK default-TLS URL construction, which the local test env must override to reach the plain-HTTP adapter; server never contacted |
-| ~~`publish` / `publish emoji string` (realtime/message)~~ | **RESOLVED in Phase 3 T1.1** (broker-name escape); the suite's one remaining categorization is filtering (below) |
 | `subscribes to filtered channel` | server-side message filtering not in scope |
 | presence trio (`multiple_pending`, `presence_auto_reenter_different_connid`, `leave_published_for_member_missing_from_sync`) | order-dependent: pass in isolation; native repro shows correct server behavior |
 | echo.ably.io embedded-JWT rest tests (5) | need external echo service token shapes (embedded x-ably-token) |
@@ -62,7 +68,11 @@
 ## Reproducing
 
 ```sh
-# full gate (~15 min; needs node + .working/ably-js-pinned with node_modules)
+# one-time: clone + patch + build the pinned ably-js (idempotent)
+./scripts/ably-poc-setup.sh
+
+# full gate (~15 min): native Go suites + ably-go conformance +
+# the 31-suite ably-js sweep
 make ably-poc-test
 
 # AIT SDK integration suites (server on :8081)

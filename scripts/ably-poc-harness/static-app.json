@@ -1,0 +1,109 @@
+{
+  "_comment": "Static app fixture for the Ably-on-Centrifugo PoC. Mirrors the sandbox POST /apps response for ably-js test/common/ably-common/test-resources/test-app-setup.json (pinned ably-js 2.22.1). Consumed by (1) the patched ably-js test harness when ABLY_TEST_STATIC_APP=1 and (2) the Go server static key store. The channels entry lists presence fixtures the sandbox would seed at app-creation time; the PoC server must pre-seed these itself for rest/presence tests.",
+  "accountId": "poc-account",
+  "appId": "poc",
+  "keys": [
+    {
+      "id": "key0",
+      "keyName": "poc.key0",
+      "keySecret": "secret_key0_0123456789abcdef",
+      "keyStr": "poc.key0:secret_key0_0123456789abcdef",
+      "capability": "{\"*\":[\"*\"]}"
+    },
+    {
+      "id": "key1",
+      "keyName": "poc.key1",
+      "keySecret": "secret_key1_0123456789abcdef",
+      "keyStr": "poc.key1:secret_key1_0123456789abcdef",
+      "capability": "{\"cansubscribe:*\":[\"subscribe\"],\"canpublish:*\":[\"publish\"],\"canpublish:andpresence\":[\"presence\",\"publish\"],\"pushenabled:*\":[\"publish\",\"subscribe\",\"push-subscribe\"],\"pushenabled:admin:*\":[\"publish\",\"subscribe\",\"push-admin\"]}"
+    },
+    {
+      "id": "key2",
+      "keyName": "poc.key2",
+      "keySecret": "secret_key2_0123456789abcdef",
+      "keyStr": "poc.key2:secret_key2_0123456789abcdef",
+      "capability": "{\"channel0\":[\"publish\"],\"channel1\":[\"publish\"],\"channel2\":[\"publish\",\"subscribe\"],\"channel3\":[\"subscribe\"],\"channel4\":[\"presence\",\"publish\",\"subscribe\"],\"channel5\":[\"presence\"],\"channel6\":[\"*\"]}"
+    },
+    {
+      "id": "key3",
+      "keyName": "poc.key3",
+      "keySecret": "secret_key3_0123456789abcdef",
+      "keyStr": "poc.key3:secret_key3_0123456789abcdef",
+      "capability": "{\"*\":[\"subscribe\"]}"
+    },
+    {
+      "id": "key4",
+      "keyName": "poc.key4",
+      "keySecret": "secret_key4_0123456789abcdef",
+      "keyStr": "poc.key4:secret_key4_0123456789abcdef",
+      "capability": "{\"*\":[\"*\"]}",
+      "revocableTokens": true
+    },
+    {
+      "id": "key5",
+      "keyName": "poc.key5",
+      "keySecret": "secret_key5_0123456789abcdef",
+      "keyStr": "poc.key5:secret_key5_0123456789abcdef",
+      "capability": "{\"[*]*\":[\"*\"]}"
+    }
+  ],
+  "namespaces": [
+    {
+      "id": "persisted",
+      "persisted": true
+    },
+    {
+      "id": "pushenabled",
+      "pushEnabled": true
+    },
+    {
+      "id": "mutable",
+      "mutableMessages": true
+    }
+  ],
+  "limits": {
+    "presence": {
+      "maxMembers": 250
+    }
+  },
+  "channels": [
+    {
+      "name": "persisted:presence_fixtures",
+      "presence": [
+        {
+          "clientId": "client_bool",
+          "data": "true"
+        },
+        {
+          "clientId": "client_int",
+          "data": "24"
+        },
+        {
+          "clientId": "client_string",
+          "data": "This is a string clientData payload"
+        },
+        {
+          "clientId": "client_json",
+          "data": "{ \"test\": \"This is a JSONObject clientData payload\"}"
+        },
+        {
+          "clientId": "client_decoded",
+          "data": "{\"example\":{\"json\":\"Object\"}}",
+          "encoding": "json"
+        },
+        {
+          "clientId": "client_encoded",
+          "data": "HO4cYSP8LybPYBPZPHQOtuD53yrD3YV3NBoTEYBh4U0N1QXHbtkfsDfTspKeLQFt",
+          "encoding": "json/utf-8/cipher+aes-128-cbc/base64"
+        }
+      ]
+    }
+  ],
+  "cipher": {
+    "algorithm": "aes",
+    "mode": "cbc",
+    "keylength": 128,
+    "key": "WUP6u0K7MXI5Zeo0VppPwg==",
+    "iv": "HO4cYSP8LybPYBPZPHQOtg=="
+  }
+}

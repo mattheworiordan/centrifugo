@@ -1,0 +1,68 @@
+diff --git a/test/common/modules/testapp_manager.js b/test/common/modules/testapp_manager.js
+index d4638e9..5346802 100644
+--- a/test/common/modules/testapp_manager.js
++++ b/test/common/modules/testapp_manager.js
+@@ -14,6 +14,41 @@ define(['globals', 'ably'], function (ablyGlobals, ably) {
+     loadJsonData = loadJsonDataNode,
+     testResourcesPath = 'test/common/ably-common/test-resources/';
+ 
++  /* Ably-on-Centrifugo PoC: when ABLY_TEST_STATIC_APP=1 (node only), skip sandbox
++   * provisioning (POST /apps) and resolve the test app from a static fixture file
++   * instead. Teardown (DELETE /apps/:id) becomes a no-op. The fixture path can be
++   * overridden with ABLY_TEST_STATIC_APP_FILE. */
++  var staticAppMode =
++    !isBrowser && typeof process !== 'undefined' && process.env && process.env.ABLY_TEST_STATIC_APP === '1';
++
++  function loadStaticApp(callback) {
++    var fs = require('fs'),
++      path = require('path'),
++      fixturePath =
++        process.env.ABLY_TEST_STATIC_APP_FILE ||
++        path.resolve(__dirname, '../../..', '../ably-centrifugo-poc/harness/static-app.json');
++
++    fs.readFile(fixturePath, function (err, data) {
++      if (err) {
++        callback(err);
++        return;
++      }
++      var fixture;
++      try {
++        fixture = JSON.parse(data);
++      } catch (e) {
++        callback(e);
++        return;
++      }
++      callback(null, {
++        accountId: fixture.accountId,
++        appId: fixture.appId,
++        keys: fixture.keys,
++        cipherConfig: fixture.cipher,
++      });
++    });
++  }
++
+   if (isNativescript) {
+     loadJsonData = loadJsonNativescript;
+     testResourcesPath = '~/tns_modules/ably/' + testResourcesPath;
+@@ -129,6 +164,10 @@ define(['globals', 'ably'], function (ablyGlobals, ably) {
+   }
+ 
+   function createNewApp(callback) {
++    if (staticAppMode) {
++      loadStaticApp(callback);
++      return;
++    }
+     loadJsonData(testResourcesPath + 'test-app-setup.json', function (err, testData) {
+       if (err) {
+         callback(err);
+@@ -201,6 +240,10 @@ define(['globals', 'ably'], function (ablyGlobals, ably) {
+   }
+ 
+   function deleteApp(helper, app, callback) {
++    if (staticAppMode) {
++      callback(null);
++      return;
++    }
+     helper = helper.addingHelperFunction('deleteApp');
+     var authKey = app.keys[0].keyStr,
+       authHeader = toBase64(helper, authKey);
