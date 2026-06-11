@@ -77,12 +77,22 @@ func persistentChannel(name string) bool {
 	return strings.HasPrefix(name, persistedNamespacePrefix) || mutableChannel(name)
 }
 
+// maxChannelNameBytes caps channel-name length (A4). Without a bound, a
+// hostile REST publish or attach could use a multi-megabyte name that
+// becomes a permanent key in the channel-keyed stores (serialMint,
+// presence, materialized) — the trivial OOM vector in HIGH finding #3.
+// 2048 bytes is far above any real channel name (the longest in the
+// pinned SDK suites is 44) and matches the documented service limit;
+// over-length names are rejected like any other invalid name (40010).
+const maxChannelNameBytes = 2048
+
 // validChannelName reports whether name is acceptable as an Ably channel
-// name. Empty names and names beginning with ':' are invalid (error code
-// 40010; pinned by ably-js channelattachempty/channelattachinvalid). The
-// full Ably channel-name grammar is not enforced.
+// name. Empty names, names beginning with ':', and names exceeding
+// maxChannelNameBytes are invalid (error code 40010; pinned by ably-js
+// channelattachempty/channelattachinvalid). The full Ably channel-name
+// grammar is not enforced.
 func validChannelName(name string) bool {
-	return name != "" && !strings.HasPrefix(name, ":")
+	return name != "" && !strings.HasPrefix(name, ":") && len(name) <= maxChannelNameBytes
 }
 
 // envelopeParams carries the publisher identity the envelope is built
