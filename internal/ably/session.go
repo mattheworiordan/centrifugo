@@ -264,6 +264,44 @@ type session struct {
 	// set once in writeConnected on the frame-reader goroutine. The
 	// comet front reads it after run() returns to drop its key index.
 	connKey string
+
+	// expectedMsgSerial enforces the SDK's monotonic-contiguous msgSerial
+	// sequence across ack-bearing frames (C1). ably-js assigns a msgSerial
+	// to four ackRequired actions — MESSAGE, PRESENCE, ANNOTATION, OBJECT
+	// (protocol.ts) — but this adapter only handles MESSAGE and PRESENCE, so
+	// those two draw from the validated sequence. NOTE: if OBJECT/ANNOTATION
+	// support is ever added, those frames MUST also run through
+	// checkMsgSerial (they currently hit handleFrame's default branch, which
+	// NACKs without advancing the expectation → a false gap on the next
+	// MESSAGE/PRESENCE). Frame-reader-goroutine-local: handleFrame is the
+	// sole reader and writer, so no mutex is needed.
+	expectedMsgSerial int64
+	msgSerialSeeded   bool
+}
+
+// checkMsgSerial validates an ack-bearing frame's msgSerial against the
+// connection's monotonic-contiguous sequence (C1). The FIRST ack-bearing
+// frame seeds the expectation rather than being validated: a fresh
+// connection starts at 0, but a resumed one legitimately continues from its
+// prior (nonzero) serial (RTN15c) — and this adapter cannot distinguish a
+// genuine resume from a claim, so it must not reject the first frame. Every
+// subsequent frame must carry exactly the next serial; an out-of-order,
+// duplicate, gapped, or negative serial is rejected. Runs only on the
+// frame-reader goroutine (no synchronization required).
+func (s *session) checkMsgSerial(serial int64) bool {
+	if !s.msgSerialSeeded {
+		if serial < 0 {
+			return false
+		}
+		s.expectedMsgSerial = serial + 1
+		s.msgSerialSeeded = true
+		return true
+	}
+	if serial != s.expectedMsgSerial {
+		return false
+	}
+	s.expectedMsgSerial++
+	return true
 }
 
 func newSession(node *centrifuge.Node, conn frameConn, params sessionParams, presence *presenceStore, mint *serialMint, materialized *materializedStore) *session {
@@ -406,11 +444,22 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 	case protocol.ActionMessage:
 		// RTL6: an inbound MESSAGE is a publish request; it is confirmed
 		// with ACK or failed with NACK (RTN7a).
+		// C1: validate the msgSerial sequence before handling. MESSAGE and
+		// PRESENCE are the only ackRequired actions this adapter handles, so
+		// they share one monotonic-contiguous sequence (see the field doc).
+		if !s.checkMsgSerial(m.MsgSerial) {
+			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "invalid msgSerial: expected a monotonic, contiguous sequence")
+			return true
+		}
 		s.publish(m)
 		return true
 	case protocol.ActionPresence:
 		// RTP territory: presence operations consume the frame's msgSerial
 		// and are confirmed with ACK like publishes.
+		if !s.checkMsgSerial(m.MsgSerial) {
+			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "invalid msgSerial: expected a monotonic, contiguous sequence")
+			return true
+		}
 		s.handlePresence(m)
 		return true
 	case protocol.ActionAuth:
@@ -886,9 +935,14 @@ func (s *session) writeConnectionError(code int, statusCode int, message string)
 	s.beginClose()
 }
 
-// writeAck confirms one inbound MESSAGE frame (RTN7a). msgSerial
-// round-trips exactly; count is 1: one inbound frame is one serial
-// (RTN7b).
+// writeAck confirms ONE inbound frame (RTN7a). msgSerial round-trips
+// exactly; count is always 1: in the SDK contract (ably-js
+// MessageQueue.completeMessages) count is the number of pending FRAMES an
+// ACK clears from the front of the queue — endSerial = serial + count —
+// NOT the number of messages inside a frame. A multi-message publish is one
+// frame = one PendingMessage = one msgSerial, so it is correctly
+// acknowledged with count 1 (an N here would clear N pending frames the
+// server never acked). This is why count is fixed at 1, not len(messages).
 func (s *session) writeAck(msgSerial int64) {
 	s.writeWire(&ackFrame{
 		Action:    protocol.ActionAck,
