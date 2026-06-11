@@ -148,18 +148,35 @@ type mutationProblem struct {
 	message    string
 }
 
-// mutate applies an update (1), delete (2) or append (5) to the
-// materialized state and records the version snapshot. The returned
-// message is the OP message to fan out: original serial and name, the
-// op's data (full for update, delta for append, {} for delete), the op
-// action, and the full version. The caller owns minting versionSerial.
+// mutate prepares and immediately commits a mutation — the single-step
+// form used by the REST/realtime semantics tests and any caller that does
+// not need the publish-then-commit split.
 func (s *materializedStore) mutate(channel, serial string, action int, data any, encoding string, extras any, version *protocol.MessageVersion) (*protocol.Message, *mutationProblem) {
+	op, commit, prob := s.prepareMutation(channel, serial, action, data, encoding, extras, version)
+	if prob != nil {
+		return nil, prob
+	}
+	commit()
+	return op, nil
+}
+
+// prepareMutation validates an update (1), delete (2) or append (5) and
+// computes the OP message to fan out — WITHOUT mutating the store. It
+// returns a commit closure the caller invokes ONLY after the broker
+// publish succeeds (B7): committing before the publish left a phantom
+// version when the publish failed (a real path once the broker is Redis).
+// The op carries the original serial and name, the op's data (full for
+// update, delta for append, {} for delete), the op action, and the full
+// version. The caller owns minting versionSerial and holds the channel
+// publish lock across prepare→publish→commit, which serializes mutations
+// and creates on this channel, so the entry cannot change between prepare
+// and commit. The caller owns minting versionSerial.
+func (s *materializedStore) prepareMutation(channel, serial string, action int, data any, encoding string, extras any, version *protocol.MessageVersion) (*protocol.Message, func(), *mutationProblem) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	entries := s.channels[channel]
-	entry, ok := entries[serial]
+	entry, ok := s.channels[channel][serial]
 	if !ok {
-		return nil, &mutationProblem{code: errCodeNotFound, statusCode: 404, message: "message not found"}
+		return nil, nil, &mutationProblem{code: errCodeNotFound, statusCode: 404, message: "message not found"}
 	}
 
 	// A version is a strictly LATER occurrence than what it mutates: on
@@ -176,12 +193,14 @@ func (s *materializedStore) mutate(channel, serial string, action int, data any,
 		version.Timestamp = floor + 1
 	}
 
+	// Compute the NEW state on a COPY — the store is not touched until commit.
+	newState := entry.state
 	switch action {
 	case protocol.MessageActionUpdate:
-		entry.state.Data = data
-		entry.state.Encoding = encoding
-		entry.state.Extras = extras
-		entry.state.Action = protocol.MessageActionUpdate
+		newState.Data = data
+		newState.Encoding = encoding
+		newState.Extras = extras
+		newState.Action = protocol.MessageActionUpdate
 	case protocol.MessageActionAppend:
 		// AIT token deltas: PLAIN string data — both encoding chains empty
 		// — concatenates; anything else replaces (documented divergence —
@@ -191,30 +210,25 @@ func (s *materializedStore) mutate(channel, serial string, action int, data any,
 		old, okOld := entry.state.Data.(string)
 		delta, okNew := data.(string)
 		if okOld && okNew && entry.state.Encoding == "" && encoding == "" {
-			entry.state.Data = old + delta
+			newState.Data = old + delta
 		} else {
-			entry.state.Data = data
-			entry.state.Encoding = encoding
+			newState.Data = data
+			newState.Encoding = encoding
 		}
-		entry.state.Extras = extras
-		entry.state.Action = protocol.MessageActionUpdate
+		newState.Extras = extras
+		newState.Action = protocol.MessageActionUpdate
 	case protocol.MessageActionDelete:
 		// The deletion op's data ({} as sent by SDKs) becomes the state.
-		entry.state.Data = data
-		entry.state.Encoding = encoding
-		entry.state.Extras = extras
-		entry.state.Action = protocol.MessageActionDelete
+		newState.Data = data
+		newState.Encoding = encoding
+		newState.Extras = extras
+		newState.Action = protocol.MessageActionDelete
 	default:
-		return nil, &mutationProblem{code: errCodeBadRequest, statusCode: 400, message: "unsupported message action"}
+		return nil, nil, &mutationProblem{code: errCodeBadRequest, statusCode: 400, message: "unsupported message action"}
 	}
-	entry.state.Version = version
-	entry.versions = append(entry.versions, entry.state)
-	// A3: bound the per-entry version history (the AIT O(N²) fix) and
-	// refresh the entry's retention deadline — an active message stays live.
-	capVersionsLocked(entry)
-	entry.expiresAt = retentionExpiryMS(channel, time.Now().UnixMilli())
+	newState.Version = version
 
-	op := protocol.Message{
+	op := &protocol.Message{
 		Name:     entry.state.Name,
 		Data:     data,
 		Encoding: encoding,
@@ -227,7 +241,25 @@ func (s *materializedStore) mutate(channel, serial string, action int, data any,
 		Timestamp: time.Now().UnixMilli(),
 		ClientID:  entry.state.ClientID,
 	}
-	return &op, nil
+
+	commit := func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		e, ok := s.channels[channel][serial]
+		if !ok {
+			// Evicted between prepare and commit (only possible if the caller
+			// did not hold the channel lock across the pair); drop the commit
+			// rather than resurrect a removed entry.
+			return
+		}
+		e.state = newState
+		e.versions = append(e.versions, e.state)
+		// A3: bound the per-entry version history and refresh the retention
+		// deadline — an active message stays live.
+		capVersionsLocked(e)
+		e.expiresAt = retentionExpiryMS(channel, time.Now().UnixMilli())
+	}
+	return op, commit, nil
 }
 
 // get returns the latest materialized state for a serial.

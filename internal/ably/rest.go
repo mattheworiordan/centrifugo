@@ -376,7 +376,10 @@ func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, ch
 	version.Timestamp = time.Now().UnixMilli()
 	normalizeMessageData(&msg)
 
-	op, prob := h.materialized.mutate(channel, serial, msg.Action, msg.Data, msg.Encoding, msg.Extras, version)
+	// B7: prepare without committing, publish, commit only on success — a
+	// failed publish must not leave a phantom version. The channel lock is
+	// held across prepare→publish→commit.
+	op, commit, prob := h.materialized.prepareMutation(channel, serial, msg.Action, msg.Data, msg.Encoding, msg.Extras, version)
 	if prob != nil {
 		h.writeError(rw, r, prob.statusCode, prob.code, prob.message)
 		return
@@ -394,6 +397,7 @@ func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, ch
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "mutation failed")
 		return
 	}
+	commit() // publish succeeded — apply the materialized state now
 	h.writeDocument(rw, r, http.StatusOK, map[string]any{"versionSerial": version.Serial})
 }
 

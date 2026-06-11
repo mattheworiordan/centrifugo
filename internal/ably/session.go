@@ -602,7 +602,12 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 	// Binary deltas normalize like creates (canonical JSON-safe envelope).
 	normalizeMessageData(msg)
 
-	op, prob := s.materialized.mutate(m.Channel, msg.Serial, msg.Action, msg.Data, msg.Encoding, msg.Extras, version)
+	// B7: prepare the op WITHOUT committing the materialized state, publish,
+	// then commit only on success — a failed publish must not leave a
+	// phantom version. prepare/publish/commit all run under the channel lock,
+	// so version order stays consistent and the entry can't change between
+	// prepare and commit.
+	op, commit, prob := s.materialized.prepareMutation(m.Channel, msg.Serial, msg.Action, msg.Data, msg.Encoding, msg.Extras, version)
 	if prob != nil {
 		unlock()
 		s.writeNack(m.MsgSerial, prob.code, prob.statusCode, "mutation failed: "+prob.message)
@@ -624,6 +629,7 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeInternal, 500, "mutation failed")
 		return
 	}
+	commit() // publish succeeded — apply the materialized state now
 	unlock()
 	// TR4s: the mutation ACK returns the versionSerial.
 	s.writeAckRes(m.MsgSerial, []string{version.Serial})
