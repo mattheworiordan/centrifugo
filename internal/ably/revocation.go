@@ -131,6 +131,16 @@ func (r *sessionRegistry) register(s *session, rec sessionRecord) {
 	r.sessions[s] = rec
 }
 
+// recordFor returns the identity captured at connect for a live session —
+// the comet per-key routes use it to bind every request to the session's
+// owner (A1). Reports false for an unregistered session.
+func (r *sessionRegistry) recordFor(s *session) (sessionRecord, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rec, ok := r.sessions[s]
+	return rec, ok
+}
+
 func (r *sessionRegistry) deregister(s *session) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

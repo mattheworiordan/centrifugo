@@ -37,13 +37,6 @@ Features of the Ably service this PoC simply does not implement:
   long-poll responses are complete `[...]\n` bodies, which node's
   streaming-mode client consumes as single chunks. Comet is JSON-only
   by SDK design.
-- **Comet per-key requests are bearer-authorized**: any valid app
-  credential plus the (unguessable, per-session `uuid!uuid`)
-  connectionKey may send/recv/close a session — the request identity is
-  not re-bound to the session's identity on every request as the
-  production service does. SDK reauth flows work in-band via AUTH
-  frames over /send, so no SDK behavior depends on the difference.
-
 - **Multi-message publishes are delivered as N single-message frames**,
   each with its own channelSerial (`Message.serial` is always
   `<cs>:000`). Real Ably delivers one frame per atomic batch with

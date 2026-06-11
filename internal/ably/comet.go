@@ -248,11 +248,12 @@ func (h *Handler) serveComet(rw http.ResponseWriter, r *http.Request) {
 // SDK feeds a nonempty send response through the same path, but 204 is
 // the simpler contract the production service settled on).
 func (h *Handler) serveCometSend(rw http.ResponseWriter, r *http.Request, key string) {
-	if _, authErr := h.authenticate(r); authErr != nil {
+	identity, authErr := h.authenticate(r)
+	if authErr != nil {
 		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
 		return
 	}
-	_, cc, ok := h.cometSession(rw, r, key)
+	_, cc, ok := h.cometSession(rw, r, key, identity)
 	if !ok {
 		return
 	}
@@ -289,7 +290,8 @@ func (h *Handler) serveCometSend(rw http.ResponseWriter, r *http.Request, key st
 // waits briefly for teardown — the client treats any 2xx as done and
 // never reads a body.
 func (h *Handler) serveCometClose(rw http.ResponseWriter, r *http.Request, key string, action protocol.Action) {
-	if _, authErr := h.authenticate(r); authErr != nil {
+	identity, authErr := h.authenticate(r)
+	if authErr != nil {
 		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
 		return
 	}
@@ -298,6 +300,14 @@ func (h *Handler) serveCometClose(rw http.ResponseWriter, r *http.Request, key s
 		// Already gone — closing a dead transport is success, not error
 		// (the SDK calls disconnect on dispose paths where the server may
 		// have reaped first).
+		rw.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if rec, ok := h.registry.recordFor(sess); !ok || !ownsSession(identity, rec) {
+		// A1: a caller that does not own the session cannot tear it down.
+		// Reply 204 (the dead-transport success contract) WITHOUT injecting
+		// the close — indistinguishable from an already-reaped key, and the
+		// victim's session is left untouched.
 		rw.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -315,12 +325,22 @@ func (h *Handler) serveCometClose(rw http.ResponseWriter, r *http.Request, key s
 	rw.WriteHeader(http.StatusNoContent)
 }
 
-// cometSession resolves a per-key comet request to its live session.
-// Unknown or dead keys are 410 GONE (the production contract: the SDK
-// treats it as nonfatal transport death and reconnects fresh).
-func (h *Handler) cometSession(rw http.ResponseWriter, r *http.Request, key string) (*session, *cometConn, bool) {
+// cometSession resolves a per-key comet request to its live session,
+// bound to the authenticated caller's identity (A1). Unknown or dead
+// keys — and keys the caller does not own — are 410 GONE (the production
+// contract: the SDK treats it as nonfatal transport death and reconnects
+// fresh). A foreign key is reported IDENTICALLY to an unknown one: a
+// distinct status would hand any credentialed caller a liveness oracle
+// for connectionKeys it doesn't own.
+func (h *Handler) cometSession(rw http.ResponseWriter, r *http.Request, key string, identity authResult) (*session, *cometConn, bool) {
 	sess := h.registry.lookupKey(key)
 	if sess == nil {
+		h.writeError(rw, r, http.StatusGone, 80016, "Unable to find connection "+key)
+		return nil, nil, false
+	}
+	rec, ok := h.registry.recordFor(sess)
+	if !ok || !ownsSession(identity, rec) {
+		// Not the owner: refuse exactly as for a dead key (no leak).
 		h.writeError(rw, r, http.StatusGone, 80016, "Unable to find connection "+key)
 		return nil, nil, false
 	}
@@ -332,6 +352,25 @@ func (h *Handler) cometSession(rw http.ResponseWriter, r *http.Request, key stri
 		return nil, nil, false
 	}
 	return sess, cc, true
+}
+
+// ownsSession reports whether the authenticated caller may drive the comet
+// session described by rec. The connectionKey is an unguessable per-session
+// token, but a same-app caller who learns one (logs, proxies, referrer)
+// must still be unable to read, inject into, or tear down a session it
+// does not own (A1 — the CRITICAL audit finding). The bind:
+//   - the signing/authenticating key MUST match (a different key, even in
+//     the same app, is refused); and
+//   - the clientId must be compatible: equal, OR the session assumed no
+//     identity (wildcard or unidentified — clientID ""), OR the caller
+//     presents the bare key / a wildcard token with no bound clientId,
+//     which already carries the key's full authority and so grants no
+//     privilege a fresh connection wouldn't.
+func ownsSession(identity authResult, rec sessionRecord) bool {
+	if identity.keyName == "" || identity.keyName != rec.keyName {
+		return false
+	}
+	return rec.clientID == "" || identity.clientID == "" || identity.clientID == rec.clientID
 }
 
 // writeCometBatch writes one comet response: a JSON array of pre-encoded
@@ -421,11 +460,12 @@ func (h *Handler) serveCometConnect(rw http.ResponseWriter, r *http.Request) {
 
 // serveCometRecv implements GET /comet/<key>/recv: the long poll.
 func (h *Handler) serveCometRecv(rw http.ResponseWriter, r *http.Request, key string) {
-	if _, authErr := h.authenticate(r); authErr != nil {
+	identity, authErr := h.authenticate(r)
+	if authErr != nil {
 		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
 		return
 	}
-	_, cc, ok := h.cometSession(rw, r, key)
+	_, cc, ok := h.cometSession(rw, r, key, identity)
 	if !ok {
 		return
 	}
