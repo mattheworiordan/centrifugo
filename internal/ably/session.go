@@ -423,8 +423,17 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 		// client does not read one).
 		return false
 	default:
-		// PRESENCE, SYNC and AUTH handling lands in later milestones.
-		log.Warn().Int("action", int(m.Action)).Str("transport", transportName).Msg("unhandled inbound action")
+		// B1/M1: a frame that reaches here is not an ACK-bearing action this
+		// server handles (MESSAGE/PRESENCE are handled above). If it
+		// nonetheless carries a msgSerial the client is awaiting, NACK it so
+		// the client's pending queue settles instead of hanging forever.
+		// msgSerial is omitempty on the wire and the first ACK-bearing frame
+		// is always a handled MESSAGE/PRESENCE, so a present serial is > 0.
+		if m.MsgSerial > 0 {
+			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "unsupported action")
+		} else {
+			log.Warn().Int("action", int(m.Action)).Str("transport", transportName).Msg("unhandled inbound action")
+		}
 		return true
 	}
 }
