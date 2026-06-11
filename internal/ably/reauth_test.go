@@ -166,3 +166,59 @@ func TestServerInitiatedAuthBeforeExpiry_RTN22(t *testing.T) {
 	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "renewed"})
 	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, conn).Action)
 }
+
+// RTC8a1: a reauth whose capability drops an attached channel fails that
+// channel with 40160 while unaffected attachments continue working.
+func TestAuthFrameDowngradeFailsRevokedChannel(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	params := defaultDialParams()
+	params.Del("key")
+	params.Set("access_token", mintSessionJWTCapability(t, "downgrade-dora",
+		time.Now().Add(time.Hour), `{"keep":["*"],"lose":["*"]}`))
+	conn := dialRealtime(t, ts.wsURL, params)
+	require.Equal(t, protocol.ActionConnected, readFrame(t, conn).Action)
+
+	for _, ch := range []string{"keep", "lose"} {
+		writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: ch})
+		require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, conn).Action)
+	}
+
+	// Reauth without "lose".
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action: protocol.ActionAuth,
+		Auth: &protocol.AuthDetails{AccessToken: mintSessionJWTCapability(t, "downgrade-dora",
+			time.Now().Add(time.Hour), `{"keep":["*"]}`)},
+	})
+	require.Equal(t, protocol.ActionConnected, readNonHeartbeatFrame(t, conn).Action)
+	failed := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionError, failed.Action)
+	require.Equal(t, "lose", failed.Channel)
+	require.Equal(t, errCodeOperationNotPermitted, failed.Error.Code)
+
+	// "keep" still works end-to-end.
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action: protocol.ActionMessage, Channel: "keep", MsgSerial: 0,
+		Messages: []*protocol.Message{{Name: "still-alive", Data: "x"}},
+	})
+	var sawAck, sawEcho bool
+	for range 2 {
+		switch m := readNonHeartbeatFrame(t, conn); m.Action {
+		case protocol.ActionAck:
+			sawAck = true
+		case protocol.ActionMessage:
+			sawEcho = true
+		default:
+			t.Fatalf("unexpected frame action %d", m.Action)
+		}
+	}
+	require.True(t, sawAck)
+	require.True(t, sawEcho)
+
+	// Re-attaching the revoked channel is refused by the normal gate.
+	writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "lose"})
+	refused := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionError, refused.Action)
+	require.Equal(t, errCodeOperationNotPermitted, refused.Error.Code)
+}

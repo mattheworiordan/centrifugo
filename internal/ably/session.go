@@ -164,6 +164,10 @@ const (
 	opConnect opKind = iota
 	opSubscribe
 	opUnsubscribe
+	// opUnsubscribeSilent tears a subscription down without a DETACHED
+	// frame — the channel was already failed on the client (capability
+	// downgrade, RTC8a1).
+	opUnsubscribeSilent
 )
 
 type pendingOp struct {
@@ -717,6 +721,32 @@ func (s *session) handleAuth(m *protocol.ProtocolMessage) {
 	}
 	s.armTokenExpiry()
 	_ = s.writeConnected()
+
+	// RTC8a1 downgrade: attachments the renewed capability no longer
+	// permits fail with 40160 (the channel transitions to FAILED
+	// client-side) and their subscriptions are torn down silently — the
+	// client will not re-attach a FAILED channel, and a fresh ATTACH
+	// re-runs the normal capability gate. attachedModes is
+	// frame-reader-goroutine-local apart from the mutex-guarded reads.
+	s.modesMu.Lock()
+	var revokedChannels []string
+	for channel := range s.attachedModes {
+		if !s.params.capability.Allows(auth.OpSubscribe, channel) {
+			revokedChannels = append(revokedChannels, channel)
+			delete(s.attachedModes, channel)
+		}
+	}
+	s.modesMu.Unlock()
+	for _, channel := range revokedChannels {
+		s.writeChannelError(channel, errCodeOperationNotPermitted, 401, "channel capability revoked by reauth")
+		cmd := &cproto.Command{
+			Id:          s.addPending(pendingOp{kind: opUnsubscribeSilent, channel: channel}),
+			Unsubscribe: &cproto.UnsubscribeRequest{Channel: brokerChannel(channel)},
+		}
+		if !s.client.HandleCommand(cmd, cmd.SizeVT()) {
+			_, _ = s.takePending(cmd.Id)
+		}
+	}
 }
 
 // disconnectWithError drops the session with a DISCONNECTED frame
@@ -1333,6 +1363,12 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			}
 			for i := range materialized {
 				s.deliverMaterialized(op.channel, &materialized[i])
+			}
+		case opUnsubscribeSilent:
+			// Teardown after a capability downgrade: the ERROR already
+			// failed the channel; nothing more goes on the wire.
+			if reply.Error != nil {
+				log.Warn().Str("channel", op.channel).Uint32("code", reply.Error.Code).Str("transport", transportName).Msg("silent unsubscribe error")
 			}
 		case opUnsubscribe:
 			// RTL5d: confirm with DETACHED. Centrifuge unsubscribe is

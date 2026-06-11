@@ -41,6 +41,7 @@ type Handler struct {
 	materialized *materializedStore
 	revocations  *revocationStore
 	registry     *sessionRegistry
+	stats        *statsStore
 	node         *centrifuge.Node
 	config       configtypes.Ably
 	keys         *auth.KeyStore
@@ -69,6 +70,7 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 		materialized: newMaterializedStore(),
 		revocations:  newRevocationStore(),
 		registry:     newSessionRegistry(),
+		stats:        newStatsStore(),
 		node:         n,
 		config:       c,
 		keys:         keys,
@@ -166,6 +168,12 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case r.URL.Path == "/presence" && r.Method == http.MethodGet:
 		// BAR1 batch presence — see rest.go.
 		h.serveBatchPresence(rw, r)
+	case r.URL.Path == "/stats" && r.Method == http.MethodGet:
+		// RSC6 app statistics — see stats.go.
+		h.serveStats(rw, r)
+	case r.URL.Path == "/stats" && r.Method == http.MethodPost:
+		// Sandbox-style stats fixture injection — see stats.go.
+		h.serveStatsFixtures(rw, r)
 	default:
 		// Catch-all REST error per the Ably error contract; route surface
 		// grows milestone by milestone.
