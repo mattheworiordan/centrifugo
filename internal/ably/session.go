@@ -489,7 +489,7 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 			opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
 				centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
 		}
-		_, err := s.node.Publish(m.Channel, data, opts...)
+		_, err := s.node.Publish(brokerChannel(m.Channel), data, opts...)
 		if err != nil {
 			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("publish failed")
 			s.writeNack(m.MsgSerial, errCodeInternal, 500, "publish failed")
@@ -551,7 +551,7 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 	// The op rides the live channel like any publication — tagged with
 	// its versionSerial (it advances the channel position) and the
 	// publisher origin (echo=false suppression applies).
-	if _, err := s.node.Publish(m.Channel, data, publishOptions(m.Channel, s.connectionID(), version.Serial)...); err != nil {
+	if _, err := s.node.Publish(brokerChannel(m.Channel), data, publishOptions(m.Channel, s.connectionID(), version.Serial)...); err != nil {
 		log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("mutation publish failed")
 		s.writeNack(m.MsgSerial, errCodeInternal, 500, "mutation failed")
 		return
@@ -869,7 +869,7 @@ func modeAllows(modes int64, ability int64) bool {
 // proceeds fresh, without RESUMED — exactly how Ably signals an
 // unbridgeable gap.
 func (s *session) resolveCursor(channel, cursor string) (centrifuge.StreamPosition, bool) {
-	res, err := s.node.History(channel,
+	res, err := s.node.History(brokerChannel(channel),
 		centrifuge.WithLimit(persistedHistorySize), centrifuge.WithReverse(true))
 	if err != nil {
 		return centrifuge.StreamPosition{}, false
@@ -898,13 +898,13 @@ func (s *session) rewindPosition(channel, spec string) (centrifuge.StreamPositio
 		if n > persistedHistorySize {
 			n = persistedHistorySize
 		}
-		res, err := s.node.History(channel, centrifuge.WithLimit(n), centrifuge.WithReverse(true))
+		res, err := s.node.History(brokerChannel(channel), centrifuge.WithLimit(n), centrifuge.WithReverse(true))
 		if err != nil || len(res.Publications) == 0 {
 			return centrifuge.StreamPosition{}, false
 		}
 		pubs, top = res.Publications, res.StreamPosition
 	} else if d, err := time.ParseDuration(spec); err == nil && d > 0 {
-		res, err := s.node.History(channel,
+		res, err := s.node.History(brokerChannel(channel),
 			centrifuge.WithLimit(persistedHistorySize), centrifuge.WithReverse(true))
 		if err != nil || len(res.Publications) == 0 {
 			return centrifuge.StreamPosition{}, false
@@ -938,7 +938,7 @@ func (s *session) rewindPosition(channel, spec string) (centrifuge.StreamPositio
 // publication — the attach point ATTACHED advertises (RTL15a
 // attachSerial) — or "" for a channel with no retained publications.
 func (s *session) latestChannelSerial(channel string) string {
-	res, err := s.node.History(channel, centrifuge.WithLimit(1), centrifuge.WithReverse(true))
+	res, err := s.node.History(brokerChannel(channel), centrifuge.WithLimit(1), centrifuge.WithReverse(true))
 	if err != nil {
 		// A channel without history configured (or a broker hiccup) just
 		// attaches without a serial — never fail the attach over it.
@@ -1052,7 +1052,7 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 		}
 		return
 	}
-	sub := &cproto.SubscribeRequest{Channel: channel}
+	sub := &cproto.SubscribeRequest{Channel: brokerChannel(channel)}
 	// RTL4j territory: an ATTACH presenting a channelSerial cursor asks to
 	// resume from that position. When the cursor resolves to a retained
 	// publication, the synthesized subscribe requests centrifuge recovery
@@ -1152,7 +1152,7 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 func (s *session) detach(channel string) {
 	cmd := &cproto.Command{
 		Id:          s.addPending(pendingOp{kind: opUnsubscribe, channel: channel}),
-		Unsubscribe: &cproto.UnsubscribeRequest{Channel: channel},
+		Unsubscribe: &cproto.UnsubscribeRequest{Channel: brokerChannel(channel)},
 	}
 	if !s.client.HandleCommand(cmd, cmd.SizeVT()) {
 		if _, ok := s.takePending(cmd.Id); ok {
@@ -1242,7 +1242,7 @@ func publishPresenceEvent(node *centrifuge.Node, mint *serialMint, channel strin
 	// RTL15b: presence events advance the channel position too — the
 	// serial is drawn from the same per-channel sequence as messages.
 	cs := mint.Mint(channel)
-	if _, err = node.Publish(channel, data,
+	if _, err = node.Publish(brokerChannel(channel), data,
 		centrifuge.WithTags(map[string]string{pubTagKind: pubTagKindPresence, pubTagSerial: cs})); err != nil {
 		return err
 	}
@@ -1250,7 +1250,7 @@ func publishPresenceEvent(node *centrifuge.Node, mint *serialMint, channel strin
 	// the live channel's retention tier — the live publication above stays
 	// history-free so message history is never polluted.
 	historyOpts := publishOptions(channel, "", cs)
-	_, err = node.Publish(presenceHistoryChannel(channel), data, historyOpts...)
+	_, err = node.Publish(brokerChannel(presenceHistoryChannel(channel)), data, historyOpts...)
 	return err
 }
 
@@ -1336,7 +1336,9 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			// compression via a SubscribeRequest flag this adapter never
 			// sets (Publication.Channel is only populated for wildcard
 			// subscriptions).
-			s.deliverPublication(reply.Push.Channel, reply.Push.Pub)
+			// Push.Channel is the BROKER name; everything downstream
+			// (frames, store lookups, mode filters) speaks Ably names.
+			s.deliverPublication(ablyChannel(reply.Push.Channel), reply.Push.Pub)
 			return
 		}
 		// Join/Leave (presence, M5), Unsubscribe and Refresh pushes are

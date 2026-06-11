@@ -9,11 +9,13 @@
 
 1. **WebSocket only.** Comet/XHR transports are out of scope; comet test
    variants fail by policy.
-2. **Channel names containing `:` outside known namespaces** collide with
-   centrifuge's namespace separator and fail to attach (102 → channel error).
-   Namespaces in the dev config: `persisted`, `mutable`, `ai`. Production
-   would need a bijective channel-name encoding at every adapter boundary or
-   namespace-free channel resolution.
+2. **RESOLVED (Phase 3): arbitrary `:` in channel names.** Every
+   broker-facing name is bijectively escaped (`~`→`~0`, `:`→`~1` —
+   brokername.go), so all Ably channels resolve namespace-free in
+   centrifuge and `without_namespace` options apply universally. The
+   adapter's own conventions (`persisted:` retention, `mutable:`/`ai:`
+   mutability) key off the Ably name. Centrifugo NAMESPACE configs no
+   longer affect Ably channels.
 3. **Multi-message publishes are delivered as N single-message frames**, each
    with its own channelSerial (`Message.serial` is always `<cs>:000`). Real
    Ably delivers one frame per atomic batch with `<cs>:<idx>` serials. Cursor
@@ -25,7 +27,7 @@
    names degrade to the unrestricted default grant (fail-open; capability
    checks still gate operations).
 5. **Server-side message filtering** (`subscribes to filtered channel`) is not
-   implemented.
+   implemented — the one remaining realtime/message failure.
 
 ## Serials & continuity
 

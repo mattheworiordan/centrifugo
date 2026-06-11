@@ -255,7 +255,7 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 			opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
 				centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
 		}
-		if _, err := h.node.Publish(channel, data, opts...); err != nil {
+		if _, err := h.node.Publish(brokerChannel(channel), data, opts...); err != nil {
 			log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("rest publish failed")
 			h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "publish failed")
 			return
@@ -383,7 +383,7 @@ func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, ch
 	}
 	// REST mutations have no connection identity: no origin tag, like
 	// REST publishes.
-	if _, err := h.node.Publish(channel, data, publishOptions(channel, "", version.Serial)...); err != nil {
+	if _, err := h.node.Publish(brokerChannel(channel), data, publishOptions(channel, "", version.Serial)...); err != nil {
 		log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("rest mutation publish failed")
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "mutation failed")
 		return
@@ -483,7 +483,7 @@ func (h *Handler) serveBatchPublish(rw http.ResponseWriter, r *http.Request) {
 				opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
 					centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
 			}
-			if _, err := h.node.Publish(channel, data, opts...); err != nil {
+			if _, err := h.node.Publish(brokerChannel(channel), data, opts...); err != nil {
 				log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("batch publish failed")
 				h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "publish failed")
 				return
@@ -760,7 +760,7 @@ func (h *Handler) resolveSerialOffset(channel, serial string) (uint64, string, b
 }
 
 func (h *Handler) historyPubs(channel string, opts ...centrifuge.HistoryOption) ([]*centrifuge.Publication, string, error) {
-	res, err := h.node.History(channel, opts...)
+	res, err := h.node.History(brokerChannel(channel), opts...)
 	if err != nil {
 		return nil, "", err
 	}
@@ -898,7 +898,7 @@ func (h *Handler) serveChannelDetails(rw http.ResponseWriter, r *http.Request, c
 		h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidChannelName, "invalid channel name")
 		return
 	}
-	subscribers := h.node.Hub().NumSubscribers(channel)
+	subscribers := h.node.Hub().NumSubscribers(brokerChannel(channel))
 	// Presence occupancy comes from the adapter-owned member set (the
 	// centrifuge presence manager only sees native centrifugo clients).
 	presence := len(h.presence.members(channel))

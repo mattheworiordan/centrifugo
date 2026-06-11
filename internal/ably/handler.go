@@ -125,7 +125,7 @@ func (h *Handler) seedPresenceFixtures(path string) error {
 			if err != nil {
 				return fmt.Errorf("ably presence fixtures: %w", err)
 			}
-			if _, err := h.node.Publish(presenceHistoryChannel(ch.Name), data, publishOptions(ch.Name, "", h.mint.Mint(ch.Name))...); err != nil {
+			if _, err := h.node.Publish(brokerChannel(presenceHistoryChannel(ch.Name)), data, publishOptions(ch.Name, "", h.mint.Mint(ch.Name))...); err != nil {
 				return fmt.Errorf("ably presence fixtures: %w", err)
 			}
 		}
