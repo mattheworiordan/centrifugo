@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -215,19 +216,8 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		// 40101 that RTN14a depends on when ably-js's comet fallback
 		// probes /comet/connect after a failed WebSocket attempt.
 		if strings.HasPrefix(r.URL.Path, "/comet/") {
-			if _, authErr := h.authenticate(r); authErr != nil {
-				h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
-				return
-			}
-			// WS-only adapter: decline the comet transport WITHOUT an Ably
-			// error envelope. ably-js turns a coded envelope from
-			// /comet/connect into an ERROR ProtocolMessage and FAILS the
-			// whole connection (comettransport.ts 'complete' handler);
-			// a code-less error just disconnects the candidate, so a
-			// client trialling [web_socket, comet] keeps its WebSocket.
-			rw.Header().Set("Content-Type", "text/plain")
-			rw.WriteHeader(http.StatusNotImplemented)
-			_, _ = rw.Write([]byte("comet transport is not supported (WebSocket-only server)"))
+			// The comet/HTTP-fallback transport family — see comet.go.
+			h.serveComet(rw, r)
 			return
 		}
 		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound,
@@ -282,6 +272,38 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	params, rejection := h.buildSessionParams(q, identity, format)
+	if rejection != nil {
+		writeConnectionError(conn, format, rejection.code, rejection.statusCode, rejection.message)
+		_ = conn.Close()
+		return
+	}
+	sess := newSession(h.node, &wsConn{conn: conn, format: format}, params, h.presence, h.mint, h.materialized)
+	// Revocation enforcement (RSA17): identity captured at connect; a
+	// matching revocation disconnects the session with 40141.
+	h.registry.register(sess, sessionRecord{
+		keyName:  identity.keyName,
+		clientID: params.clientID,
+		viaToken: identity.viaToken,
+		issuedAt: identity.issuedAt,
+	})
+	defer h.registry.deregister(sess)
+	sess.run(r.Context())
+}
+
+// connectRejection is a connect-time refusal the transport front
+// delivers its own way: the WS path as an in-band ERROR frame after the
+// upgrade, the comet path as an HTTP error envelope.
+type connectRejection struct {
+	code       int
+	statusCode int
+	message    string
+}
+
+// buildSessionParams derives the session parameters from the RTN2
+// connect query and the authenticated identity — shared by the WS and
+// comet fronts.
+func (h *Handler) buildSessionParams(q url.Values, identity authResult, format protocol.Format) (sessionParams, *connectRejection) {
 	// RTN2d: an explicit clientId param is assumed for the connection; a
 	// token-bound identity (RSA7a) or the authenticating key name
 	// identifies it otherwise.
@@ -289,18 +311,13 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 	if clientID == "*" {
 		// RSA7c: the literal '*' clientId value is reserved (it denotes the
 		// wildcard identity) and cannot be assumed by a connection.
-		writeConnectionError(conn, format, errCodeInvalidClientID, http.StatusBadRequest, "invalid clientId: the wildcard value '*' is reserved")
-		_ = conn.Close()
-		return
+		return sessionParams{}, &connectRejection{errCodeInvalidClientID, http.StatusBadRequest, "invalid clientId: the wildcard value '*' is reserved"}
 	}
 	switch {
 	case identity.clientID != "":
 		// RSA15a: a clientId param must match the token-bound identity.
 		if clientID != "" && clientID != identity.clientID {
-			writeConnectionError(conn, format, errCodeIncompatibleCredentials, http.StatusUnauthorized,
-				"clientId is incompatible with the token's clientId")
-			_ = conn.Close()
-			return
+			return sessionParams{}, &connectRejection{errCodeIncompatibleCredentials, http.StatusUnauthorized, "clientId is incompatible with the token's clientId"}
 		}
 		clientID = identity.clientID
 	case identity.wildcardClientID:
@@ -346,7 +363,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		// session's re-entered members — they share the connectionId key).
 		h.presence.cancelExpiry(recoverID)
 	}
-	sess := newSession(h.node, &wsConn{conn: conn, format: format}, sessionParams{
+	return sessionParams{
 		userID:           userID,
 		clientID:         clientID,
 		wildcardClientID: identity.wildcardClientID && clientID == "",
@@ -358,17 +375,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		recoverError:     recoverError,             // RTN16e: 80018 on the first CONNECTED
 		tokenExpires:     identity.expires,         // RTN15-territory: 40142 disconnect at exp
 		reauth:           h.verifyTokenString,      // RTC8 AUTH frames
-	}, h.presence, h.mint, h.materialized)
-	// Revocation enforcement (RSA17): identity captured at connect; a
-	// matching revocation disconnects the session with 40141.
-	h.registry.register(sess, sessionRecord{
-		keyName:  identity.keyName,
-		clientID: clientID,
-		viaToken: identity.viaToken,
-		issuedAt: identity.issuedAt,
-	})
-	defer h.registry.deregister(sess)
-	sess.run(r.Context())
+	}, nil
 }
 
 // uuidShaped reports whether s looks like a centrifuge client UUID —

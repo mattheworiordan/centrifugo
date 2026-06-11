@@ -276,12 +276,14 @@ func TestCORSPreflightAndExposedHeaders(t *testing.T) {
 	require.Contains(t, resp3.Header.Get("Access-Control-Expose-Headers"), "X-Ably-ErrorCode")
 }
 
-// Comet transport probes are declined WITHOUT an Ably error envelope:
-// ably-js fails the whole connection on a coded envelope from
-// /comet/connect but soft-drops the candidate on a code-less error, so
-// a client trialling [web_socket, comet] keeps its WebSocket. Invalid
-// credentials still get the coded 40101 (RTN14a).
-func TestCometDeclinedWithoutEnvelope(t *testing.T) {
+// Comet error contracts that survive the real transport landing (C2):
+// invalid credentials on /comet/connect get the coded 40101 envelope
+// (RTN14a — a coded envelope from connect fails the SDK connection
+// fatally, exactly right for bad creds), while the ops not yet
+// implemented (send — C3) keep the envelope-free 501 so SDK transport
+// trials soft-drop rather than hard-fail. Full connect/recv behavior:
+// comet_test.go.
+func TestCometErrorContracts(t *testing.T) {
 	t.Parallel()
 	h := newTestHandler(t)
 	srv := httptest.NewServer(h)
@@ -289,25 +291,24 @@ func TestCometDeclinedWithoutEnvelope(t *testing.T) {
 
 	req, err := http.NewRequest(http.MethodGet, srv.URL+"/comet/connect", nil)
 	require.NoError(t, err)
-	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
+	req.SetBasicAuth("this.is", "wrong")
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusNotImplemented, resp.StatusCode)
-	require.Empty(t, resp.Header.Get("X-Ably-Errorcode"))
-	require.NotContains(t, resp.Header.Get("Content-Type"), "json")
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.NotContains(t, string(body), `"error"`, "no Ably error envelope")
+	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	require.Equal(t, "40101", resp.Header.Get("X-Ably-Errorcode"))
 
-	req, err = http.NewRequest(http.MethodGet, srv.URL+"/comet/connect", nil)
+	req, err = http.NewRequest(http.MethodPost, srv.URL+"/comet/somekey/send", strings.NewReader("[]"))
 	require.NoError(t, err)
-	req.SetBasicAuth("this.is", "wrong")
+	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
 	resp2, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp2.Body.Close() }()
-	require.Equal(t, http.StatusUnauthorized, resp2.StatusCode)
-	require.Equal(t, "40101", resp2.Header.Get("X-Ably-Errorcode"))
+	require.Equal(t, http.StatusNotImplemented, resp2.StatusCode)
+	require.Empty(t, resp2.Header.Get("X-Ably-Errorcode"))
+	body, err := io.ReadAll(resp2.Body)
+	require.NoError(t, err)
+	require.NotContains(t, string(body), `"error"`, "no Ably error envelope")
 }
 
 // The adapter enabled without a keys file is a startup error: it cannot

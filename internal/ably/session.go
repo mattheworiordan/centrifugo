@@ -134,6 +134,10 @@ type sessionParams struct {
 	// refreshed identity. Built by the handler over the same verifier as
 	// connect-time auth.
 	reauth func(token string) (authResult, *authProblem)
+	// onConnected, when set, is invoked once with the freshly minted
+	// connectionKey before the first CONNECTED frame is written — the
+	// comet front uses it to index the session for per-key routes.
+	onConnected func(connectionKey string, s *session)
 	// recoverError, when set, is carried on the INITIAL CONNECTED frame
 	// (TR4o error attribute): the recover claim was rejected — e.g. a
 	// malformed connectionKey (80018) — and the connection proceeded
@@ -238,6 +242,11 @@ type session struct {
 	// immediately. Abrupt drops keep members for the grace window.
 	cleanClose bool
 	closeCh    chan struct{} // closed on teardown: stops the heartbeat ticker and cancels the client context
+
+	// connKey is the connection's "<connectionId>!<token>" key (CD2b),
+	// set once in writeConnected on the frame-reader goroutine. The
+	// comet front reads it after run() returns to drop its key index.
+	connKey string
 }
 
 func newSession(node *centrifuge.Node, conn frameConn, params sessionParams, presence *presenceStore, mint *serialMint, materialized *materializedStore) *session {
@@ -612,6 +621,17 @@ func (s *session) writeConnected() error {
 	// state, like the rest of params.
 	connectErr := s.params.recoverError
 	s.params.recoverError = nil
+	// The comet front indexes the session by connectionKey for the
+	// per-key request routes. Registering here — before the first
+	// CONNECTED is written, on the frame-reader goroutine —
+	// happens-before any deregistration in run()'s defers, so the index
+	// can never leak a dead session's key.
+	if s.connKey == "" {
+		s.connKey = connectionID + "!" + s.client.ID()
+		if s.params.onConnected != nil {
+			s.params.onConnected(s.connKey, s)
+		}
+	}
 	return s.writeFrame(&protocol.ProtocolMessage{
 		Action:       protocol.ActionConnected,
 		ConnectionID: connectionID,
@@ -623,7 +643,7 @@ func (s *session) writeConnected() error {
 			// connectionId but gets a FRESH key (RTN16d asserts the key
 			// changes across recovery). REST TM2h attribution strips at
 			// the first '!'.
-			ConnectionKey:      connectionID + "!" + s.client.ID(),
+			ConnectionKey:      s.connKey,
 			MaxMessageSize:     maxMessageSize,     // CD2c
 			MaxFrameSize:       maxFrameSize,       // CD2d
 			MaxInboundRate:     maxInboundRate,     // CD2e

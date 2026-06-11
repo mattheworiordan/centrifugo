@@ -87,14 +87,42 @@ type sessionRecord struct {
 }
 
 // sessionRegistry tracks live sessions so revocations can disconnect
-// matching connections.
+// matching connections, and indexes comet sessions by connectionKey so
+// the per-key HTTP routes (/comet/<key>/recv|send|close|disconnect)
+// can find their session between requests.
 type sessionRegistry struct {
 	mu       sync.Mutex
 	sessions map[*session]sessionRecord
+	byKey    map[string]*session
 }
 
 func newSessionRegistry() *sessionRegistry {
-	return &sessionRegistry{sessions: make(map[*session]sessionRecord)}
+	return &sessionRegistry{
+		sessions: make(map[*session]sessionRecord),
+		byKey:    make(map[string]*session),
+	}
+}
+
+func (r *sessionRegistry) registerKey(key string, s *session) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.byKey[key] = s
+}
+
+// deregisterKey removes the index entry only when it still maps to s —
+// a late deregistration can never evict a successor session.
+func (r *sessionRegistry) deregisterKey(key string, s *session) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.byKey[key] == s {
+		delete(r.byKey, key)
+	}
+}
+
+func (r *sessionRegistry) lookupKey(key string) *session {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.byKey[key]
 }
 
 func (r *sessionRegistry) register(s *session, rec sessionRecord) {
