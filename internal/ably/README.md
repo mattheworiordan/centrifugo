@@ -38,12 +38,14 @@ commitment, and very deliberately not production software.
 Everything below is verified by *unmodified official SDK test suites*
 run against this server (`make ably-poc-test` reproduces it):
 
-- **31 ably-js test suites fully green — 413 tests — in both wire
-  encodings** (JSON and msgpack): connection, channels, resume/recover,
-  auth (key, Ably-JWT, requestToken, capabilities, reauth), history and
-  pagination, presence and presence sync, encryption (rides the
-  encoding passthrough), batch publish, token revocation, stats, idempotent
-  publishing, message updates/deletes/appends, and more.
+- **32 ably-js test suites fully green — 481 tests — in both wire
+  encodings** (JSON and msgpack) **and over both transports**
+  (WebSocket and comet/HTTP long-polling): connection, channels,
+  resume/recover, auth (key, Ably-JWT, requestToken, capabilities,
+  reauth), history and pagination, presence and presence sync,
+  encryption (rides the encoding passthrough), batch publish, token
+  revocation, stats, idempotent publishing, message updates/deletes/
+  appends, transport fallback, and more.
 - **ably-go conformance mirrors** green.
 - **The AIT SDK's own integration suites: 45/45**, plus its e2e
   token-streaming demo surviving a mid-stream transport drop with
@@ -61,8 +63,6 @@ Numbers, spec-point citations, and the per-suite breakdown live in
 
 The honest list is in [DIVERGENCES.md](DIVERGENCES.md). Headlines:
 
-- **WebSocket only** — no Comet/XHR transports (browser SDKs that probe
-  comet get a graceful decline and keep their WebSocket).
 - **Single node, in-memory** — no clustering, no durable storage; a
   restart is a fresh world. Message history retention mimics Ably's
   tiers but lives in RAM.
@@ -88,11 +88,15 @@ The honest list is in [DIVERGENCES.md](DIVERGENCES.md). Headlines:
 ./scripts/ably-poc-setup.sh
 
 # the full acceptance gate: native Go suites + ably-go conformance +
-# the 31-suite ably-js sweep (~15 min)
+# the 32-suite ably-js sweep (~20 min)
 make ably-poc-test
 
 # or just point any Ably SDK at the deployed instance:
 curl https://rt-poc-demo.fly.dev/time
+
+# force the browser demo onto HTTP long-polling instead of WebSocket
+# (watch the Network tab fill with /comet/connect, /send and /recv):
+#   https://rt-poc-chat-demo.vercel.app/?transport=xhr_polling
 ```
 
 The architecture, in one paragraph: each Ably realtime connection gets

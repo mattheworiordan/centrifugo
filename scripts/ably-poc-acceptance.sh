@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# ably-js acceptance sweep for the Ably-on-Centrifugo PoC (M9 gate).
+# ably-js acceptance sweep for the Ably-on-Centrifugo PoC.
 #
 # Boots the adapter on a dedicated port and runs the allowlisted ably-js
-# suites (non-comet: the PoC is WebSocket-only). Suites included here are
-# FULLY green; suites with categorized known-failures (realtime/message,
-# realtime/presence — colon-bearing channel names, order-dependent
-# presence trio, server-side filtering) are swept separately and tracked
-# in .working/ably-centrifugo-poc/allowlist.json.
+# suites over BOTH transports (WebSocket and comet/HTTP long-polling —
+# Phase 4). Suites included here are FULLY green; suites with
+# categorized known-failures (realtime/message, realtime/presence —
+# order-dependent presence trio, server-side filtering) are swept
+# separately and tracked in .working/ably-centrifugo-poc/allowlist.json.
 set -euo pipefail
 
 PORT=8057
@@ -80,31 +80,37 @@ SUITES=(
 	test/rest/stats.test.js
 	test/rest/init.test.js
 	test/rest/fallbacks.test.js
+	test/realtime/transports.test.js
 )
 
 FAILED=0
 for suite in "${SUITES[@]}"; do
 	[ -f "$suite" ] || { echo "[skip] $suite (not in pinned checkout)"; continue; }
-	# Inverted filter: comet variants (WS-only PoC) everywhere; per-suite
-	# additions are categorized known-exclusions, each with its reason in
-	# .working/ably-centrifugo-poc/allowlist.json:
-	#   - rest/request checkput/checkpatch/checkdelete call out to
+	# Comet/HTTP-fallback variants RUN since Phase 4 (the adapter serves
+	# both Ably transports). Remaining per-suite exclusions are external-
+	# infra or harness-environment artifacts, each documented:
+	#   - rest/request checkput/checkpatch/checkdelete and
+	#     realtime/transports no_internet_connectivity call out to
 	#     echo.ably.io (external infra, not this server);
-	#   - realtime/failure break_transport enumerates a comet-only
-	#     transport branch that can never connect to a WS-only server;
 	#   - rest/init "without any tls key" and rest/fallbacks "primary
 	#     domain as the first attempted" assert SDK default-TLS URL
 	#     construction, which the local test env must override
 	#     (ABLY_USE_TLS=false / explicit port) to reach this server.
-	EXCLUDE="comet"
+	EXCLUDE=""
 	case "$suite" in
-		*rest/request.test.js) EXCLUDE="comet|checkput|checkpatch|checkdelete" ;;
-		*realtime/failure.test.js) EXCLUDE="comet|break_transport" ;;
-		*rest/init.test.js) EXCLUDE="comet|without any tls key" ;;
-		*rest/fallbacks.test.js) EXCLUDE="comet|primary domain as the first attempted" ;;
+		*rest/request.test.js) EXCLUDE="checkput|checkpatch|checkdelete" ;;
+		*rest/init.test.js) EXCLUDE="without any tls key" ;;
+		*rest/fallbacks.test.js) EXCLUDE="primary domain as the first attempted" ;;
+		*realtime/transports.test.js) EXCLUDE="no_internet_connectivity" ;;
 	esac
 	echo "=== $suite ==="
-	if ! npx mocha "$suite" --reporter min --grep "$EXCLUDE" --invert; then
+	GREP_ARGS=()
+	if [ -n "$EXCLUDE" ]; then
+		GREP_ARGS=(--grep "$EXCLUDE" --invert)
+	fi
+	# ${arr[@]+...}: empty-array expansion is an unbound-variable error
+	# under set -u on macOS stock bash 3.2.
+	if ! npx mocha "$suite" --reporter min ${GREP_ARGS[@]+"${GREP_ARGS[@]}"}; then
 		FAILED=1
 	fi
 done

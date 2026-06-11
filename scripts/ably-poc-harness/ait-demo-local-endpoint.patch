@@ -13,10 +13,25 @@ index c50e27f..670844d 100644
  
    const session = createAgentSession({ client: ably, channelName: invocation.sessionName });
 diff --git a/demo/vercel/react/use-chat/src/app/providers.tsx b/demo/vercel/react/use-chat/src/app/providers.tsx
-index 5e07926..d8e9acb 100644
+index 5e07926..2958bad 100644
 --- a/demo/vercel/react/use-chat/src/app/providers.tsx
 +++ b/demo/vercel/react/use-chat/src/app/providers.tsx
-@@ -31,6 +31,11 @@ export function Providers({ clientId, children }: { clientId?: string; children:
+@@ -19,7 +19,14 @@ export function Providers({ clientId, children }: { clientId?: string; children:
+     // the Ably sandbox (`nonprod:sandbox`); unset in normal use, so it defaults
+     // to production. It must match the endpoint the agent connects to.
+     const endpoint = process.env.NEXT_PUBLIC_ABLY_ENDPOINT;
++    // `?transport=xhr_polling` (or `web_socket`) in the URL pins the
++    // browser to a single Ably transport — handy for demonstrating the
++    // HTTP long-polling fallback: watch the Network tab fill with
++    // /comet/connect, /comet/<key>/send and /recv requests.
++    const forcedTransport =
++      typeof window !== 'undefined' ? new URLSearchParams(window.location.search).get('transport') : null;
+     const ably = new Ably.Realtime({
++      ...(forcedTransport ? { transports: [forcedTransport as Ably.Transport] } : {}),
+       authCallback: async (_tokenParams, callback) => {
+         try {
+           const response = await fetch(`/api/auth/ably-token${authParams}`);
+@@ -31,6 +38,11 @@ export function Providers({ clientId, children }: { clientId?: string; children:
          }
        },
        ...(endpoint ? { endpoint } : {}),

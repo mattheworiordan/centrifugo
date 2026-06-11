@@ -60,7 +60,7 @@ export ABLY_TEST_STATIC_APP=1 \
        ABLY_TEST_STATIC_APP_FILE=/tmp/minted-keys.json \
        ABLY_ENDPOINT=rt-poc-demo.fly.dev \
        ABLY_PORT=443 ABLY_TLS_PORT=443 ABLY_USE_TLS=true
-npx mocha test/realtime/connection.test.js --reporter min --grep comet --invert
+npx mocha test/realtime/connection.test.js --reporter min
 ```
 
 Notes:
@@ -75,7 +75,7 @@ Notes:
 The official AIT browser demo (`ably-ai-transport-js`
 `demo/vercel/react/use-chat`, Next.js + Vercel `useChat` over Ably) runs
 against the PoC unmodified except for the committed env-driven endpoint
-patch (`.working/ably-centrifugo-poc/harness/ait-demo-local-endpoint.patch`,
+patch (`scripts/ably-poc-harness/ait-demo-local-endpoint.patch`,
 already applied to `.working/ait-pinned`).
 
 With the server on fly (TLS on 443), the demo needs **only the endpoint
