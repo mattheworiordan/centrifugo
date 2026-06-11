@@ -1,0 +1,9 @@
+# Keep the fly.io build context lean: the image needs the Go module and
+# the deploy assets, nothing else. (.working alone is ~1.4GB of pinned
+# SDK checkouts.)
+.working
+.git
+**/node_modules
+tmp
+misc
+**/*.log

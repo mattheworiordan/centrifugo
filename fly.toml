@@ -1,0 +1,34 @@
+# Ably-on-Centrifugo PoC — fly.io app definition.
+#
+# Lives at the repo root so the Docker build context covers the whole
+# module (deploy/ably-poc/Dockerfile builds from source on fly's remote
+# builders). Deploy runbook: deploy/ably-poc/README.md.
+#
+# The app name is deliberately neutral. Rename if taken:
+#   flyctl apps create <name> && sed -i '' 's/^app = .*/app = "<name>"/' fly.toml
+
+app = "rt-poc-demo"
+primary_region = "lhr"
+
+[build]
+  dockerfile = "deploy/ably-poc/Dockerfile"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # A demo box that must answer the moment someone clicks a link:
+  # exactly one machine, never scaled to zero.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+    method = "GET"
+    path = "/time"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
