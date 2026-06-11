@@ -92,6 +92,20 @@ func (s *materializedStore) mutate(channel, serial string, action int, data any,
 		return nil, &mutationProblem{code: errCodeNotFound, statusCode: 404, message: "message not found"}
 	}
 
+	// A version is a strictly LATER occurrence than what it mutates: on
+	// loopback the create and the op can land in the same millisecond,
+	// and SDK tests assert version.timestamp > message.timestamp (the
+	// same local-speed artifact class as the heartbeat ping floor).
+	// Clamp past both the create and the previous version so version
+	// timestamps stay strictly monotonic.
+	floor := entry.state.Timestamp
+	if entry.state.Version != nil && entry.state.Version.Timestamp > floor {
+		floor = entry.state.Version.Timestamp
+	}
+	if version.Timestamp <= floor {
+		version.Timestamp = floor + 1
+	}
+
 	switch action {
 	case protocol.MessageActionUpdate:
 		entry.state.Data = data
