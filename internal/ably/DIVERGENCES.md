@@ -31,10 +31,12 @@
 
 ## Serials & continuity
 
-6. **Mint and broker append are not atomic.** Near-simultaneous publishers can
-   invert serial order vs offset order. Consequence honored everywhere:
-   resume cursors resolve by serial→publication LOOKUP, never lexicographic
-   filtering. Real Ably serializes mint+append.
+6. **RESOLVED (Phase 3): mint and broker append are atomic per channel.**
+   Every mint-then-publish path holds the channel's publish lock
+   (serialMint.lockChannel), so lexicographic serial order always equals
+   broker offset order — the real-service invariant. Cursors still resolve
+   by lookup (robust regardless). Pinned by a 4-writer concurrency hammer
+   that fails immediately without the lock.
 7. **Cursor resolution scans retained history** (≤1000 deep) per
    cursor-bearing ATTACH — O(retention); production wants an offset index.
 8. **A presence-event serial used as a resume cursor is unresolvable** (live
@@ -87,9 +89,9 @@
     failure NACKs the client with state already moved (single-node: publish
     failures are node-shutdown-only).
 19. **GET …/versions returns a single page** (no Link pagination).
-20. **Concurrent mutations on one serial:** version list order = apply order
-    under the store mutex; the final state's version may carry the lower
-    versionSerial when racers interleave (same class as #6).
+20. **RESOLVED (Phase 3): concurrent mutations on one serial** are fully
+    serialized by the channel publish lock — version list order, final
+    state, and versionSerial order always agree.
 
 ## REST & history
 

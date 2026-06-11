@@ -454,6 +454,13 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// 40009 reject NACKs the frame and keeps the connection alive —
 	// contrast the protocol-level maxFrameSize read limit set in
 	// serveRealtime, which kills the connection outright.
+	// T1.2: the channel publish lock makes mint+append atomic — serial
+	// order equals broker offset order (serials.go). The deferred unlock
+	// also spans the ACK write: a stalled client can hold the lock for up
+	// to writeTimeout, stalling that channel's other publishers — bounded
+	// and inversion-free (writeMu is a strict leaf), PoC-acceptable.
+	unlock := s.mint.lockChannel(m.Channel)
+	defer unlock()
 	payloads, idemKeys, serials, problem := buildEnvelopes(m.Messages, envelopeParams{
 		connectionID: connectionID,
 		clientID:     s.params.clientID,
@@ -525,6 +532,9 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeMutableRequired, 400, "mutation failed: this operation can only be performed on a channel with mutable messages enabled")
 		return
 	}
+	// T1.2: mint+mutate+append atomic per channel (serials.go).
+	unlock := s.mint.lockChannel(m.Channel)
+	defer unlock()
 	// The mutator supplies the MessageOperation in version; the server
 	// assigns the versionSerial and timestamp (TM2s).
 	version := msg.Version
@@ -1239,6 +1249,9 @@ func publishPresenceEvent(node *centrifuge.Node, mint *serialMint, channel strin
 	if err != nil {
 		return err
 	}
+	// T1.2: mint+append atomic per channel (serials.go).
+	unlock := mint.lockChannel(channel)
+	defer unlock()
 	// RTL15b: presence events advance the channel position too — the
 	// serial is drawn from the same per-channel sequence as messages.
 	cs := mint.Mint(channel)

@@ -8,11 +8,16 @@ package ably
 // same sequence, so lexicographic serial order matches publish order.
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
+
+	"github.com/centrifugal/centrifuge"
 	"github.com/stretchr/testify/require"
 )
 
@@ -195,4 +200,76 @@ func TestRESTAndRealtimeShareSerialSequence(t *testing.T) {
 	require.True(t, strings.HasPrefix(newestSerial, rtSerial+":"), "newest history item is the realtime publish")
 	require.NotEmpty(t, oldestSerial)
 	require.Less(t, oldestSerial, newestSerial, "REST serial sorts strictly below the later realtime serial")
+}
+
+// T1.2: mint+append are atomic per channel — under concurrent publishers
+// the lexicographic serial order ALWAYS equals broker offset order (the
+// real-service invariant; previously documented as a divergence).
+func TestConcurrentPublishSerialOrderMatchesOffsets(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	const conns = 4
+	const perConn = 25
+	// WaitGroup + defer (not a results channel): a helper failure inside a
+	// goroutine runs t.FailNow → runtime.Goexit, which still executes
+	// defers — so the main goroutine can never hang on a lost send.
+	var wg sync.WaitGroup
+	for c := range conns {
+		wg.Add(1)
+		go func(c int) {
+			defer wg.Done()
+			conn := connectRealtime(t, ts)
+			writeFrame(t, conn, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: "serial-hammer"})
+			// Drain until ATTACHED, tolerating early deliveries.
+			for {
+				if readNonHeartbeatFrame(t, conn).Action == protocol.ActionAttached {
+					break
+				}
+			}
+			for i := range perConn {
+				writeFrame(t, conn, &protocol.ProtocolMessage{
+					Action:    protocol.ActionMessage,
+					Channel:   "serial-hammer",
+					MsgSerial: int64(i),
+					Messages:  []*protocol.Message{{Name: fmt.Sprintf("c%d-%d", c, i), Data: "x"}},
+				})
+			}
+		}(c)
+	}
+	wg.Wait()
+
+	// Read the full stream in offset order and assert the serial tags are
+	// strictly increasing. Reads take the SAME channel publish lock the
+	// writers hold across mint+append: the memory broker assigns
+	// pub.Offset after inserting the publication into the stream, so an
+	// unsynchronized History read races that write — the lock is the
+	// happens-before edge (and conceptually, the invariant is defined by
+	// that lock).
+	historyAll := func() ([]*centrifuge.Publication, error) {
+		unlock := ts.handler.mint.lockChannel("serial-hammer")
+		defer unlock()
+		res, err := ts.node.History(brokerChannel("serial-hammer"), centrifuge.WithLimit(conns*perConn))
+		if err != nil {
+			return nil, err
+		}
+		return res.Publications, nil
+	}
+	require.Eventually(t, func() bool {
+		pubs, err := historyAll()
+		return err == nil && len(pubs) == conns*perConn
+	}, 10*time.Second, 50*time.Millisecond, "all publications retained")
+	pubs, err := historyAll()
+	require.NoError(t, err)
+	prevSerial := ""
+	prevOffset := uint64(0)
+	for _, pub := range pubs {
+		require.Greater(t, pub.Offset, prevOffset, "history is offset-ordered")
+		serial := pub.Tags[pubTagSerial]
+		require.NotEmpty(t, serial)
+		require.Greater(t, serial, prevSerial,
+			"serial at offset %d out of order: %q after %q", pub.Offset, serial, prevSerial)
+		prevSerial = serial
+		prevOffset = pub.Offset
+	}
 }

@@ -229,6 +229,9 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "internal error")
 		return
 	}
+	// T1.2: mint+append atomic per channel (serials.go).
+	unlock := h.mint.lockChannel(channel)
+	defer unlock()
 	payloads, idemKeys, serials, problem := buildEnvelopes(messages, envelopeParams{
 		// REST publishes have no connection identity: connectionID stays
 		// empty (no TM2c attribution beyond explicit TM2h above, no origin
@@ -362,6 +365,9 @@ func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, ch
 		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "unsupported message action")
 		return
 	}
+	// T1.2: mint+mutate+append atomic per channel (serials.go).
+	unlock := h.mint.lockChannel(channel)
+	defer unlock()
 	version := msg.Version
 	if version == nil {
 		version = &protocol.MessageVersion{}
@@ -450,51 +456,58 @@ func (h *Handler) serveBatchPublish(rw http.ResponseWriter, r *http.Request) {
 
 	results := make([]any, 0, len(req.Channels))
 	for _, channel := range req.Channels {
-		// FRESH decode per channel: the publish core stamps ids/serials in
-		// place, and every channel needs its own envelopes.
-		var messages []*protocol.Message
-		if err := json.Unmarshal(req.Messages, &messages); err != nil {
-			var single protocol.Message
-			if err := json.Unmarshal(req.Messages, &single); err != nil {
-				h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch messages")
-				return
+		// One channel per closure so the publish lock (T1.2: mint+append
+		// atomic, never two channel locks at once) releases per iteration.
+		result, errResult := func() (map[string]any, *publishProblem) {
+			unlock := h.mint.lockChannel(channel)
+			defer unlock()
+			// FRESH decode per channel: the publish core stamps
+			// ids/serials in place; every channel needs its own envelopes.
+			var messages []*protocol.Message
+			if err := json.Unmarshal(req.Messages, &messages); err != nil {
+				var single protocol.Message
+				if err := json.Unmarshal(req.Messages, &single); err != nil {
+					return nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "invalid batch messages"}
+				}
+				messages = []*protocol.Message{&single}
 			}
-			messages = []*protocol.Message{&single}
-		}
-		idBase, err := newRESTIDBase()
-		if err != nil {
-			h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "internal error")
+			idBase, err := newRESTIDBase()
+			if err != nil {
+				return nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: "internal error"}
+			}
+			payloads, idemKeys, serials, problem := buildEnvelopes(messages, envelopeParams{
+				clientID:   identity.clientID,
+				mintSerial: func() string { return h.mint.Mint(channel) },
+				newID: func(idx int) string {
+					return fmt.Sprintf("%s:%d", idBase, idx)
+				},
+			})
+			if problem != nil {
+				return nil, problem
+			}
+			for i, data := range payloads {
+				opts := publishOptions(channel, "", serials[i])
+				if idemKeys[i] != "" {
+					opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
+						centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
+				}
+				if _, err := h.node.Publish(brokerChannel(channel), data, opts...); err != nil {
+					log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("batch publish failed")
+					return nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: "publish failed"}
+				}
+			}
+			if mutableChannel(channel) {
+				for _, msg := range messages {
+					h.materialized.create(channel, msg)
+				}
+			}
+			return map[string]any{"channel": channel, "messageId": idBase}, nil
+		}()
+		if errResult != nil {
+			h.writeError(rw, r, statusOf(errResult), errResult.code, errResult.message)
 			return
 		}
-		payloads, idemKeys, serials, problem := buildEnvelopes(messages, envelopeParams{
-			clientID:   identity.clientID,
-			mintSerial: func() string { return h.mint.Mint(channel) },
-			newID: func(idx int) string {
-				return fmt.Sprintf("%s:%d", idBase, idx)
-			},
-		})
-		if problem != nil {
-			h.writeError(rw, r, statusOf(problem), problem.code, problem.message)
-			return
-		}
-		for i, data := range payloads {
-			opts := publishOptions(channel, "", serials[i])
-			if idemKeys[i] != "" {
-				opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
-					centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
-			}
-			if _, err := h.node.Publish(brokerChannel(channel), data, opts...); err != nil {
-				log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("batch publish failed")
-				h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "publish failed")
-				return
-			}
-		}
-		if mutableChannel(channel) {
-			for _, msg := range messages {
-				h.materialized.create(channel, msg)
-			}
-		}
-		results = append(results, map[string]any{"channel": channel, "messageId": idBase})
+		results = append(results, result)
 	}
 	h.writeDocument(rw, r, http.StatusCreated, results)
 }

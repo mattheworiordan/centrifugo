@@ -12,16 +12,12 @@ package ably
 //
 // One mint per process (handler-owned), one Generator per channel:
 // REST and realtime publishes on the same channel draw from the same
-// monotonic sequence. Serial order matches broker offset order for
-// non-overlapping publishes only: mint (buildEnvelopes) and append
-// (node.Publish) are not atomic, so two near-simultaneous publishers
-// can mint in one order and reach the broker in the other. Real Ably
-// serializes mint+append; this single-node PoC does not. CONSEQUENCE
-// FOR M6.3: a resume cursor must be resolved by serial→publication
-// LOOKUP (find the publication tagged with the cursor serial, replay
-// everything after its offset) — NEVER by lexicographic filtering
-// (serial > cursor), which an inverted pair would corrupt into a skip
-// or double-delivery.
+// monotonic sequence. Since Phase 3 (T1.2), mint+append are ATOMIC per
+// channel: every mint-then-publish path holds the channel's publish
+// lock (lockChannel) across the pair, so serial order always matches
+// broker offset order — the same guarantee the real Ably service makes.
+// Resume cursors still resolve by serial→publication LOOKUP (robust
+// regardless), but the lexicographic-order invariant now holds.
 //
 // Divergence note (documented for M9): a multi-message publish is
 // delivered by this adapter as N single-message publications, each with
@@ -45,15 +41,35 @@ const pubTagSerial = "s"
 type serialMint struct {
 	seriesID string
 
-	mu   sync.Mutex
-	gens map[string]*serial.Generator
+	mu    sync.Mutex
+	gens  map[string]*serial.Generator
+	locks map[string]*sync.Mutex
 }
 
 func newSerialMint() *serialMint {
 	return &serialMint{
 		seriesID: serial.NewSeriesID(),
 		gens:     make(map[string]*serial.Generator),
+		locks:    make(map[string]*sync.Mutex),
 	}
+}
+
+// lockChannel acquires the channel's publish lock — held across every
+// mint+broker-append pair so serial order equals offset order. Returns
+// the unlock func. Lock ordering: the channel lock is OUTERMOST; the
+// serialMint and materialized-store mutexes nest inside it (the
+// presence-store mutex is never held under it at all), and no path ever
+// holds two channel locks at once.
+func (m *serialMint) lockChannel(channel string) func() {
+	m.mu.Lock()
+	l, ok := m.locks[channel]
+	if !ok {
+		l = &sync.Mutex{}
+		m.locks[channel] = l
+	}
+	m.mu.Unlock()
+	l.Lock()
+	return l.Unlock
 }
 
 // Mint returns the next channelSerial for channel.
