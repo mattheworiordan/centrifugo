@@ -29,6 +29,9 @@ type Key struct {
 	Capability string
 	// Raw is the full `appId.keyId:keySecret` key string.
 	Raw string
+	// RevocableTokens reports whether the key may revoke tokens it
+	// signed (RSA17 / the fixture's revocableTokens flag).
+	RevocableTokens bool
 }
 
 // KeyStore holds the API keys of one static Ably app, indexed by key
@@ -51,10 +54,11 @@ type fixtureApp struct {
 }
 
 type fixtureKey struct {
-	KeyName    string `json:"keyName"`
-	KeySecret  string `json:"keySecret"`
-	KeyStr     string `json:"keyStr"`
-	Capability string `json:"capability"`
+	KeyName         string `json:"keyName"`
+	KeySecret       string `json:"keySecret"`
+	KeyStr          string `json:"keyStr"`
+	Capability      string `json:"capability"`
+	RevocableTokens bool   `json:"revocableTokens"`
 }
 
 // LoadKeyStore reads a static Ably app fixture JSON file and returns a
@@ -110,7 +114,12 @@ func LoadKeyStore(path string) (*KeyStore, error) {
 		if fk.Capability != "" && !json.Valid([]byte(fk.Capability)) {
 			return nil, fmt.Errorf("ably keystore: %s: key %q capability is not valid JSON", path, name)
 		}
-		store.keys[name] = Key{APIKey: parsed, Capability: fk.Capability, Raw: raw}
+		store.keys[name] = Key{
+			APIKey:          parsed,
+			Capability:      fk.Capability,
+			Raw:             raw,
+			RevocableTokens: fk.RevocableTokens,
+		}
 		if store.dummy == nil {
 			// Sized like a real key so the dummy compare in Authenticate
 			// is timing-representative. A presented credential could in

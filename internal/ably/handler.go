@@ -39,6 +39,8 @@ const (
 type Handler struct {
 	mint         *serialMint
 	materialized *materializedStore
+	revocations  *revocationStore
+	registry     *sessionRegistry
 	node         *centrifuge.Node
 	config       configtypes.Ably
 	keys         *auth.KeyStore
@@ -65,6 +67,8 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 	h := &Handler{
 		mint:         newSerialMint(),
 		materialized: newMaterializedStore(),
+		revocations:  newRevocationStore(),
+		registry:     newSessionRegistry(),
 		node:         n,
 		config:       c,
 		keys:         keys,
@@ -155,6 +159,13 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/keys/") && strings.HasSuffix(r.URL.Path, "/requestToken"):
 		// RSA8 token request exchange — see resttoken.go.
 		h.serveRequestToken(rw, r)
+	case strings.HasPrefix(r.URL.Path, "/keys/") && strings.HasSuffix(r.URL.Path, "/revokeTokens") && r.Method == http.MethodPost:
+		// RSA17 token revocation — see revocation.go.
+		keyName := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/keys/"), "/revokeTokens")
+		h.serveRevokeTokens(rw, r, keyName)
+	case r.URL.Path == "/presence" && r.Method == http.MethodGet:
+		// BAR1 batch presence — see rest.go.
+		h.serveBatchPresence(rw, r)
 	default:
 		// Catch-all REST error per the Ably error contract; route surface
 		// grows milestone by milestone.
@@ -286,6 +297,15 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		tokenExpires:     identity.expires,         // RTN15-territory: 40142 disconnect at exp
 		reauth:           h.verifyTokenString,      // RTC8 AUTH frames
 	}, h.presence, h.mint, h.materialized)
+	// Revocation enforcement (RSA17): identity captured at connect; a
+	// matching revocation disconnects the session with 40141.
+	h.registry.register(sess, sessionRecord{
+		keyName:  identity.keyName,
+		clientID: clientID,
+		viaToken: identity.viaToken,
+		issuedAt: identity.issuedAt,
+	})
+	defer h.registry.deregister(sess)
 	sess.run(r.Context())
 }
 

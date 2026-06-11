@@ -23,6 +23,13 @@
       "keySecret": "secret_key2_0123456789abcdef",
       "keyStr": "poc.key2:secret_key2_0123456789abcdef",
       "capability": "{\"channel0\":[\"publish\"],\"channel1\":[\"publish\"],\"channel2\":[\"publish\",\"subscribe\"],\"channel3\":[\"subscribe\"],\"channel4\":[\"presence\",\"publish\",\"subscribe\"],\"channel5\":[\"presence\"],\"channel6\":[\"*\"]}"
+    },
+    {
+      "keyName": "poc.key4",
+      "keySecret": "secret_key4_0123456789abcdef",
+      "keyStr": "poc.key4:secret_key4_0123456789abcdef",
+      "capability": "{\"*\":[\"*\"]}",
+      "revocableTokens": true
     }
   ],
   "namespaces": [

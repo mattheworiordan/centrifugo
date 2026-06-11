@@ -397,6 +397,156 @@ func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, ch
 	h.writeDocument(rw, r, http.StatusOK, map[string]any{"versionSerial": version.Serial})
 }
 
+// serveBatchPresence implements GET /presence?channels=a,b (BAR1; pinned
+// by ably-js rest/batch batchPresence): one BatchResult whose per-channel
+// entries carry the member set or a capability error — partial failures
+// are per channel, never the whole request.
+func (h *Handler) serveBatchPresence(rw http.ResponseWriter, r *http.Request) {
+	identity, authErr := h.authenticate(r)
+	if authErr != nil {
+		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
+		return
+	}
+	channelsParam := r.URL.Query().Get("channels")
+	if channelsParam == "" {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "missing channels parameter")
+		return
+	}
+	channels := strings.Split(channelsParam, ",")
+	format := responseFormat(r)
+	results := make([]any, 0, len(channels))
+	successCount, failureCount := 0, 0
+	for _, channel := range channels {
+		if !validChannelName(channel) || !identity.capability.Allows(auth.OpPresence, channel) {
+			failureCount++
+			results = append(results, map[string]any{
+				"channel": channel,
+				"error": map[string]any{
+					"code": errCodeOperationNotPermitted, "statusCode": 401,
+					"message": "capability does not permit presence",
+				},
+			})
+			continue
+		}
+		members := h.presence.members(channel)
+		items := make([]*protocol.PresenceMessage, 0, len(members))
+		for _, m := range members {
+			present := *m
+			present.Action = protocol.PresencePresent
+			if format == protocol.FormatMsgpack {
+				denormalizePresenceData(&present)
+			}
+			items = append(items, &present)
+		}
+		successCount++
+		results = append(results, map[string]any{"channel": channel, "presence": items})
+	}
+	h.writeDocument(rw, r, http.StatusOK, map[string]any{
+		"successCount": successCount,
+		"failureCount": failureCount,
+		"results":      results,
+	})
+}
+
+// batchPublishSpec is one RSC22 BatchPublishSpec.
+type batchPublishSpec struct {
+	Channels []string        `json:"channels"`
+	Messages json.RawMessage `json:"messages"`
+}
+
+// serveBatchSpecs serves the RSC22 rest.batchPublish form: the body is
+// an ARRAY of specs; the response is one BatchPublishResult per spec
+// with per-channel partial results ({channel, messageId} on success,
+// {channel, error} on capability/name failure) plus success/failure
+// counts — a bad channel never fails the whole request.
+func (h *Handler) serveBatchSpecs(rw http.ResponseWriter, r *http.Request, identity authResult, body []byte) {
+	var specs []batchPublishSpec
+	if err := json.Unmarshal(body, &specs); err != nil || len(specs) == 0 {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body")
+		return
+	}
+	out := make([]any, 0, len(specs))
+	for _, spec := range specs {
+		results := make([]any, 0, len(spec.Channels))
+		successCount, failureCount := 0, 0
+		for _, channel := range spec.Channels {
+			entry, problem := h.batchPublishOne(channel, spec.Messages, identity)
+			if problem != nil {
+				failureCount++
+				results = append(results, map[string]any{
+					"channel": channel,
+					"error": map[string]any{
+						"code": problem.code, "statusCode": statusOf(problem),
+						"message": problem.message,
+					},
+				})
+				continue
+			}
+			successCount++
+			results = append(results, entry)
+		}
+		out = append(out, map[string]any{
+			"successCount": successCount,
+			"failureCount": failureCount,
+			"results":      results,
+		})
+	}
+	h.writeDocument(rw, r, http.StatusCreated, out)
+}
+
+// batchPublishOne publishes one spec's messages to one channel under the
+// channel publish lock, returning the success entry or the per-channel
+// problem.
+func (h *Handler) batchPublishOne(channel string, rawMessages json.RawMessage, identity authResult) (map[string]any, *publishProblem) {
+	if !validChannelName(channel) {
+		return nil, &publishProblem{code: errCodeInvalidChannelName, statusCode: 400, message: "invalid channel name"}
+	}
+	if !identity.capability.Allows(auth.OpPublish, channel) {
+		return nil, &publishProblem{code: errCodeOperationNotPermitted, statusCode: 401, message: "capability does not permit publish"}
+	}
+	unlock := h.mint.lockChannel(channel)
+	defer unlock()
+	var messages []*protocol.Message
+	if err := json.Unmarshal(rawMessages, &messages); err != nil {
+		var single protocol.Message
+		if err := json.Unmarshal(rawMessages, &single); err != nil {
+			return nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "invalid batch messages"}
+		}
+		messages = []*protocol.Message{&single}
+	}
+	idBase, err := newRESTIDBase()
+	if err != nil {
+		return nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: "internal error"}
+	}
+	payloads, idemKeys, serials, problem := buildEnvelopes(messages, envelopeParams{
+		clientID:   identity.clientID,
+		mintSerial: func() string { return h.mint.Mint(channel) },
+		newID: func(idx int) string {
+			return fmt.Sprintf("%s:%d", idBase, idx)
+		},
+	})
+	if problem != nil {
+		return nil, problem
+	}
+	for i, data := range payloads {
+		opts := publishOptions(channel, "", serials[i])
+		if idemKeys[i] != "" {
+			opts = append(opts, centrifuge.WithIdempotencyKey(idemKeys[i]),
+				centrifuge.WithIdempotentResultTTL(idempotentResultTTL))
+		}
+		if _, err := h.node.Publish(brokerChannel(channel), data, opts...); err != nil {
+			log.Error().Err(err).Str("channel", channel).Str("transport", transportName).Msg("batch publish failed")
+			return nil, &publishProblem{code: errCodeInternal, statusCode: 500, message: "publish failed"}
+		}
+	}
+	if mutableChannel(channel) {
+		for _, msg := range messages {
+			h.materialized.create(channel, msg)
+		}
+	}
+	return map[string]any{"channel": channel, "messageId": idBase}, nil
+}
+
 // serveBatchPublish implements POST /messages (BO2, the batch publish
 // API; pinned by ably-js request_batch_api_success via rest.request):
 // one body {channels: [...], messages: <message|[]message>} publishes the
@@ -421,10 +571,11 @@ func (h *Handler) serveBatchPublish(rw http.ResponseWriter, r *http.Request) {
 	}
 	format := requestBodyFormat(r)
 	if format == protocol.FormatMsgpack {
-		// Normalize the envelope once: decode the msgpack body to the
-		// JSON-safe generic form so the per-channel re-decode below stays
-		// format-agnostic.
-		var generic map[string]any
+		// Normalize once: decode the msgpack body to the JSON-safe
+		// generic form — `any`, not a map, because the RSC22 spec form is
+		// an ARRAY — so the shape sniff and per-channel re-decodes below
+		// stay format-agnostic.
+		var generic any
 		if err := protocol.UnmarshalAny(body, format, &generic); err != nil {
 			h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body")
 			return
@@ -433,6 +584,14 @@ func (h *Handler) serveBatchPublish(rw http.ResponseWriter, r *http.Request) {
 			h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "internal error")
 			return
 		}
+	}
+	// Two wire forms share this endpoint: the rest.batchPublish API posts
+	// an ARRAY of BatchPublishSpecs (RSC22 — per-channel partial results);
+	// the request()-API form posts a single {channels, messages} object
+	// (flat per-channel results, whole-batch validation).
+	if trimmed := strings.TrimSpace(string(body)); strings.HasPrefix(trimmed, "[") {
+		h.serveBatchSpecs(rw, r, identity, body)
+		return
 	}
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Channels) == 0 {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body")

@@ -38,11 +38,15 @@ type TokenClaims struct {
 	Capability string
 	// Expires is the token expiry (exp claim) in ms since epoch.
 	Expires int64
+	// IssuedAt is the iat claim in ms since epoch (0 when absent) —
+	// token revocation (RSA17) matches tokens issued before a cutoff.
+	IssuedAt int64
 }
 
 // ablyJWTClaims is the wire shape of Ably-JWT claims.
 type ablyJWTClaims struct {
 	Exp        int64  `json:"exp"`
+	Iat        int64  `json:"iat"`
 	Capability string `json:"x-ably-capability"`
 	ClientID   string `json:"x-ably-clientId"`
 }
@@ -96,5 +100,6 @@ func (s *KeyStore) VerifyToken(token string) (TokenClaims, error) {
 		ClientID:   claims.ClientID,
 		Capability: claims.Capability,
 		Expires:    claims.Exp * 1000,
+		IssuedAt:   claims.Iat * 1000,
 	}, nil
 }

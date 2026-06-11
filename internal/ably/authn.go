@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 )
@@ -38,6 +39,9 @@ type authResult struct {
 	// auth): the realtime session disconnects with 40142 when it passes
 	// (RTN15-territory) unless an AUTH renewal extends it first.
 	expires int64
+	// issuedAt is the token iat in ms (0 when absent) — revocation
+	// matching (RSA17).
+	issuedAt int64
 }
 
 // authProblem is the Ably error verdict of a failed authentication,
@@ -76,11 +80,16 @@ func (h *Handler) verifyTokenString(token string) (authResult, *authProblem) {
 		capability: capability,
 		keyName:    claims.KeyName,
 		expires:    claims.Expires,
+		issuedAt:   claims.IssuedAt,
 	}
 	if claims.ClientID == "*" {
 		res.wildcardClientID = true // RSA7b4
 	} else {
 		res.clientID = claims.ClientID
+	}
+	// RSA17/40141: a revoked token is refused outright.
+	if h.revocations.revoked(claims.KeyName, res.clientID, claims.IssuedAt, time.Now().UnixMilli()) {
+		return authResult{}, &authProblem{code: 40141, statusCode: http.StatusUnauthorized, message: "token revoked"}
 	}
 	return res, nil
 }

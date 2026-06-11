@@ -675,15 +675,7 @@ func (s *session) armTokenExpiry() {
 		})
 	}
 	s.expiryTimer = time.AfterFunc(wait, func() {
-		_ = s.writeFrame(&protocol.ProtocolMessage{
-			Action: protocol.ActionDisconnected,
-			Error: &protocol.ErrorInfo{
-				Code:       40142,
-				StatusCode: 401,
-				Message:    "token expired",
-			},
-		})
-		s.beginClose()
+		s.disconnectWithError(40142, 401, "token expired")
 	})
 }
 
@@ -725,6 +717,23 @@ func (s *session) handleAuth(m *protocol.ProtocolMessage) {
 	}
 	s.armTokenExpiry()
 	_ = s.writeConnected()
+}
+
+// disconnectWithError drops the session with a DISCONNECTED frame
+// carrying the error — the SDK's renew-and-reconnect signal family
+// (40142 token expired, 40141 token revoked). Mirrors the token-expiry
+// timer's pattern; safe from any goroutine (writeFrame is
+// writeMu-serialized, beginClose is idempotent).
+func (s *session) disconnectWithError(code int, statusCode int, message string) {
+	_ = s.writeFrame(&protocol.ProtocolMessage{
+		Action: protocol.ActionDisconnected,
+		Error: &protocol.ErrorInfo{
+			Code:       code,
+			StatusCode: statusCode,
+			Message:    message,
+		},
+	})
+	s.teardown()
 }
 
 // writeConnectionError fails the whole connection with an ERROR frame
