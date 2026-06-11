@@ -80,6 +80,7 @@ const (
 	errCodeMaxMessageLength        = 40009 // maximum message length exceeded
 	errCodeInvalidChannelName      = 40010 // invalid channel name
 	errCodeInvalidClientID         = 40012 // invalid client id
+	errCodePublishRateExceeded     = 42911 // max per-connection publish rate exceeded (nonfatal)
 	errCodeInvalidCredentials      = 40101 // invalid credentials
 	errCodeIncompatibleCredentials = 40102 // incompatible credentials
 	errCodeOperationNotPermitted   = 40160 // operation not permitted with provided capability
@@ -95,6 +96,45 @@ const (
 // handler goroutine on a full TCP buffer (matches the uniws transport's
 // write-timeout discipline).
 const writeTimeout = 5 * time.Second
+
+// rateLimiter is a per-connection token bucket enforcing the advertised
+// maxInboundRate (CD2e) on inbound publishes (C5). It is accessed only on
+// the frame-reader goroutine (handleFrame is the sole caller), so it needs
+// no synchronization — the bucket refills lazily from the elapsed time on
+// each allow(), keeping the hot path lock-free. Capacity equals the rate, so
+// up to one second's worth of publishes may burst before the 1000/s steady
+// state applies.
+type rateLimiter struct {
+	tokens   float64
+	capacity float64
+	rate     float64 // tokens per second
+	last     time.Time
+}
+
+func newRateLimiter(ratePerSecond float64) *rateLimiter {
+	// last stays zero until the first allow() seeds it from the caller's
+	// clock, so the limiter has no time.Now() dependency at construction —
+	// deterministically testable, and no clock skew between construction and
+	// the first allow.
+	return &rateLimiter{tokens: ratePerSecond, capacity: ratePerSecond, rate: ratePerSecond}
+}
+
+// allow refills the bucket for the time elapsed since the last call and
+// consumes one token, reporting whether a token was available. now is passed
+// in so tests can drive it deterministically.
+func (rl *rateLimiter) allow(now time.Time) bool {
+	if rl.last.IsZero() {
+		rl.last = now
+	} else if elapsed := now.Sub(rl.last).Seconds(); elapsed > 0 {
+		rl.tokens = min(rl.capacity, rl.tokens+elapsed*rl.rate)
+		rl.last = now
+	}
+	if rl.tokens >= 1 {
+		rl.tokens--
+		return true
+	}
+	return false
+}
 
 // pubTagOrigin is the publication tag carrying the publisher's Ably
 // connectionId. Set on every adapter publish; echo=false connections
@@ -277,6 +317,10 @@ type session struct {
 	// sole reader and writer, so no mutex is needed.
 	expectedMsgSerial int64
 	msgSerialSeeded   bool
+
+	// inboundRate enforces the advertised maxInboundRate (CD2e) on inbound
+	// publishes (C5). Frame-reader-goroutine-local, like the serial state.
+	inboundRate *rateLimiter
 }
 
 // checkMsgSerial validates an ack-bearing frame's msgSerial against the
@@ -316,6 +360,7 @@ func newSession(node *centrifuge.Node, conn frameConn, params sessionParams, pre
 		attachedModes: make(map[string]int64),
 		connected:     make(chan error, 1),
 		closeCh:       make(chan struct{}),
+		inboundRate:   newRateLimiter(maxInboundRate),
 	}
 }
 
@@ -449,6 +494,15 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 		// they share one monotonic-contiguous sequence (see the field doc).
 		if !s.checkMsgSerial(m.MsgSerial) {
 			s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "invalid msgSerial: expected a monotonic, contiguous sequence")
+			return true
+		}
+		// C5: enforce the advertised maxInboundRate (CD2e). The serial was
+		// already accepted (expectation advanced) above, so a rate NACK does
+		// not desync the sequence. 42911 is the nonfatal per-connection
+		// publish-rate code — the SDK fails this publish and keeps the
+		// connection.
+		if !s.inboundRate.allow(time.Now()) {
+			s.writeNack(m.MsgSerial, errCodePublishRateExceeded, 429, "publish rate limit exceeded")
 			return true
 		}
 		s.publish(m)
