@@ -52,7 +52,6 @@ import (
 	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/serial"
-	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 
 	"github.com/centrifugal/centrifuge"
 	cproto "github.com/centrifugal/protocol"
@@ -201,7 +200,7 @@ type session struct {
 	node         *centrifuge.Node
 	mint         *serialMint
 	materialized *materializedStore
-	conn         *websocket.Conn
+	conn         frameConn
 	params       sessionParams
 	presence     *presenceStore
 
@@ -241,7 +240,7 @@ type session struct {
 	closeCh    chan struct{} // closed on teardown: stops the heartbeat ticker and cancels the client context
 }
 
-func newSession(node *centrifuge.Node, conn *websocket.Conn, params sessionParams, presence *presenceStore, mint *serialMint, materialized *materializedStore) *session {
+func newSession(node *centrifuge.Node, conn frameConn, params sessionParams, presence *presenceStore, mint *serialMint, materialized *materializedStore) *session {
 	return &session{
 		node:          node,
 		mint:          mint,
@@ -300,19 +299,14 @@ func (s *session) run(reqCtx context.Context) {
 	go s.heartbeatLoop()
 
 	for {
-		// Decode by the session's negotiated format (RTN2a) regardless of
-		// the WS frame type flag — tolerant on read; writes always carry
-		// the matching frame type (see writeBytes).
-		_, data, err := s.conn.ReadMessage()
+		// The transport owns wire decoding (wsConn is format-tolerant on
+		// read per RTN2a; a comet front feeds posted frames one at a
+		// time). A read error ends the session.
+		m, err := s.conn.readFrame()
 		if err != nil {
 			return
 		}
-		var m protocol.ProtocolMessage
-		if err := protocol.Unmarshal(data, s.params.format, &m); err != nil {
-			log.Warn().Err(err).Str("transport", transportName).Str("format", s.params.format.String()).Msg("bad inbound frame")
-			continue
-		}
-		if !s.handleFrame(&m) {
+		if !s.handleFrame(m) {
 			return
 		}
 	}
@@ -1602,7 +1596,7 @@ func (s *session) handleTransportClose(disconnect centrifuge.Disconnect) {
 	}
 	// The client is already closing inside centrifuge — calling closeFn
 	// here is both unnecessary and the path back into this very function.
-	_ = s.conn.Close()
+	_ = s.conn.close()
 }
 
 // heartbeatLoop emits server-initiated activity so the client never trips
@@ -1660,7 +1654,7 @@ func (s *session) teardown() {
 	if s.closeFn != nil {
 		_ = s.closeFn()
 	}
-	_ = s.conn.Close()
+	_ = s.conn.close()
 }
 
 // leavePresence handles the connection's members at teardown: a clean
@@ -1719,18 +1713,14 @@ func (s *session) writeWire(v any) {
 	_ = s.writeBytes(data)
 }
 
-// writeBytes writes one encoded frame with the WS frame type matching the
-// session's wire format: msgpack frames are binary messages, JSON frames
-// are text messages.
+// writeBytes hands one encoded frame to the transport under writeMu —
+// the single ordering point for every outbound frame. The transport
+// maps the session's wire format to its own framing (WS: text vs
+// binary message type).
 func (s *session) writeBytes(data []byte) error {
-	messageType := websocket.TextMessage
-	if s.params.format == protocol.FormatMsgpack {
-		messageType = websocket.BinaryMessage
-	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
-	_ = s.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	return s.conn.WriteMessage(messageType, data)
+	return s.conn.writeEncoded(data, s.params.format == protocol.FormatMsgpack)
 }
 
 func (s *session) addPending(op pendingOp) uint32 {

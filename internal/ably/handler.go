@@ -346,7 +346,7 @@ func (h *Handler) serveRealtime(rw http.ResponseWriter, r *http.Request) {
 		// session's re-entered members — they share the connectionId key).
 		h.presence.cancelExpiry(recoverID)
 	}
-	sess := newSession(h.node, conn, sessionParams{
+	sess := newSession(h.node, &wsConn{conn: conn, format: format}, sessionParams{
 		userID:           userID,
 		clientID:         clientID,
 		wildcardClientID: identity.wildcardClientID && clientID == "",
