@@ -47,5 +47,10 @@
   },
   "log": {
     "level": "debug"
+  },
+  "client": {
+    "allowed_origins": [
+      "*"
+    ]
   }
 }
