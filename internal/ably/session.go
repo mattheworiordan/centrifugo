@@ -468,12 +468,18 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	// 40009 reject NACKs the frame and keeps the connection alive —
 	// contrast the protocol-level maxFrameSize read limit set in
 	// serveRealtime, which kills the connection outright.
-	// T1.2: the channel publish lock makes mint+append atomic — serial
-	// order equals broker offset order (serials.go). The deferred unlock
-	// also spans the ACK write: a stalled client can hold the lock for up
-	// to writeTimeout, stalling that channel's other publishers — bounded
-	// and inversion-free (writeMu is a strict leaf), PoC-acceptable.
-	unlock := s.mint.lockChannel(m.Channel)
+	// T1.2/A2: the channel publish lock makes mint+Publish (+ the
+	// materialized create on mutable channels) atomic — serial order equals
+	// broker offset order (serials.go), and a cross-connection mutate (which
+	// takes the SAME lock) can never observe a published-but-not-yet-
+	// materialized create. A2: it is released BEFORE the terminal ACK/NACK
+	// write, so a stalled transport writer can no longer pin the
+	// process-wide per-channel lock for up to writeTimeout and stall every
+	// other publisher to this channel. sync.OnceFunc keeps the explicit
+	// pre-write unlocks panic-safe: the deferred call is a no-op once an
+	// explicit unlock has run, and still releases the lock on any panic
+	// between lock and write.
+	unlock := sync.OnceFunc(s.mint.lockChannel(m.Channel))
 	defer unlock()
 	payloads, idemKeys, serials, problem := buildEnvelopes(m.Messages, envelopeParams{
 		connectionID: connectionID,
@@ -488,6 +494,7 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		},
 	})
 	if problem != nil {
+		unlock()
 		s.writeNack(m.MsgSerial, problem.code, problem.statusCode, "publish failed: "+problem.message)
 		return
 	}
@@ -512,6 +519,7 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 		}
 		_, err := s.node.Publish(brokerChannel(m.Channel), data, opts...)
 		if err != nil {
+			unlock()
 			log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("publish failed")
 			s.writeNack(m.MsgSerial, errCodeInternal, 500, "publish failed")
 			return
@@ -520,15 +528,19 @@ func (s *session) publish(m *protocol.ProtocolMessage) {
 	if mutableChannel(m.Channel) {
 		// The create registers materialized state (mutation ops and
 		// materialized reads key off it), and the ACK carries the
-		// assigned message serials (TR4s).
+		// assigned message serials (TR4s). The create stays UNDER the lock
+		// (A2): a racing cross-connection mutate must not see the published
+		// create before its materialized entry exists.
 		msgSerials := make([]string, len(m.Messages))
 		for i, msg := range m.Messages {
 			msgSerials[i] = msg.Serial
 			s.materialized.create(m.Channel, msg)
 		}
+		unlock()
 		s.writeAckRes(m.MsgSerial, msgSerials)
 		return
 	}
+	unlock()
 	s.writeAck(m.MsgSerial)
 }
 
@@ -546,8 +558,11 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeMutableRequired, 400, "mutation failed: this operation can only be performed on a channel with mutable messages enabled")
 		return
 	}
-	// T1.2: mint+mutate+append atomic per channel (serials.go).
-	unlock := s.mint.lockChannel(m.Channel)
+	// T1.2/A2: mint+mutate+Publish atomic per channel (serials.go); the
+	// lock is released BEFORE the terminal ACK/NACK write so a stalled
+	// writer cannot pin the channel lock (see publish). sync.OnceFunc makes
+	// the explicit pre-write unlocks panic-safe.
+	unlock := sync.OnceFunc(s.mint.lockChannel(m.Channel))
 	defer unlock()
 	// The mutator supplies the MessageOperation in version; the server
 	// assigns the versionSerial and timestamp (TM2s).
@@ -563,12 +578,14 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 
 	op, prob := s.materialized.mutate(m.Channel, msg.Serial, msg.Action, msg.Data, msg.Encoding, msg.Extras, version)
 	if prob != nil {
+		unlock()
 		s.writeNack(m.MsgSerial, prob.code, prob.statusCode, "mutation failed: "+prob.message)
 		return
 	}
 	op.ID = fmt.Sprintf("%s:%d:0", s.connectionID(), m.MsgSerial)
 	data, err := json.Marshal(op)
 	if err != nil {
+		unlock()
 		s.writeNack(m.MsgSerial, errCodeInternal, 500, "mutation failed")
 		return
 	}
@@ -576,10 +593,12 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 	// its versionSerial (it advances the channel position) and the
 	// publisher origin (echo=false suppression applies).
 	if _, err := s.node.Publish(brokerChannel(m.Channel), data, publishOptions(m.Channel, s.connectionID(), version.Serial)...); err != nil {
+		unlock()
 		log.Error().Err(err).Str("channel", m.Channel).Str("transport", transportName).Msg("mutation publish failed")
 		s.writeNack(m.MsgSerial, errCodeInternal, 500, "mutation failed")
 		return
 	}
+	unlock()
 	// TR4s: the mutation ACK returns the versionSerial.
 	s.writeAckRes(m.MsgSerial, []string{version.Serial})
 }
