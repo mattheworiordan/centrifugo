@@ -324,6 +324,11 @@ func (h *Handler) buildSessionParams(q url.Values, identity authResult, format p
 		// RSA7b4/RSA15b: a wildcard token carries no identity; the caller
 		// may assume any clientId (including none).
 	}
+	// C3: the connection clientId becomes a presence/attribution map key and
+	// the centrifuge UserID — reject invalid UTF-8 at the boundary.
+	if !validClientID(clientID) {
+		return sessionParams{}, &connectRejection{errCodeInvalidClientID, http.StatusBadRequest, "clientId is not valid UTF-8"}
+	}
 	userID := identity.keyName
 	if clientID != "" {
 		userID = clientID

@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/serial"
@@ -121,12 +122,23 @@ func jsonDepthWithin(v any, max int) bool {
 }
 
 // validChannelName reports whether name is acceptable as an Ably channel
-// name. Empty names, names beginning with ':', and names exceeding
-// maxChannelNameBytes are invalid (error code 40010; pinned by ably-js
-// channelattachempty/channelattachinvalid). The full Ably channel-name
+// name. Empty names, names beginning with ':', names exceeding
+// maxChannelNameBytes, and names containing invalid UTF-8 (C3) are invalid
+// (error code 40010; pinned by ably-js channelattachempty/
+// channelattachinvalid). Channel names become map keys and broker names, so
+// invalid UTF-8 must not flow through raw. The full Ably channel-name
 // grammar is not enforced.
 func validChannelName(name string) bool {
-	return name != "" && !strings.HasPrefix(name, ":") && len(name) <= maxChannelNameBytes
+	return name != "" && !strings.HasPrefix(name, ":") &&
+		len(name) <= maxChannelNameBytes && utf8.ValidString(name)
+}
+
+// validClientID reports whether a clientId is acceptable — it must be valid
+// UTF-8 (C3): clientIds become map keys (presence, attribution) and message
+// fields, so invalid UTF-8 must be rejected at the boundary rather than
+// flowing through raw. The empty clientId (unidentified) is valid.
+func validClientID(id string) bool {
+	return utf8.ValidString(id)
 }
 
 // envelopeParams carries the publisher identity the envelope is built
@@ -188,6 +200,11 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, [
 		// it is enveloped or published.
 		if !jsonDepthWithin(msg.Data, maxJSONDepth) || !jsonDepthWithin(msg.Extras, maxJSONDepth) {
 			return nil, nil, nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "message payload nesting too deep"}
+		}
+		// C3: a per-message clientId becomes an attribution/map key — reject
+		// invalid UTF-8 at the boundary.
+		if !validClientID(msg.ClientID) {
+			return nil, nil, nil, &publishProblem{code: errCodeInvalidClientID, statusCode: 400, message: "message clientId is not valid UTF-8"}
 		}
 		if msg.ClientID != "" && p.clientID != "" && msg.ClientID != p.clientID {
 			// RTL6g/RSL1m4: an identified publisher can only publish

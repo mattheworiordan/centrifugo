@@ -85,6 +85,12 @@ func (h *Handler) verifyTokenString(token string) (authResult, *authProblem) {
 	if claims.ClientID == "*" {
 		res.wildcardClientID = true // RSA7b4
 	} else {
+		// C3: a token clientId becomes a presence/attribution map key — reject
+		// invalid UTF-8 here so it is caught on every surface that token-auths
+		// (realtime connect, REST publish, comet), not only the connect path.
+		if !validClientID(claims.ClientID) {
+			return authResult{}, &authProblem{code: errCodeInvalidClientID, statusCode: http.StatusUnauthorized, message: "token clientId is not valid UTF-8"}
+		}
 		res.clientID = claims.ClientID
 	}
 	// RSA17/40141: a revoked token is refused outright.

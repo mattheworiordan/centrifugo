@@ -221,6 +221,12 @@ func (h *Handler) serveRESTPublish(rw http.ResponseWriter, r *http.Request, chan
 				return
 			}
 			publisherClientID = string(decoded)
+			// C3: reject an X-Ably-ClientId whose decoded bytes are not valid
+			// UTF-8 (it becomes a message attribution / map key).
+			if !validClientID(publisherClientID) {
+				h.writeError(rw, r, http.StatusBadRequest, errCodeInvalidClientID, "X-Ably-ClientId is not valid UTF-8")
+				return
+			}
 		}
 	}
 

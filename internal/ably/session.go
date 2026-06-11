@@ -1437,6 +1437,13 @@ func (s *session) handlePresence(m *protocol.ProtocolMessage) {
 			s.writeNack(m.MsgSerial, errCodePresenceNoClientID, 400, "presence failed: no clientId")
 			return
 		}
+		// C3: the resolved clientId becomes a presence map key — reject
+		// invalid UTF-8 (the connection's own clientId is already validated at
+		// connect, so this guards an explicit entry clientId).
+		if !validClientID(clientID) {
+			s.writeNack(m.MsgSerial, errCodeInvalidClientID, 400, "presence failed: clientId is not valid UTF-8")
+			return
+		}
 		entry := *pm
 		entry.ClientID = clientID
 		entry.ConnectionID = connectionID // TP3 attribution
