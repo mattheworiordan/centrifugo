@@ -112,51 +112,99 @@ func TestTimeMsgPack_RSC16(t *testing.T) {
 	}
 }
 
-// Catch-all REST error contract: the auth gate runs before routing
-// (matching the real service — RTN14a's comet fallback depends on bad
-// credentials being 40101 on ANY path), so an unknown path is 40400
-// only for an authenticated caller and a credential error otherwise.
+// Catch-all REST error contract: path resolution precedes auth, like
+// the real service — an unknown path is 40400 with the full Ably error
+// envelope (help-suffixed message, href, nonfatal, serverId) REGARDLESS
+// of credentials (verified against realtime.ably.io: `curl /foo` with
+// no creds is 404/40400, not 401). The serverId names the stack.
 func TestNotFoundError(t *testing.T) {
 	t.Parallel()
 	h := newTestHandler(t)
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	req, err := http.NewRequest(http.MethodGet, srv.URL+"/nonexistent", nil)
-	require.NoError(t, err)
-	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusNotFound, resp.StatusCode)
-	require.Equal(t, "40400", resp.Header.Get("X-Ably-Errorcode"))
-
-	var envelope struct {
-		Error struct {
-			Message    string `json:"message"`
-			Code       int    `json:"code"`
-			StatusCode int    `json:"statusCode"`
-		} `json:"error"`
-	}
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&envelope))
-	require.Equal(t, 40400, envelope.Error.Code)
-	require.Equal(t, http.StatusNotFound, envelope.Error.StatusCode)
-
-	// Without (or with bad) credentials the same path is a credential
-	// error, not a 404.
 	for name, setAuth := range map[string]func(*http.Request){
-		"no credentials":  func(r *http.Request) {},
-		"bad credentials": func(r *http.Request) { r.SetBasicAuth("this.is", "wrong") },
+		"no credentials":   func(r *http.Request) {},
+		"bad credentials":  func(r *http.Request) { r.SetBasicAuth("this.is", "wrong") },
+		"good credentials": func(r *http.Request) { r.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef") },
 	} {
 		req, err := http.NewRequest(http.MethodGet, srv.URL+"/nonexistent", nil)
 		require.NoError(t, err)
 		setAuth(req)
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
-		require.Equal(t, http.StatusUnauthorized, resp.StatusCode, name)
-		require.Equal(t, "40101", resp.Header.Get("X-Ably-Errorcode"), name)
+		require.Equal(t, http.StatusNotFound, resp.StatusCode, name)
+		require.Equal(t, "40400", resp.Header.Get("X-Ably-Errorcode"), name)
+		require.Equal(t, ablyCluster, resp.Header.Get("X-Ably-Cluster"), name)
+		require.Contains(t, resp.Header.Get("X-Ably-Serverid"), "centrifugo-adapter.", name)
+
+		var envelope struct {
+			Error struct {
+				Message    string `json:"message"`
+				Code       int    `json:"code"`
+				StatusCode int    `json:"statusCode"`
+				Nonfatal   *bool  `json:"nonfatal"`
+				Href       string `json:"href"`
+				ServerID   string `json:"serverId"`
+			} `json:"error"`
+		}
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&envelope))
 		_ = resp.Body.Close()
+		require.Equal(t, 40400, envelope.Error.Code, name)
+		require.Equal(t, http.StatusNotFound, envelope.Error.StatusCode, name)
+		require.Equal(t,
+			"Could not find path: /nonexistent. (See https://help.ably.io/error/40400 for help.)",
+			envelope.Error.Message, name)
+		require.Equal(t, "https://help.ably.io/error/40400", envelope.Error.Href, name)
+		require.NotNil(t, envelope.Error.Nonfatal, name)
+		require.False(t, *envelope.Error.Nonfatal, name)
+		require.Contains(t, envelope.Error.ServerID, "centrifugo-adapter.", name)
 	}
+
+	// Control bytes in the path (percent-decoded by net/http) must still
+	// yield VALID JSON — strconv.Quote-style \x escapes would not parse.
+	resp, err := http.Get(srv.URL + "/foo%01bar")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	var envelope struct {
+		Error struct{ Message string } `json:"error"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&envelope), "body must be valid JSON despite control bytes")
+	require.Contains(t, envelope.Error.Message, "Could not find path")
+}
+
+// A browser landing on an API error (Accept: text/html) gets the
+// courtesy page — like realtime.ably.io — with the error status
+// preserved and the Centrifugo provenance stated.
+func TestBrowserErrorPageHTML(t *testing.T) {
+	t.Parallel()
+	h := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+	require.Contains(t, resp.Header.Get("Content-Type"), "text/html")
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Contains(t, string(body), "right place")
+	require.Contains(t, string(body), "Centrifugo")
+	require.Contains(t, string(body), "not the Ably service")
+
+	// API clients (no text/html in Accept) keep the JSON envelope.
+	req, err = http.NewRequest(http.MethodGet, srv.URL+"/", nil)
+	require.NoError(t, err)
+	req.Header.Set("Accept", "application/json")
+	resp2, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	require.Contains(t, resp2.Header.Get("Content-Type"), "application/json")
 }
 
 // CORS preflights succeed WITHOUT credentials (browsers strip them from
@@ -198,7 +246,7 @@ func TestCORSPreflightAndExposedHeaders(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = resp3.Body.Close() }()
 	require.Equal(t, http.StatusUnauthorized, resp3.StatusCode)
-	require.Contains(t, resp3.Header.Get("Access-Control-Expose-Headers"), "X-Ably-Errorcode")
+	require.Contains(t, resp3.Header.Get("Access-Control-Expose-Headers"), "X-Ably-ErrorCode")
 }
 
 // Comet transport probes are declined WITHOUT an Ably error envelope:

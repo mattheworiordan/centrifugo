@@ -1118,8 +1118,9 @@ func (h *Handler) serveChannelDetails(rw http.ResponseWriter, r *http.Request, c
 // corsExposedHeaders lets browser SDKs read pagination and error
 // metadata cross-origin: without exposing Link, ably-js paginated
 // resources silently stop after page one when the API lives on a
-// different origin than the app.
-const corsExposedHeaders = "Link, X-Ably-Errorcode, X-Ably-Errormessage, X-Ably-Serverid"
+// different origin than the app. The list (and its casing) mirrors the
+// real service's Access-Control-Expose-Headers.
+const corsExposedHeaders = "Link,Transfer-Encoding,Content-Length,X-Ably-ErrorCode,X-Ably-ErrorMessage,X-Ably-ServerId,X-Ably-Cluster,Server"
 
 // writeDocument writes a REST response document in the negotiated format
 // (RSC8c).

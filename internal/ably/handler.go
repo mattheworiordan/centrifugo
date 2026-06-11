@@ -42,6 +42,7 @@ type Handler struct {
 	revocations  *revocationStore
 	registry     *sessionRegistry
 	stats        *statsStore
+	serverID     string
 	node         *centrifuge.Node
 	config       configtypes.Ably
 	keys         *auth.KeyStore
@@ -71,6 +72,7 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 		revocations:  newRevocationStore(),
 		registry:     newSessionRegistry(),
 		stats:        newStatsStore(),
+		serverID:     ablyServerID(),
 		node:         n,
 		config:       c,
 		keys:         keys,
@@ -189,31 +191,32 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		h.serveStatsFixtures(rw, r)
 	default:
 		// Catch-all REST error per the Ably error contract; route surface
-		// grows milestone by milestone. Like the real service, the auth
-		// gate runs BEFORE routing: bad credentials on any path are 40101,
-		// not 40400 — RTN14a depends on this when a comet transport
-		// fallback probes /comet/connect with the same (invalid) key the
-		// WebSocket attempt failed with: a 404 would read as a retryable
-		// transport error and mask the credential failure.
-		if _, authErr := h.authenticate(r); authErr != nil {
-			h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
-			return
-		}
+		// grows milestone by milestone. PATH RESOLUTION PRECEDES AUTH,
+		// matching the real service (verified against realtime.ably.io:
+		// `curl /foo` with no credentials is 404/40400, not 401): an
+		// unknown path is "Could not find path" regardless of creds.
+		// /comet/* is the exception because it's a REAL endpoint family —
+		// auth applies there first, so an invalid key gets the coded
+		// 40101 that RTN14a depends on when ably-js's comet fallback
+		// probes /comet/connect after a failed WebSocket attempt.
 		if strings.HasPrefix(r.URL.Path, "/comet/") {
+			if _, authErr := h.authenticate(r); authErr != nil {
+				h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
+				return
+			}
 			// WS-only adapter: decline the comet transport WITHOUT an Ably
 			// error envelope. ably-js turns a coded envelope from
 			// /comet/connect into an ERROR ProtocolMessage and FAILS the
 			// whole connection (comettransport.ts 'complete' handler);
 			// a code-less error just disconnects the candidate, so a
 			// client trialling [web_socket, comet] keeps its WebSocket.
-			// (Invalid credentials never reach here — the auth gate above
-			// answers with the coded 40101 RTN14a depends on.)
 			rw.Header().Set("Content-Type", "text/plain")
 			rw.WriteHeader(http.StatusNotImplemented)
 			_, _ = rw.Write([]byte("comet transport is not supported (WebSocket-only server)"))
 			return
 		}
-		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "not found")
+		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound,
+			"Could not find path: "+r.URL.Path)
 	}
 }
 
@@ -438,14 +441,109 @@ func responseFormat(r *http.Request) protocol.Format {
 // writeError writes an Ably REST error response: an error envelope body plus
 // X-Ably-Errorcode/X-Ably-Errormessage headers (HP6/HP7). JSON-only for now —
 // SDKs accept JSON error bodies regardless of the requested format.
-func (h *Handler) writeError(rw http.ResponseWriter, _ *http.Request, statusCode int, code int, message string) {
-	rw.Header().Set("Content-Type", contentTypeJSON)
+// ablyServerID is this node's identity in error envelopes and the
+// X-Ably-Serverid header — the analogue of the real service's
+// "frontend.<id>.<region>..." values, named so the serving stack is
+// unmistakable (e.g. "centrifugo-adapter.5683e6e9b29318" on fly).
+func ablyServerID() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return "centrifugo-adapter." + host
+}
+
+// ablyCluster mirrors the real service's X-Ably-Cluster header
+// (prod:realtime:main there) with a value that makes the serving stack
+// unmistakable when comparing responses side by side.
+const ablyCluster = "poc:centrifugo-adapter"
+
+// browserErrorPage is served when a browser (Accept: text/html) lands on
+// an API error — the same courtesy page the real service shows at
+// realtime.ably.io, with the PoC's provenance stated plainly.
+const browserErrorPage = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Ably-protocol endpoint</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #f4f4f5; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #18181b; }
+  .card { background: #fff; border-radius: 12px; padding: 48px; max-width: 560px; margin: 24px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .mark { width: 56px; height: 56px; border-radius: 12px; background: #18181b; color: #ff2d2d;
+          display: flex; align-items: center; justify-content: center; font-size: 28px; margin-bottom: 28px; }
+  h1 { font-size: 28px; line-height: 1.25; margin: 0 0 20px; font-weight: 700; }
+  p { font-size: 15px; line-height: 1.6; margin: 0 0 14px; color: #3f3f46; }
+  a { color: #2563eb; }
+  .prov { font-size: 13px; color: #71717a; border-top: 1px solid #e4e4e7; padding-top: 14px; margin-top: 22px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="mark">&#9650;</div>
+  <h1>Let's get you to the right place</h1>
+  <p>This is an API endpoint designed for requests, not web browsing.</p>
+  <p>Read more about Ably API request formats <a href="https://ably.com/docs/api/rest-api">in the Docs</a>.</p>
+  <p class="prov">Served by the <strong>Ably-on-Centrifugo PoC adapter</strong> &mdash; an
+  Ably-protocol-compatible server built on Centrifugo, not the Ably service.</p>
+</div>
+</body>
+</html>`
+
+func (h *Handler) writeError(rw http.ResponseWriter, r *http.Request, statusCode int, code int, message string) {
+	// The real service appends a help pointer to every error message and
+	// carries href/nonfatal/serverId in the envelope (verified against
+	// realtime.ably.io) — same shape here, with serverId/cluster values
+	// that say plainly which stack answered.
+	href := "https://help.ably.io/error/" + strconv.Itoa(code)
+	full := strings.TrimSuffix(message, ".") + ". (See " + href + " for help.)"
 	rw.Header().Set("X-Ably-Errorcode", strconv.Itoa(code))
-	rw.Header().Set("X-Ably-Errormessage", message)
+	rw.Header().Set("X-Ably-Errormessage", sanitizeHeaderValue(full))
+	rw.Header().Set("X-Ably-Serverid", h.serverID)
+	rw.Header().Set("X-Ably-Cluster", ablyCluster)
+	rw.Header().Set("X-Robots-Tag", "noindex")
 	rw.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
+	if r != nil && strings.Contains(r.Header.Get("Accept"), "text/html") {
+		// A human in a browser: the courtesy page, with the error status
+		// preserved for anything inspecting it.
+		rw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		rw.WriteHeader(statusCode)
+		_, _ = rw.Write([]byte(browserErrorPage))
+		return
+	}
+	rw.Header().Set("Content-Type", contentTypeJSON)
 	rw.WriteHeader(statusCode)
-	body := `{"error":{"message":` + strconv.Quote(message) +
+	// jsonQuote, not strconv.Quote: Go quoting emits \x escapes JSON
+	// parsers reject, and the message can carry request-derived bytes
+	// (the path lands in "Could not find path: …").
+	body := `{"error":{"message":` + jsonQuote(full) +
 		`,"code":` + strconv.Itoa(code) +
-		`,"statusCode":` + strconv.Itoa(statusCode) + `}}`
+		`,"statusCode":` + strconv.Itoa(statusCode) +
+		`,"nonfatal":false` +
+		`,"href":` + jsonQuote(href) +
+		`,"serverId":` + jsonQuote(h.serverID) + `}}`
 	_, _ = rw.Write([]byte(body))
+}
+
+// jsonQuote renders s as a JSON string literal. Unlike strconv.Quote it
+// never emits Go-only escapes (\x01, \a) and replaces invalid UTF-8
+// with U+FFFD — always-valid JSON for request-derived input.
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s) // marshaling a string cannot fail
+	return string(b)
+}
+
+// sanitizeHeaderValue blanks control bytes out of a header value:
+// net/http would reject or mangle them, and request-derived text (URL
+// paths) can carry them.
+func sanitizeHeaderValue(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return ' '
+		}
+		return r
+	}, s)
 }
