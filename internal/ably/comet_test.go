@@ -131,3 +131,126 @@ func TestCometConnectRejectsMsgpack(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	require.Equal(t, "40000", resp.Header.Get("X-Ably-Errorcode"))
 }
+
+// cometSend POSTs a frame batch to /comet/<key>/send.
+func cometSend(t *testing.T, ts *realtimeTestServer, key string, frames string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, ts.srv.URL+"/comet/"+key+"/send", strings.NewReader(frames))
+	require.NoError(t, err)
+	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
+	req.Header.Set("Content-Type", contentTypeJSON)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+// recvUntil polls /recv until a frame matching the predicate arrives
+// (collecting across heartbeat-completed batches) or the deadline hits.
+func recvUntil(t *testing.T, ts *realtimeTestServer, key string, deadline time.Duration, match func(*protocol.ProtocolMessage) bool) *protocol.ProtocolMessage {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		resp := cometGet(t, ts, "/comet/"+key+"/recv")
+		if resp.StatusCode == http.StatusNoContent {
+			continue
+		}
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		for _, m := range decodeCometBatch(t, resp) {
+			if match(m) {
+				return m
+			}
+		}
+	}
+	t.Fatal("expected frame never arrived over comet recv")
+	return nil
+}
+
+// The full lifecycle over comet: attach, publish (ACK + echo), clean
+// close delivering CLOSED — the C3 surface end to end.
+func TestCometSendAttachPublishClose(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	key := cometConnect(t, ts)
+
+	// ATTACH via send; ATTACHED rides recv.
+	resp := cometSend(t, ts, key, `[{"action":10,"channel":"comet-life"}]`)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	attached := recvUntil(t, ts, key, 5*time.Second, func(m *protocol.ProtocolMessage) bool {
+		return m.Action == protocol.ActionAttached
+	})
+	require.Equal(t, "comet-life", attached.Channel)
+
+	// Publish via send; the ACK and the echoed MESSAGE ride recv.
+	resp = cometSend(t, ts, key, `[{"action":15,"channel":"comet-life","msgSerial":0,"messages":[{"name":"ev","data":"over-comet"}]}]`)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	sawAck, sawMsg := false, false
+	recvUntil(t, ts, key, 5*time.Second, func(m *protocol.ProtocolMessage) bool {
+		switch m.Action {
+		case protocol.ActionAck:
+			sawAck = true
+		case protocol.ActionMessage:
+			require.Equal(t, "comet-life", m.Channel)
+			require.Equal(t, "ev", m.Messages[0].Name)
+			sawMsg = true
+		}
+		return sawAck && sawMsg
+	})
+
+	// Clean close: a recv parked BEFORE the close deterministically
+	// receives the terminal CLOSED (flushLocked completes it when the
+	// CLOSE-injected reply is buffered), and the key dies — 410.
+	closedCh := make(chan bool, 1)
+	go func() {
+		resp := cometGet(t, ts, "/comet/"+key+"/recv")
+		if resp.StatusCode != http.StatusOK {
+			closedCh <- false
+			return
+		}
+		for _, m := range decodeCometBatch(t, resp) {
+			if m.Action == protocol.ActionClosed {
+				closedCh <- true
+				return
+			}
+		}
+		closedCh <- false
+	}()
+	time.Sleep(300 * time.Millisecond) // let the recv park
+	respClose := cometGet(t, ts, "/comet/"+key+"/close")
+	require.Equal(t, http.StatusNoContent, respClose.StatusCode)
+	select {
+	case got := <-closedCh:
+		require.True(t, got, "the parked recv must deliver the terminal CLOSED")
+	case <-time.After(5 * time.Second):
+		t.Fatal("parked recv never completed after close")
+	}
+	require.Eventually(t, func() bool {
+		return cometGet(t, ts, "/comet/"+key+"/recv").StatusCode == http.StatusGone
+	}, 5*time.Second, 100*time.Millisecond, "closed session's key must die")
+}
+
+// /disconnect ends the session abruptly: presence grace semantics, key
+// gone, 204 even when repeated (closing a dead transport is success).
+func TestCometDisconnect(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	key := cometConnect(t, ts)
+
+	resp := cometGet(t, ts, "/comet/"+key+"/disconnect")
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	require.Eventually(t, func() bool {
+		return cometGet(t, ts, "/comet/"+key+"/recv").StatusCode == http.StatusGone
+	}, 5*time.Second, 100*time.Millisecond)
+	// Repeat disconnect on the dead key: still 204.
+	resp = cometGet(t, ts, "/comet/"+key+"/disconnect")
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+}
+
+func TestCometSendValidation(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+	key := cometConnect(t, ts)
+	resp := cometSend(t, ts, key, `{"not":"an array"}`)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Equal(t, "40000", resp.Header.Get("X-Ably-Errorcode"))
+}

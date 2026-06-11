@@ -276,13 +276,11 @@ func TestCORSPreflightAndExposedHeaders(t *testing.T) {
 	require.Contains(t, resp3.Header.Get("Access-Control-Expose-Headers"), "X-Ably-ErrorCode")
 }
 
-// Comet error contracts that survive the real transport landing (C2):
-// invalid credentials on /comet/connect get the coded 40101 envelope
-// (RTN14a — a coded envelope from connect fails the SDK connection
-// fatally, exactly right for bad creds), while the ops not yet
-// implemented (send — C3) keep the envelope-free 501 so SDK transport
-// trials soft-drop rather than hard-fail. Full connect/recv behavior:
-// comet_test.go.
+// Comet error contracts: invalid credentials on /comet/connect get the
+// coded 40101 envelope (RTN14a — a coded envelope from connect fails
+// the SDK connection fatally, exactly right for bad creds); per-key ops
+// on unknown keys are 410/80016 (nonfatal transport death — the SDK
+// reconnects fresh). Full transport behavior: comet_test.go.
 func TestCometErrorContracts(t *testing.T) {
 	t.Parallel()
 	h := newTestHandler(t)
@@ -298,17 +296,14 @@ func TestCometErrorContracts(t *testing.T) {
 	require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	require.Equal(t, "40101", resp.Header.Get("X-Ably-Errorcode"))
 
-	req, err = http.NewRequest(http.MethodPost, srv.URL+"/comet/somekey/send", strings.NewReader("[]"))
+	req, err = http.NewRequest(http.MethodPost, srv.URL+"/comet/nosuch!key/send", strings.NewReader("[]"))
 	require.NoError(t, err)
 	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
 	resp2, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp2.Body.Close() }()
-	require.Equal(t, http.StatusNotImplemented, resp2.StatusCode)
-	require.Empty(t, resp2.Header.Get("X-Ably-Errorcode"))
-	body, err := io.ReadAll(resp2.Body)
-	require.NoError(t, err)
-	require.NotContains(t, string(body), `"error"`, "no Ably error envelope")
+	require.Equal(t, http.StatusGone, resp2.StatusCode)
+	require.Equal(t, "80016", resp2.Header.Get("X-Ably-Errorcode"))
 }
 
 // The adapter enabled without a keys file is a startup error: it cannot

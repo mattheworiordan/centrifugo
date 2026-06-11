@@ -408,6 +408,13 @@ func (s *session) handleFrame(m *protocol.ProtocolMessage) bool {
 		s.closeMu.Unlock()
 		_ = s.writeFrame(&protocol.ProtocolMessage{Action: protocol.ActionClosed})
 		return false
+	case protocol.ActionDisconnect:
+		// The comet front's /disconnect injects this (transport disposal
+		// without closing the CONNECTION): end the session WITHOUT clean-
+		// close semantics — presence grace runs as for an abruptly
+		// dropped socket, and the client may resume. No reply frame (the
+		// client does not read one).
+		return false
 	default:
 		// PRESENCE, SYNC and AUTH handling lands in later milestones.
 		log.Warn().Int("action", int(m.Action)).Str("transport", transportName).Msg("unhandled inbound action")

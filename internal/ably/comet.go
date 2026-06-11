@@ -24,6 +24,8 @@ package ably
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -210,9 +212,8 @@ func (c *cometConn) close() error {
 // --- HTTP front ---
 
 // serveComet routes the /comet/* family: /comet/connect establishes a
-// session; per-key paths address it between requests. send/close/
-// disconnect land in C3 — until then they answer the envelope-free 501
-// decline (a code-less error soft-drops the comet candidate).
+// session; the per-key paths (recv/send/close/disconnect) address it
+// between requests via the registry's connectionKey index.
 func (h *Handler) serveComet(rw http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/comet/")
 	if rest == "connect" {
@@ -227,18 +228,91 @@ func (h *Handler) serveComet(rw http.ResponseWriter, r *http.Request) {
 	switch op {
 	case "recv":
 		h.serveCometRecv(rw, r, key)
-	case "send", "close", "disconnect":
-		// C3. The envelope-free decline keeps SDK transport trials soft.
-		if _, authErr := h.authenticate(r); authErr != nil {
-			h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
-			return
-		}
-		rw.Header().Set("Content-Type", "text/plain")
-		rw.WriteHeader(http.StatusNotImplemented)
-		_, _ = rw.Write([]byte("comet " + op + " is not implemented yet"))
+	case "send":
+		h.serveCometSend(rw, r, key)
+	case "close":
+		h.serveCometClose(rw, r, key, protocol.ActionClose)
+	case "disconnect":
+		h.serveCometClose(rw, r, key, protocol.ActionDisconnect)
 	default:
 		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "Could not find path: "+r.URL.Path)
 	}
+}
+
+// serveCometSend implements POST /comet/<key>/send: the client→server
+// half of the transport. The body is a JSON ARRAY of ProtocolMessages
+// (the SDK batches; one in-flight send at a time). Frames are fed IN
+// ORDER to the session's inbound channel — the run loop stays the sole
+// frame dispatcher, exactly as for WS — and the response is always 204:
+// ACKs/NACKs and every other server frame ride the recv channel (the
+// SDK feeds a nonempty send response through the same path, but 204 is
+// the simpler contract the production service settled on).
+func (h *Handler) serveCometSend(rw http.ResponseWriter, r *http.Request, key string) {
+	if _, authErr := h.authenticate(r); authErr != nil {
+		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
+		return
+	}
+	_, cc, ok := h.cometSession(rw, r, key)
+	if !ok {
+		return
+	}
+	// The WS read limit's comet analogue (CD2d): cap the send body.
+	body, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, maxFrameSize))
+	if err != nil {
+		h.writeError(rw, r, http.StatusRequestEntityTooLarge, 40000, "send body too large")
+		return
+	}
+	var frames []*protocol.ProtocolMessage
+	if err := json.Unmarshal(body, &frames); err != nil {
+		h.writeError(rw, r, http.StatusBadRequest, 40000, "invalid send body: expected a JSON array of protocol messages")
+		return
+	}
+	for _, m := range frames {
+		if m == nil {
+			continue
+		}
+		if err := cc.feed(r.Context(), m); err != nil {
+			// The session died mid-batch: the client's next request gets
+			// the terminal frame from recv or a 410 — same as production.
+			h.writeError(rw, r, http.StatusGone, 80016, "Unable to find connection "+key)
+			return
+		}
+	}
+	rw.WriteHeader(http.StatusNoContent)
+}
+
+// serveCometClose implements GET /comet/<key>/close (clean close: the
+// session replies CLOSED and leaves presence immediately) and
+// /disconnect (transport disposal: presence grace runs, the client may
+// resume). Either action is injected as an inbound frame so the run
+// loop processes it with full ordering guarantees, then the response
+// waits briefly for teardown — the client treats any 2xx as done and
+// never reads a body.
+func (h *Handler) serveCometClose(rw http.ResponseWriter, r *http.Request, key string, action protocol.Action) {
+	if _, authErr := h.authenticate(r); authErr != nil {
+		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
+		return
+	}
+	sess := h.registry.lookupKey(key)
+	if sess == nil {
+		// Already gone — closing a dead transport is success, not error
+		// (the SDK calls disconnect on dispose paths where the server may
+		// have reaped first).
+		rw.WriteHeader(http.StatusNoContent)
+		return
+	}
+	cc, ok := sess.conn.(*cometConn)
+	if !ok {
+		rw.WriteHeader(http.StatusNoContent)
+		return
+	}
+	_ = cc.feed(r.Context(), &protocol.ProtocolMessage{Action: action})
+	select {
+	case <-cc.closeCh:
+	case <-time.After(5 * time.Second):
+	case <-r.Context().Done():
+	}
+	rw.WriteHeader(http.StatusNoContent)
 }
 
 // cometSession resolves a per-key comet request to its live session.
