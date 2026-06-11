@@ -807,6 +807,19 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 			count := int(cursor - low)
 			pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(count),
 				centrifuge.WithSince(&centrifuge.StreamPosition{Offset: low - 1, Epoch: cursorEpoch}))
+			// Partial eviction makes WithSince resume from the oldest
+			// RETAINED publication, which can sit at/after the cursor —
+			// without truncation the page re-serves what the previous
+			// page already delivered and the cursor never advances (an
+			// infinite Link walk on size-evicted streams). Everything
+			// at/after the cursor is outside the requested window.
+			kept := pubs[:0]
+			for _, pub := range pubs {
+				if pub.Offset < cursor {
+					kept = append(kept, pub)
+				}
+			}
+			pubs = kept
 			reversePubs(pubs)
 		} else {
 			pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(limit),
@@ -822,6 +835,16 @@ func (h *Handler) serveRESTHistory(rw http.ResponseWriter, r *http.Request, chan
 		count := int(boundOffset - low + 1)
 		pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(count),
 			centrifuge.WithSince(&centrifuge.StreamPosition{Offset: low - 1, Epoch: boundEpoch}))
+		// Same partial-eviction truncation as the cursor window above:
+		// only publications at/below the attach-point bound belong to
+		// this page.
+		kept := pubs[:0]
+		for _, pub := range pubs {
+			if pub.Offset <= boundOffset {
+				kept = append(kept, pub)
+			}
+		}
+		pubs = kept
 		reversePubs(pubs)
 	} else {
 		pubs, epoch, err = h.historyPubs(readChannel, centrifuge.WithLimit(limit), centrifuge.WithReverse(backwards))

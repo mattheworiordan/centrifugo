@@ -108,7 +108,12 @@
     filtered-out publications still consume page capacity.
 23. **untilAttach pagination re-resolves from_serial per page**: if the
     attach-point publication is evicted mid-walk, pagination ends early with
-    an empty page.
+    an empty page. Backwards pages over a partially size-evicted window are
+    truncated at the cursor (otherwise the broker's oldest-retained fallback
+    would re-serve the previous page forever); a FORWARDS read whose cursor
+    offset was evicted silently skips ahead to the oldest retained
+    publication — a gap, where real Ably's persistent storage would still
+    have the messages.
 24. **Client-supplied non-zero publish timestamps are honored** (SDKs never
     send them); they could distort time-window rewind scans.
 25. **Batch publish (`POST /messages`) msgpack bodies** normalize through a

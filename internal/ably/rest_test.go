@@ -361,3 +361,54 @@ func TestRESTPresence(t *testing.T) {
 	require.Len(t, members, 1)
 	require.Equal(t, "live-carol", members[0].ClientID)
 }
+
+// Retention tiers: mutable-messages channels (mutable:/ai:) keep the
+// persisted tier, not the ephemeral one — AIT late-join hydration reads
+// channel history, so an ai: conversation must outlive the ephemeral
+// window (caught live: a second demo tab found no backlog once the 2-min
+// TTL passed). The size cap distinguishes the tiers without waiting on
+// TTL: ephemeral retains 100, persisted 1000.
+func TestRetentionTierByChannelConvention(t *testing.T) {
+	t.Parallel()
+	ts := newRealtimeServer(t)
+
+	const n = 120 // above the ephemeral cap, below the persisted one
+	publish := func(channel string) {
+		t.Helper()
+		var batch []map[string]any
+		for i := 0; i < n; i++ {
+			batch = append(batch, map[string]any{"name": fmt.Sprintf("m%03d", i)})
+		}
+		body, err := json.Marshal(batch)
+		require.NoError(t, err)
+		resp := restRequest(t, ts, http.MethodPost, "/channels/"+url.PathEscape(channel)+"/messages",
+			body, map[string]string{"Content-Type": contentTypeJSON})
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+	}
+	count := func(channel string) int {
+		t.Helper()
+		total := 0
+		path := "/channels/" + url.PathEscape(channel) + "/messages?limit=100&direction=backwards"
+		for page := 0; ; page++ {
+			resp := restRequest(t, ts, http.MethodGet, path, nil, nil)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			items := decodeMessagesBody(t, resp)
+			total += len(items)
+			next := nextLinkQuery(t, resp)
+			t.Logf("%s page%d: items=%d next=%q", channel, page, len(items), next)
+			require.Less(t, page, 5, "pagination must terminate")
+			if next == "" || len(items) == 0 {
+				return total
+			}
+			path = "/channels/" + url.PathEscape(channel) + "/messages?" + next
+		}
+	}
+
+	for _, channel := range []string{"ai:tier", "mutable:tier", "persisted:tier"} {
+		publish(channel)
+		require.Equal(t, n, count(channel), "%s retains the full backlog (persisted tier)", channel)
+	}
+	publish("plain-tier")
+	require.Equal(t, ephemeralHistorySize, count("plain-tier"),
+		"unprefixed channels keep the ephemeral cap")
+}

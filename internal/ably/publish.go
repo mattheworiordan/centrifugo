@@ -65,6 +65,18 @@ func mutableChannel(name string) bool {
 	return strings.HasPrefix(name, "mutable:") || strings.HasPrefix(name, "ai:")
 }
 
+// persistentChannel reports whether the channel gets the long-term
+// retention tier. Mutable-messages channels are persisted alongside the
+// persisted: namespace: AIT session resume and late-join hydration read
+// channel history (load-history/load-conversation in the SDK), so a
+// second tab opening an ai: conversation after the ephemeral 2-minute
+// window must still find the backlog — this is the multi-client sync
+// the use-chat demo advertises. (The materialized mutation store never
+// evicts; this aligns raw history retention with it.)
+func persistentChannel(name string) bool {
+	return strings.HasPrefix(name, persistedNamespacePrefix) || mutableChannel(name)
+}
+
 // validChannelName reports whether name is acceptable as an Ably channel
 // name. Empty names and names beginning with ':' are invalid (error code
 // 40010; pinned by ably-js channelattachempty/channelattachinvalid). The
@@ -231,7 +243,7 @@ func publishOptions(channel string, originConnectionID string, channelSerial str
 	if len(tags) > 0 {
 		opts = append(opts, centrifuge.WithTags(tags))
 	}
-	if strings.HasPrefix(channel, persistedNamespacePrefix) {
+	if persistentChannel(channel) {
 		opts = append(opts, centrifuge.WithHistory(persistedHistorySize, persistedHistoryTTL))
 	} else {
 		opts = append(opts, centrifuge.WithHistory(ephemeralHistorySize, ephemeralHistoryTTL))
