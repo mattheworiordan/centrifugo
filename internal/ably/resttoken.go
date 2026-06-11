@@ -228,12 +228,22 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// nonceSweepInterval bounds how often use() performs a full expiry sweep
+// (B4/M4): at most once per interval, so a burst of N distinct nonces costs
+// O(N) total work rather than O(N²) (the old code swept the whole map on
+// every call). Correctness does not depend on the sweep — use() checks each
+// nonce's freshness exactly on access — so the sweep is pure memory
+// reclamation and can run lazily.
+const nonceSweepInterval = 2 * timestampTolerance
+
 // nonceCache rejects nonce reuse within the timestamp tolerance window —
 // together with the timestamp check this bounds replay of a captured
 // signed TokenRequest.
 type nonceCache struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
+	mu        sync.Mutex
+	seen      map[string]time.Time
+	lastSweep time.Time
+	sweeps    int // count of full sweeps performed (test observability)
 }
 
 func newNonceCache() *nonceCache {
@@ -241,19 +251,32 @@ func newNonceCache() *nonceCache {
 }
 
 // use records the nonce, reporting false when it was already used within
-// the window. Expired entries are evicted lazily on each call.
+// the tolerance window. Freshness is checked per-access (so a stale entry
+// not yet swept never causes a false replay-reject); a bounded periodic
+// sweep reclaims expired entries without scanning the map on every call.
 func (c *nonceCache) use(nonce string) bool {
 	now := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.sweepLocked(now)
+	if t, seen := c.seen[nonce]; seen && now.Sub(t) <= 2*timestampTolerance {
+		return false // replay within the window
+	}
+	c.seen[nonce] = now
+	return true
+}
+
+// sweepLocked reclaims expired entries at most once per nonceSweepInterval,
+// amortizing the O(n) scan to O(1) per use() across a burst (B4/M4).
+func (c *nonceCache) sweepLocked(now time.Time) {
+	if !c.lastSweep.IsZero() && now.Sub(c.lastSweep) < nonceSweepInterval {
+		return
+	}
+	c.lastSweep = now
+	c.sweeps++
 	for n, t := range c.seen {
 		if now.Sub(t) > 2*timestampTolerance {
 			delete(c.seen, n)
 		}
 	}
-	if _, dup := c.seen[nonce]; dup {
-		return false
-	}
-	c.seen[nonce] = now
-	return true
 }
