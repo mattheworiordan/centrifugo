@@ -429,6 +429,11 @@ func (h *Handler) serveBatchPresence(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	channels := strings.Split(channelsParam, ",")
+	// C4: bound the per-request channel fan-out (each is a presence lookup).
+	if len(channels) > maxBatchTotalChannels {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "too many channels in batch request")
+		return
+	}
 	format := responseFormat(r)
 	results := make([]any, 0, len(channels))
 	successCount, failureCount := 0, 0
@@ -464,6 +469,15 @@ func (h *Handler) serveBatchPresence(rw http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Batch request caps (C4): a batch request must not fan out into an
+// unbounded number of per-channel decodes + publish locks. The pinned
+// suites use a handful of channels/specs; these bounds are far above any
+// real batch while rejecting an abusive one (40000).
+const (
+	maxBatchSpecs         = 100 // specs in the RSC22 array form
+	maxBatchTotalChannels = 100 // channels summed across the whole request
+)
+
 // batchPublishSpec is one RSC22 BatchPublishSpec.
 type batchPublishSpec struct {
 	Channels []string        `json:"channels"`
@@ -479,6 +493,19 @@ func (h *Handler) serveBatchSpecs(rw http.ResponseWriter, r *http.Request, ident
 	var specs []batchPublishSpec
 	if err := json.Unmarshal(body, &specs); err != nil || len(specs) == 0 {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body")
+		return
+	}
+	// C4: bound the request's total fan-out (specs and summed channels).
+	if len(specs) > maxBatchSpecs {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "too many batch specs")
+		return
+	}
+	totalChannels := 0
+	for _, spec := range specs {
+		totalChannels += len(spec.Channels)
+	}
+	if totalChannels > maxBatchTotalChannels {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "too many channels in batch request")
 		return
 	}
 	out := make([]any, 0, len(specs))
@@ -611,6 +638,11 @@ func (h *Handler) serveBatchPublish(rw http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.Unmarshal(body, &req); err != nil || len(req.Channels) == 0 {
 		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "invalid batch body")
+		return
+	}
+	// C4: bound the request's fan-out.
+	if len(req.Channels) > maxBatchTotalChannels {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "too many channels in batch request")
 		return
 	}
 	rawMessages := strings.TrimSpace(string(req.Messages))
