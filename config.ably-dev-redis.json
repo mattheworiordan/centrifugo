@@ -1,0 +1,62 @@
+{
+  "ably": {
+    "enabled": true,
+    "keys_file": ".working/ably-centrifugo-poc/harness/static-app.json"
+  },
+  "engine": {
+    "type": "redis",
+    "redis": {
+      "address": ["redis://127.0.0.1:6399"]
+    }
+  },
+  "http_server": {
+    "port": 8049
+  },
+  "channel": {
+    "without_namespace": {
+      "presence": true,
+      "history_size": 100,
+      "history_ttl": "300s",
+      "allow_subscribe_for_client": true,
+      "allow_tags_filter": true,
+      "allow_recovery": true
+    },
+    "namespaces": [
+      {
+        "presence": true,
+        "history_size": 1000,
+        "history_ttl": "24h",
+        "allow_subscribe_for_client": true,
+        "allow_tags_filter": true,
+        "allow_recovery": true,
+        "name": "persisted"
+      },
+      {
+        "presence": true,
+        "history_size": 1000,
+        "history_ttl": "24h",
+        "allow_subscribe_for_client": true,
+        "allow_tags_filter": true,
+        "allow_recovery": true,
+        "name": "mutable"
+      },
+      {
+        "presence": true,
+        "history_size": 1000,
+        "history_ttl": "24h",
+        "allow_subscribe_for_client": true,
+        "allow_tags_filter": true,
+        "allow_recovery": true,
+        "name": "ai"
+      }
+    ]
+  },
+  "log": {
+    "level": "debug"
+  },
+  "client": {
+    "allowed_origins": [
+      "*"
+    ]
+  }
+}

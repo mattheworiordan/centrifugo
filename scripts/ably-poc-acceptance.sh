@@ -16,11 +16,29 @@ CONFIG="$ROOT/tmp/ably-poc-acceptance.json"
 
 [ -d "$ABLY_JS/node_modules" ] || { echo "missing $ABLY_JS (pinned ably-js checkout with node_modules)"; exit 1; }
 
+# REDIS=1 runs the SAME sweep against the Redis engine (D2). centrifuge's
+# Redis broker uses Lua + streams, so a REAL Redis is required (miniredis
+# cannot emulate it). If Redis is unreachable at the configured address the
+# gate SKIPS cleanly (exit 0) rather than failing — the memory-engine gate
+# is the default. Bring Redis up with: docker compose -f deploy/ably-poc/docker-compose.yml up -d redis
+SRC_CONFIG="$ROOT/config.ably-dev.json"
+REDIS_ADDR="127.0.0.1:6399"
+if [ "${REDIS:-0}" = "1" ]; then
+	SRC_CONFIG="$ROOT/config.ably-dev-redis.json"
+	echo "REDIS=1: running the acceptance sweep against the Redis engine ($REDIS_ADDR)"
+	if ! (exec 3<>"/dev/tcp/${REDIS_ADDR%:*}/${REDIS_ADDR##*:}") 2>/dev/null; then
+		echo "Redis not reachable at $REDIS_ADDR — start it (docker compose -f deploy/ably-poc/docker-compose.yml up -d redis) then re-run."
+		echo "ABLY-POC ACCEPTANCE: SKIPPED (Redis engine, no Redis)"
+		exit 0
+	fi
+fi
+
 mkdir -p "$ROOT/tmp"
 go build -o "$ROOT/tmp/centrifugo-ably" "$ROOT"
 
-# Port-derived config: the dev profile with the acceptance port.
-python3 - "$ROOT/config.ably-dev.json" "$CONFIG" "$PORT" << 'PYEOF'
+# Port-derived config: the selected profile (memory or redis) with the
+# acceptance port.
+python3 - "$SRC_CONFIG" "$CONFIG" "$PORT" << 'PYEOF'
 import json, sys
 src, dst, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 c = json.load(open(src))

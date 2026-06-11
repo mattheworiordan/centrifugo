@@ -4,8 +4,10 @@ centrifugo
 /config.*.yaml
 /config.json
 /config.*.json
-# The Ably adapter dev profile is part of the repo (used by `make ably-dev`).
+# The Ably adapter dev profiles are part of the repo (used by `make ably-dev`
+# and the WP-D Redis engine: REDIS=1 ./scripts/ably-poc-acceptance.sh).
 !/config.ably-dev.json
+!/config.ably-dev-redis.json
 /config.toml
 /config.*.toml
 BUILDS

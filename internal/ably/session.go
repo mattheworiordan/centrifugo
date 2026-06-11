@@ -1576,7 +1576,16 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			}
 			s.connected <- err
 		case opSubscribe:
-			if reply.Error != nil {
+			// "already subscribed" (105) is treated as SUCCESS, not an attach
+			// error (D2). Two rapid ATTACHes for one channel both pass attach()'s
+			// alreadyAttached check when the first opSubscribe reply (which sets
+			// attachedModes) has not landed yet — harmless on the memory engine
+			// (replies are synchronous) but real on Redis, where the reply lags
+			// and the second Subscribe returns 105. The client IS subscribed (the
+			// desired state), so confirm ATTACHED; failing the channel here would
+			// drive it to FAILED and abandon the live subscription. The 105 reply
+			// carries no reply.Subscribe, so recovery/replay below is nil-guarded.
+			if reply.Error != nil && reply.Error.Code != centrifuge.ErrorAlreadySubscribed.Code {
 				s.writeAttachError(op.channel, reply.Error)
 				return
 			}

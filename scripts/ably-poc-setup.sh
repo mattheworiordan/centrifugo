@@ -43,3 +43,5 @@ if [ ! -f "$PINNED/build/ably-node.js" ]; then
 fi
 
 echo "==> done. Run: make ably-poc-test"
+echo "    (optional) Redis engine (WP-D): docker compose -f deploy/ably-poc/docker-compose.yml up -d redis"
+echo "               then: REDIS=1 ./scripts/ably-poc-acceptance.sh"

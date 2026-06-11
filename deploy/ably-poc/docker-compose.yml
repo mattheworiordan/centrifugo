@@ -1,0 +1,26 @@
+# Local Redis for the Ably-on-Centrifugo PoC's Redis engine (WP-D).
+#
+# Brings up a single Redis on host port 6399 (deliberately NOT the default
+# 6379, to avoid clobbering any Redis you already run). config.ably-dev-redis.json
+# and the REDIS=1 acceptance gate both point at 127.0.0.1:6399.
+#
+#   docker compose -f deploy/ably-poc/docker-compose.yml up -d redis
+#   REDIS=1 ./scripts/ably-poc-acceptance.sh
+#   docker compose -f deploy/ably-poc/docker-compose.yml down
+#
+# maxmemory-policy is noeviction: centrifuge's Redis broker keeps channel
+# history in streams keyed by channel; LRU eviction of a stream key (its
+# meta key surviving) is a SILENT continuity gap (see research/11-durable-
+# storage.md, Q7). noeviction makes Redis error on writes when full —
+# detectable, never silently corrupt.
+services:
+  redis:
+    image: redis:7
+    command: ["redis-server", "--maxmemory-policy", "noeviction", "--appendonly", "yes"]
+    ports:
+      - "6399:6379"
+    volumes:
+      - ably-poc-redis-data:/data
+
+volumes:
+  ably-poc-redis-data:
