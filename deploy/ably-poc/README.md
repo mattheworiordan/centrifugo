@@ -35,7 +35,10 @@ flyctl apps create rt-poc-demo
 flyctl secrets set ABLY_KEYS_JSON=- -a rt-poc-demo < /tmp/minted-keys.json
 
 # 4. Build (on fly's remote builders — no local docker needed) + deploy.
-flyctl deploy
+#    --ha=false is REQUIRED: fly otherwise creates a second machine for
+#    high availability, and the PoC's stores are in-memory per-node —
+#    two machines would round-robin requests between two separate worlds.
+flyctl deploy --ha=false
 ```
 
 ### Verify
@@ -95,13 +98,32 @@ done
 npx --yes vercel@latest deploy --prod
 ```
 
-Caveats:
-- **`link:` dependency**: the demo's `package.json` references the local
-  SDK (`link:../../../..`). Vercel's remote build cannot follow that
-  outside the upload root, so deploy from the **ait-pinned repo root**
-  with the project's Root Directory set to `demo/vercel/react/use-chat`
-  (Vercel dashboard → Settings), or vendor the built SDK tarball
-  (`pnpm pack` at the repo root, point the dependency at the `.tgz`).
+Caveats — ALL of these were needed in practice (deployed 2026-06-11 as
+https://rt-poc-chat-demo.vercel.app; the demo working tree in
+`.working/ait-pinned` already carries every change below):
+- **`link:` dependency**: vendor the built SDK tarball — `pnpm pack` at
+  the ait-pinned root, copy the `.tgz` into the demo dir, point the
+  dependency at `file:./ably-ai-transport-0.2.0.tgz`, and remove the
+  `prebuild` script. The demo's `vercel.json` also carried an
+  `installCommand` that escapes the upload root
+  (`cd ../../../.. && pnpm install …`) — replace it with
+  `pnpm install --no-frozen-lockfile`.
+- **`ENABLE_EXPERIMENTAL_COREPACK=1`** (Vercel env var): without it
+  Vercel ignores `packageManager: pnpm@11.3.0` and picks an ancient
+  pnpm that dies on every registry fetch with `ERR_INVALID_THIS`.
+- **pnpm 11 build-script approval**: pnpm 11 errors in CI on ignored
+  build scripts (sharp, unrs-resolver) and no longer reads the `pnpm`
+  field from package.json. Add a demo-local `pnpm-workspace.yaml`:
+  `allowBuilds: { sharp: true, unrs-resolver: true }` (this also bounds
+  the workspace so the ait-pinned root workspace is not consulted).
+- **`.vercelignore`** (`node_modules`, `.next`, test artifacts):
+  guarantees the vendored tarball uploads regardless of gitignore rules.
+- Regenerate the demo's `pnpm-lock.yaml` after the dependency edit
+  (`corepack pnpm@11.3.0 install`) or the remote install fails on the
+  stale lockfile.
+- The repo's `.tool-versions` pins a node version without the global
+  `vercel`; run the CLI as `npx --yes vercel@latest … --cwd <demo-dir>`
+  from outside the demo (its `devEngines` also rejects plain npx inside).
 - `MOCK_LLM=1` keeps the agent deterministic — no AI provider key
   involved.
 - Browser origins: the server config allows `*`, so the Vercel domain
