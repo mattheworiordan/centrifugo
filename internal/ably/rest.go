@@ -1115,6 +1115,12 @@ func (h *Handler) serveChannelDetails(rw http.ResponseWriter, r *http.Request, c
 	})
 }
 
+// corsExposedHeaders lets browser SDKs read pagination and error
+// metadata cross-origin: without exposing Link, ably-js paginated
+// resources silently stop after page one when the API lives on a
+// different origin than the app.
+const corsExposedHeaders = "Link, X-Ably-Errorcode, X-Ably-Errormessage, X-Ably-Serverid"
+
 // writeDocument writes a REST response document in the negotiated format
 // (RSC8c).
 func (h *Handler) writeDocument(rw http.ResponseWriter, r *http.Request, status int, v any) {
@@ -1129,6 +1135,7 @@ func (h *Handler) writeDocument(rw http.ResponseWriter, r *http.Request, status 
 	} else {
 		rw.Header().Set("Content-Type", contentTypeJSON)
 	}
+	rw.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
 	rw.WriteHeader(status)
 	_, _ = rw.Write(data)
 }

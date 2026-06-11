@@ -159,6 +159,48 @@ func TestNotFoundError(t *testing.T) {
 	}
 }
 
+// CORS preflights succeed WITHOUT credentials (browsers strip them from
+// OPTIONS by spec) — a 401 preflight blocks the real request entirely,
+// which broke browser-side history hydration in the deployed demo while
+// every non-browser path worked. REST responses expose Link so paginated
+// resources work cross-origin.
+func TestCORSPreflightAndExposedHeaders(t *testing.T) {
+	t.Parallel()
+	h := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	req, err := http.NewRequest(http.MethodOptions, srv.URL+"/channels/ai%3Apre/messages?limit=10", nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", "https://app.example")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "authorization")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNoContent, resp.StatusCode, "preflight must succeed without credentials")
+	require.Contains(t, resp.Header.Get("Access-Control-Allow-Methods"), "GET")
+
+	// Authenticated REST responses expose the pagination Link header.
+	req, err = http.NewRequest(http.MethodGet, srv.URL+"/channels/plain-pre/messages?limit=10", nil)
+	require.NoError(t, err)
+	req.SetBasicAuth("poc.key0", "secret_key0_0123456789abcdef")
+	resp2, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	require.Contains(t, resp2.Header.Get("Access-Control-Expose-Headers"), "Link")
+
+	// Error responses expose the Ably error headers too.
+	req, err = http.NewRequest(http.MethodGet, srv.URL+"/channels/plain-pre/messages", nil)
+	require.NoError(t, err)
+	resp3, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp3.Body.Close() }()
+	require.Equal(t, http.StatusUnauthorized, resp3.StatusCode)
+	require.Contains(t, resp3.Header.Get("Access-Control-Expose-Headers"), "X-Ably-Errorcode")
+}
+
 // Comet transport probes are declined WITHOUT an Ably error envelope:
 // ably-js fails the whole connection on a coded envelope from
 // /comet/connect but soft-drops the candidate on a code-less error, so

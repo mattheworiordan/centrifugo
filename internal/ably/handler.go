@@ -149,6 +149,19 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		h.serveRealtime(rw, r)
 		return
 	}
+	// CORS preflights MUST succeed without credentials (browsers strip
+	// them from OPTIONS by spec) and MUST get a 2xx, or the browser never
+	// sends the real request — a 401 here silently broke every
+	// cross-origin REST call from web SDKs (history hydration in the
+	// browser demo) while same-origin and non-browser clients worked.
+	// The CORS middleware wrapping this handler has already attached the
+	// Allow-Origin/Allow-Headers/Allow-Credentials headers.
+	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
+		rw.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		rw.Header().Set("Access-Control-Max-Age", "86400")
+		rw.WriteHeader(http.StatusNoContent)
+		return
+	}
 	switch {
 	case r.URL.Path == "/time" && r.Method == http.MethodGet:
 		h.serveTime(rw, r)
@@ -429,6 +442,7 @@ func (h *Handler) writeError(rw http.ResponseWriter, _ *http.Request, statusCode
 	rw.Header().Set("Content-Type", contentTypeJSON)
 	rw.Header().Set("X-Ably-Errorcode", strconv.Itoa(code))
 	rw.Header().Set("X-Ably-Errormessage", message)
+	rw.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
 	rw.WriteHeader(statusCode)
 	body := `{"error":{"message":` + strconv.Quote(message) +
 		`,"code":` + strconv.Itoa(code) +
