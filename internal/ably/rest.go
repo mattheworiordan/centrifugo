@@ -1123,20 +1123,23 @@ func (h *Handler) serveChannelDetails(rw http.ResponseWriter, r *http.Request, c
 const corsExposedHeaders = "Link,Transfer-Encoding,Content-Length,X-Ably-ErrorCode,X-Ably-ErrorMessage,X-Ably-ServerId,X-Ably-Cluster,Server"
 
 // writeDocument writes a REST response document in the negotiated format
-// (RSC8c).
+// (RSC8c). JSON is tab-indented like the real service's REST responses
+// (cosmetic for SDKs, but side-by-side curls read identically).
 func (h *Handler) writeDocument(rw http.ResponseWriter, r *http.Request, status int, v any) {
 	format := responseFormat(r)
-	data, err := protocol.MarshalAny(v, format)
+	var data []byte
+	var err error
+	if format == protocol.FormatMsgpack {
+		data, err = protocol.MarshalAny(v, format)
+		rw.Header().Set("Content-Type", contentTypeMsgPack)
+	} else {
+		data, err = json.MarshalIndent(v, "", "\t")
+		rw.Header().Set("Content-Type", contentTypeJSON)
+	}
 	if err != nil {
 		h.writeError(rw, r, http.StatusInternalServerError, errCodeInternal, "failed to encode response")
 		return
 	}
-	if format == protocol.FormatMsgpack {
-		rw.Header().Set("Content-Type", contentTypeMsgPack)
-	} else {
-		rw.Header().Set("Content-Type", contentTypeJSON)
-	}
-	rw.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
 	rw.WriteHeader(status)
 	_, _ = rw.Write(data)
 }

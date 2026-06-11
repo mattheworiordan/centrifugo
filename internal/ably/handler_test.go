@@ -174,6 +174,33 @@ func TestNotFoundError(t *testing.T) {
 	require.Contains(t, envelope.Error.Message, "Could not find path")
 }
 
+// Successful responses carry the same identity/CORS surface as the real
+// service (verified against realtime.ably.io /time): constant
+// Allow-Origin `*` (not the middleware's origin echo), no credentials
+// flag, exposed headers, Vary: Origin, serverId and cluster — so success
+// and error responses are equally identifiable, and JSON bodies are
+// tab-indented like the service's.
+func TestSuccessResponseSurface(t *testing.T) {
+	t.Parallel()
+	h := newTestHandler(t)
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/time")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
+	require.Empty(t, resp.Header.Get("Access-Control-Allow-Credentials"))
+	require.Contains(t, resp.Header.Get("Access-Control-Expose-Headers"), "X-Ably-ServerId")
+	require.Equal(t, "Origin", resp.Header.Get("Vary"))
+	require.Contains(t, resp.Header.Get("X-Ably-Serverid"), "centrifugo-adapter.")
+	require.Equal(t, ablyCluster, resp.Header.Get("X-Ably-Cluster"))
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Regexp(t, `^\[\n\t\d+\n\]$`, string(body), "tab-indented JSON array like the real service")
+}
+
 // A browser landing on an API error (Accept: text/html) gets the
 // courtesy page — like realtime.ably.io — with the error status
 // preserved and the Centrifugo provenance stated.

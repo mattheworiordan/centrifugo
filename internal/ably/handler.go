@@ -151,13 +151,28 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		h.serveRealtime(rw, r)
 		return
 	}
+	// Every REST response carries the same identity and CORS surface the
+	// real service does (verified against realtime.ably.io /time):
+	// Allow-Origin is a constant `*` — overriding the centrifugo CORS
+	// middleware's origin echo, which emits an EMPTY header to clients
+	// that send no Origin — with the credentials flag dropped (`*` plus
+	// credentials is an invalid CORS combination; Ably uses header auth,
+	// not cookies). Serverid/Cluster on every response make the serving
+	// stack identifiable on success, not just on errors.
+	hdr := rw.Header()
+	hdr.Set("Access-Control-Allow-Origin", "*")
+	hdr.Del("Access-Control-Allow-Credentials")
+	hdr.Set("Access-Control-Expose-Headers", corsExposedHeaders)
+	hdr.Set("Vary", "Origin")
+	hdr.Set("X-Ably-Serverid", h.serverID)
+	hdr.Set("X-Ably-Cluster", ablyCluster)
 	// CORS preflights MUST succeed without credentials (browsers strip
 	// them from OPTIONS by spec) and MUST get a 2xx, or the browser never
 	// sends the real request — a 401 here silently broke every
 	// cross-origin REST call from web SDKs (history hydration in the
 	// browser demo) while same-origin and non-browser clients worked.
-	// The CORS middleware wrapping this handler has already attached the
-	// Allow-Origin/Allow-Headers/Allow-Credentials headers.
+	// Allow-Origin comes from the common block above; Allow-Headers is
+	// echoed by the wrapping CORS middleware.
 	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 		rw.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		rw.Header().Set("Access-Control-Max-Age", "86400")
@@ -419,8 +434,7 @@ func (h *Handler) serveTime(rw http.ResponseWriter, r *http.Request) {
 		_, _ = rw.Write(body)
 		return
 	}
-	rw.Header().Set("Content-Type", contentTypeJSON)
-	_, _ = rw.Write([]byte("[" + strconv.FormatInt(now, 10) + "]"))
+	h.writeDocument(rw, r, http.StatusOK, []int64{now})
 }
 
 // responseFormat picks the REST response encoding: the format query param
@@ -500,12 +514,11 @@ func (h *Handler) writeError(rw http.ResponseWriter, r *http.Request, statusCode
 	// that say plainly which stack answered.
 	href := "https://help.ably.io/error/" + strconv.Itoa(code)
 	full := strings.TrimSuffix(message, ".") + ". (See " + href + " for help.)"
+	// Identity/CORS headers are applied for every response in ServeHTTP;
+	// only the error-specific ones are added here.
 	rw.Header().Set("X-Ably-Errorcode", strconv.Itoa(code))
 	rw.Header().Set("X-Ably-Errormessage", sanitizeHeaderValue(full))
-	rw.Header().Set("X-Ably-Serverid", h.serverID)
-	rw.Header().Set("X-Ably-Cluster", ablyCluster)
 	rw.Header().Set("X-Robots-Tag", "noindex")
-	rw.Header().Set("Access-Control-Expose-Headers", corsExposedHeaders)
 	if r != nil && strings.Contains(r.Header.Get("Accept"), "text/html") {
 		// A human in a browser: the courtesy page, with the error status
 		// preserved for anything inspecting it.
@@ -516,24 +529,29 @@ func (h *Handler) writeError(rw http.ResponseWriter, r *http.Request, statusCode
 	}
 	rw.Header().Set("Content-Type", contentTypeJSON)
 	rw.WriteHeader(statusCode)
-	// jsonQuote, not strconv.Quote: Go quoting emits \x escapes JSON
-	// parsers reject, and the message can carry request-derived bytes
-	// (the path lands in "Could not find path: …").
-	body := `{"error":{"message":` + jsonQuote(full) +
-		`,"code":` + strconv.Itoa(code) +
-		`,"statusCode":` + strconv.Itoa(statusCode) +
-		`,"nonfatal":false` +
-		`,"href":` + jsonQuote(href) +
-		`,"serverId":` + jsonQuote(h.serverID) + `}}`
-	_, _ = rw.Write([]byte(body))
-}
-
-// jsonQuote renders s as a JSON string literal. Unlike strconv.Quote it
-// never emits Go-only escapes (\x01, \a) and replaces invalid UTF-8
-// with U+FFFD — always-valid JSON for request-derived input.
-func jsonQuote(s string) string {
-	b, _ := json.Marshal(s) // marshaling a string cannot fail
-	return string(b)
+	// json.MarshalIndent, not hand-built strings: always-valid JSON for
+	// request-derived bytes (the path lands in "Could not find path: …"),
+	// and tab-indented like the real service's error bodies.
+	envelope := struct {
+		Error struct {
+			Message    string `json:"message"`
+			Code       int    `json:"code"`
+			StatusCode int    `json:"statusCode"`
+			Nonfatal   bool   `json:"nonfatal"`
+			Href       string `json:"href"`
+			ServerID   string `json:"serverId"`
+		} `json:"error"`
+	}{}
+	envelope.Error.Message = full
+	envelope.Error.Code = code
+	envelope.Error.StatusCode = statusCode
+	envelope.Error.Href = href
+	envelope.Error.ServerID = h.serverID
+	body, err := json.MarshalIndent(envelope, "", "\t")
+	if err != nil { // unreachable for this struct; keep the response well-formed regardless
+		body = []byte(`{"error":{"message":"internal error","code":50000,"statusCode":500}}`)
+	}
+	_, _ = rw.Write(body)
 }
 
 // sanitizeHeaderValue blanks control bytes out of a header value:
