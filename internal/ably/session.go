@@ -223,9 +223,19 @@ type session struct {
 	connected chan error // signalled exactly once by the centrifuge connect reply
 
 	// modesMu guards attachedModes: granted mode bits per attached channel
-	// (0 = unrestricted). Written by the reader loop (attach/detach
-	// replies arrive via the centrifuge writer goroutine), read at
-	// enforcement points on both goroutines.
+	// (0 = unrestricted). attachedModes is written from BOTH goroutines and
+	// is NOT goroutine-local: the centrifuge-writer goroutine writes it in
+	// the opSubscribe/opUnsubscribe replies (writeAttached / the DETACHED
+	// delete), and the frame-reader goroutine writes it on the re-attach
+	// (options-update) path and the reauth-downgrade delete. Every access —
+	// read and write, on either goroutine — holds modesMu, so it is
+	// memory-safe. Logical per-channel consistency (a channel is not both
+	// "attached in the map" and "DETACHED on the wire") relies on the SDK
+	// serializing its own ATTACH/DETACH for a given channel, which
+	// conforming SDKs do (ably-js coalesces a re-ATTACH while ATTACHING and
+	// will not DETACH a channel it is concurrently re-attaching). A
+	// self-racing non-conforming client could observe a transient map/wire
+	// mismatch on one channel, never a crash and never cross-channel.
 	modesMu       sync.Mutex
 	attachedModes map[string]int64
 
@@ -813,8 +823,10 @@ func (s *session) handleAuth(m *protocol.ProtocolMessage) {
 	// permits fail with 40160 (the channel transitions to FAILED
 	// client-side) and their subscriptions are torn down silently — the
 	// client will not re-attach a FAILED channel, and a fresh ATTACH
-	// re-runs the normal capability gate. attachedModes is
-	// frame-reader-goroutine-local apart from the mutex-guarded reads.
+	// re-runs the normal capability gate. This delete runs on the
+	// frame-reader goroutine; the centrifuge-writer goroutine also writes
+	// attachedModes (opSubscribe/opUnsubscribe replies), so the modesMu it
+	// takes below is load-bearing, not decorative (see the field comment).
 	s.modesMu.Lock()
 	var revokedChannels []string
 	for channel := range s.attachedModes {
