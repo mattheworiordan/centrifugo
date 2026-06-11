@@ -46,6 +46,12 @@ const (
 	// session's first frames; the SDK abandons the attempt at its 10s
 	// realtimeRequestTimeout, so answer before that.
 	cometConnectFlush = 8 * time.Second
+	// cometCloseInjectTimeout bounds how long /close|/disconnect spends
+	// injecting its terminal frame before answering 2xx (B5/M6). The
+	// handler never waits for teardown to complete — the SDK reads no body
+	// — so a client spamming /close on a wedged session cannot tie up
+	// goroutines.
+	cometCloseInjectTimeout = 1 * time.Second
 )
 
 // cometClosedError ends the session read loop when the comet transport is
@@ -316,12 +322,17 @@ func (h *Handler) serveCometClose(rw http.ResponseWriter, r *http.Request, key s
 		rw.WriteHeader(http.StatusNoContent)
 		return
 	}
-	_ = cc.feed(r.Context(), &protocol.ProtocolMessage{Action: action})
-	select {
-	case <-cc.closeCh:
-	case <-time.After(5 * time.Second):
-	case <-r.Context().Done():
-	}
+	// B5/M6: inject the close/disconnect frame best-effort and answer 2xx
+	// immediately. The SDK treats any 2xx as done and never reads the body,
+	// so there is no reason to pin the handler goroutine waiting for
+	// teardown — a client spamming /close on a wedged session would
+	// otherwise tie up a goroutine for up to writeTimeout each. The bounded
+	// inject keeps even the feed from blocking if the inbound queue is full
+	// on a stuck session; teardown proceeds asynchronously as the run loop
+	// processes the injected frame.
+	ctx, cancel := context.WithTimeout(r.Context(), cometCloseInjectTimeout)
+	defer cancel()
+	_ = cc.feed(ctx, &protocol.ProtocolMessage{Action: action})
 	rw.WriteHeader(http.StatusNoContent)
 }
 
