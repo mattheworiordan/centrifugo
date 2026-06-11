@@ -8,7 +8,13 @@
 ## Protocol & channels
 
 1. **WebSocket only.** Comet/XHR transports are out of scope; comet test
-   variants fail by policy.
+   variants fail by policy. Phase 3 refinement: authenticated `/comet/*`
+   probes are declined **501 text/plain without an Ably error envelope** —
+   ably-js fails the whole connection on a coded envelope from
+   `/comet/connect` but soft-drops the candidate on a code-less error, so
+   a client trialling `[web_socket, comet]` keeps its WebSocket. (Bad
+   credentials still get the coded 40101 first: the auth gate runs before
+   routing, matching the real service — RTN14a.)
 2. **RESOLVED (Phase 3): arbitrary `:` in channel names.** Every
    broker-facing name is bijectively escaped (`~`→`~0`, `:`→`~1` —
    brokername.go), so all Ably channels resolve namespace-free in
@@ -109,6 +115,28 @@
     generic JSON round-trip: binary message data arrives as a bare base64
     string without the `"base64"` encoding segment (the single-channel path
     handles binary canonically). No SDK sends binary batch bodies today.
+
+## Phase 3 additions
+
+29. **Stats are fixture-backed, not metered** (RSC6/TS12, stats.go): the
+    server never records its own usage; GET /stats serves only what
+    POST /stats injected (the sandbox fixture mechanism the ably-js
+    harness uses). Re-injecting an intervalId REPLACES its record (the
+    real harness gets a fresh app per run; replace keeps a long-lived
+    server idempotent). `inProgress` is set on every record and `appId`
+    is the constant `"poc"`. Production: real metering pipeline.
+30. **Token revocation registry is in-memory, per-node** (RSA17,
+    revocation.go): `revocationKey:` targeting is accepted but
+    ineffective — this PoC's tokens never carry the
+    `x-ably-revocation-key` claim, so `clientId:` is the only effective
+    specifier (matches the pinned tests). Sessions that adopt a clientId
+    via mid-connection AUTH (rather than at CONNECT) are not re-indexed
+    for live disconnect; connect-time enforcement still applies.
+31. **Presence SYNC pages at exactly 100 members** (RTP4) with
+    channelSerial cursors `presence:<offset>` / final `presence:`;
+    single-page syncs omit channelSerial entirely (both forms complete
+    SDK syncs). Real Ably's page size is an implementation detail; 100
+    matches the documented behavior the pinned suite depends on.
 
 ## Test-observability quirks (documented, not bugs)
 

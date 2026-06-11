@@ -62,17 +62,46 @@ SUITES=(
 	test/rest/request.test.js
 	test/rest/updates-deletes.test.js
 	test/realtime/encoding.test.js
+	test/realtime/crypto.test.js
+	test/realtime/connectivity.test.js
+	test/realtime/event_emitter.test.js
+	test/realtime/init.test.js
+	test/realtime/api.test.js
+	test/realtime/utils.test.js
+	test/realtime/reauth.test.js
+	test/realtime/failure.test.js
+	test/realtime/sync.test.js
+	test/rest/defaults.test.js
+	test/rest/api.test.js
+	test/rest/bufferutils.test.js
+	test/rest/status.test.js
+	test/rest/batch.test.js
+	test/rest/http.test.js
+	test/rest/stats.test.js
+	test/rest/init.test.js
+	test/rest/fallbacks.test.js
 )
 
 FAILED=0
 for suite in "${SUITES[@]}"; do
 	[ -f "$suite" ] || { echo "[skip] $suite (not in pinned checkout)"; continue; }
-	# Inverted filter: comet variants (WS-only PoC) everywhere; the
-	# request suite additionally excludes checkput/checkpatch/checkdelete,
-	# which call out to echo.ably.io (external infra, not this server).
+	# Inverted filter: comet variants (WS-only PoC) everywhere; per-suite
+	# additions are categorized known-exclusions, each with its reason in
+	# .working/ably-centrifugo-poc/allowlist.json:
+	#   - rest/request checkput/checkpatch/checkdelete call out to
+	#     echo.ably.io (external infra, not this server);
+	#   - realtime/failure break_transport enumerates a comet-only
+	#     transport branch that can never connect to a WS-only server;
+	#   - rest/init "without any tls key" and rest/fallbacks "primary
+	#     domain as the first attempted" assert SDK default-TLS URL
+	#     construction, which the local test env must override
+	#     (ABLY_USE_TLS=false / explicit port) to reach this server.
 	EXCLUDE="comet"
 	case "$suite" in
 		*rest/request.test.js) EXCLUDE="comet|checkput|checkpatch|checkdelete" ;;
+		*realtime/failure.test.js) EXCLUDE="comet|break_transport" ;;
+		*rest/init.test.js) EXCLUDE="comet|without any tls key" ;;
+		*rest/fallbacks.test.js) EXCLUDE="comet|primary domain as the first attempted" ;;
 	esac
 	echo "=== $suite ==="
 	if ! npx mocha "$suite" --reporter min --grep "$EXCLUDE" --invert; then
