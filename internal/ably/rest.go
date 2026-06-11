@@ -365,6 +365,12 @@ func (h *Handler) serveMutateMessage(rw http.ResponseWriter, r *http.Request, ch
 		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "unsupported message action")
 		return
 	}
+	// C2: reject a nesting bomb in the mutation's data/extras before taking
+	// the channel lock or touching the store.
+	if !jsonDepthWithin(msg.Data, maxJSONDepth) || !jsonDepthWithin(msg.Extras, maxJSONDepth) {
+		h.writeError(rw, r, http.StatusBadRequest, errCodeBadRequest, "message payload nesting too deep")
+		return
+	}
 	// T1.2: mint+mutate+append atomic per channel (serials.go).
 	unlock := h.mint.lockChannel(channel)
 	defer unlock()

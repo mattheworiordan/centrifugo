@@ -633,6 +633,12 @@ func (s *session) mutateMessage(m *protocol.ProtocolMessage) {
 		s.writeNack(m.MsgSerial, errCodeMutableRequired, 400, "mutation failed: this operation can only be performed on a channel with mutable messages enabled")
 		return
 	}
+	// C2: reject a nesting bomb in the mutation's data/extras before taking
+	// the channel lock or touching the store.
+	if !jsonDepthWithin(msg.Data, maxJSONDepth) || !jsonDepthWithin(msg.Extras, maxJSONDepth) {
+		s.writeNack(m.MsgSerial, errCodeBadRequest, 400, "mutation failed: message payload nesting too deep")
+		return
+	}
 	// T1.2/A2: mint+mutate+Publish atomic per channel (serials.go); the
 	// lock is released BEFORE the terminal ACK/NACK write so a stalled
 	// writer cannot pin the channel lock (see publish). sync.OnceFunc makes

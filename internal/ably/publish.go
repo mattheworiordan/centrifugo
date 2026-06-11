@@ -86,6 +86,40 @@ func persistentChannel(name string) bool {
 // over-length names are rejected like any other invalid name (40010).
 const maxChannelNameBytes = 2048
 
+// maxJSONDepth bounds the nesting depth of inbound message data/extras
+// (C2). Bodies are decoded into `any` with only the maxFrameSize byte cap
+// as a guard, so a deeply-nested "nesting bomb" within a small body is
+// otherwise accepted (Go's json caps recursion at ~10000, far above any
+// real payload). 64 is generous for legitimate structured data while
+// rejecting abusive nesting, which runs thousands of levels deep.
+const maxJSONDepth = 64
+
+// jsonDepthWithin reports whether v's nesting depth is within max. It stops
+// descending the instant the budget is exceeded, so its own recursion is
+// bounded to max+1 levels regardless of how deep v actually is. Scalars
+// (string, number, bool, nil, []byte) are depth 0; each nested object or
+// array costs one level.
+func jsonDepthWithin(v any, max int) bool {
+	if max < 0 {
+		return false
+	}
+	switch t := v.(type) {
+	case map[string]any:
+		for _, e := range t {
+			if !jsonDepthWithin(e, max-1) {
+				return false
+			}
+		}
+	case []any:
+		for _, e := range t {
+			if !jsonDepthWithin(e, max-1) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // validChannelName reports whether name is acceptable as an Ably channel
 // name. Empty names, names beginning with ':', and names exceeding
 // maxChannelNameBytes are invalid (error code 40010; pinned by ably-js
@@ -149,6 +183,11 @@ func buildEnvelopes(messages []*protocol.Message, p envelopeParams) ([][]byte, [
 	for idx, msg := range messages {
 		if msg == nil {
 			return nil, nil, nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "null message"}
+		}
+		// C2: reject a nesting bomb in the user-controlled data/extras before
+		// it is enveloped or published.
+		if !jsonDepthWithin(msg.Data, maxJSONDepth) || !jsonDepthWithin(msg.Extras, maxJSONDepth) {
+			return nil, nil, nil, &publishProblem{code: errCodeBadRequest, statusCode: 400, message: "message payload nesting too deep"}
 		}
 		if msg.ClientID != "" && p.clientID != "" && msg.ClientID != p.clientID {
 			// RTL6g/RSL1m4: an identified publisher can only publish
