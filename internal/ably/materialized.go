@@ -20,8 +20,14 @@ package ably
 // update/append (the rewind pin) and message.delete after delete. The
 // message timestamp stays create-anchored; version.timestamp moves.
 //
-// Retention: the store never evicts (no TTL) — single-node PoC posture;
-// production would bound it alongside the history retention tiers.
+// Retention (A3): the store is BOUNDED. Per entry, the version history is
+// capped (count + summed bytes) so a long AIT append stream no longer
+// grows O(N) full-state snapshots each O(length) → O(N²); the latest
+// materialized state is always retained in full regardless. Whole entries
+// carry a TTL aligned with the channel's history retention tier and are
+// evicted lazily on access and when a sibling create touches the channel
+// (no background goroutine — materialized entries only ever live on
+// mutable channels, which are all persistent/24h, so eviction is rare).
 //
 // Single-node PoC posture, like presenceStore: a multi-node engine would
 // back this with centrifuge's MapBroker (keyed state + stream, M9 note —
@@ -34,6 +40,21 @@ import (
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
 )
 
+const (
+	// maxVersionsRetained caps an entry's retained version snapshots. GET
+	// .../versions returns a single page (RSL14), so deep history isn't
+	// contractually promised; keeping the last N bounds an AIT append
+	// stream whose versions slice otherwise grew one full-state snapshot
+	// per token. The latest state lives in entry.state, always complete.
+	maxVersionsRetained = 50
+	// maxVersionBytesRetained caps the SUMMED string-data bytes across an
+	// entry's retained snapshots — a second guard so a handful of very
+	// large snapshots can't blow memory even under the count cap. Oldest
+	// snapshots are dropped until both caps hold (the create/most-recent
+	// are kept where possible).
+	maxVersionBytesRetained = 256 * 1024
+)
+
 type materializedStore struct {
 	mu       sync.Mutex
 	channels map[string]map[string]*materializedEntry // channel → serial → entry
@@ -44,6 +65,46 @@ type materializedStore struct {
 type materializedEntry struct {
 	state    protocol.Message
 	versions []protocol.Message // snapshot AFTER each operation, oldest first
+	// expiresAt is the ms-since-epoch eviction deadline, refreshed on each
+	// mutation to the channel's retention TTL (A3). 0 means never expires.
+	expiresAt int64
+}
+
+// retentionExpiryMS returns the eviction deadline for a freshly touched
+// entry on channel — aligned with the history retention tier the channel
+// name selects (publish.go). Mutable-message channels are persistent
+// (24h); the ephemeral tier (2min) never applies in practice since only
+// mutable channels hold materialized entries.
+func retentionExpiryMS(channel string, now int64) int64 {
+	if persistentChannel(channel) {
+		return now + persistedHistoryTTL.Milliseconds()
+	}
+	return now + ephemeralHistoryTTL.Milliseconds()
+}
+
+// versionDataBytes is the string-data size of a snapshot (AIT appends are
+// strings; non-string payloads are not the O(N²) concern and count 0).
+func versionDataBytes(m protocol.Message) int {
+	if s, ok := m.Data.(string); ok {
+		return len(s)
+	}
+	return 0
+}
+
+// capVersionsLocked drops oldest version snapshots until both the count
+// and summed-byte caps hold. The most recent snapshot is always kept.
+func capVersionsLocked(entry *materializedEntry) {
+	for len(entry.versions) > maxVersionsRetained {
+		entry.versions = entry.versions[1:]
+	}
+	total := 0
+	for _, v := range entry.versions {
+		total += versionDataBytes(v)
+	}
+	for total > maxVersionBytesRetained && len(entry.versions) > 1 {
+		total -= versionDataBytes(entry.versions[0])
+		entry.versions = entry.versions[1:]
+	}
 }
 
 func newMaterializedStore() *materializedStore {
@@ -57,6 +118,11 @@ func newMaterializedStore() *materializedStore {
 func (s *materializedStore) create(channel string, msg *protocol.Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UnixMilli()
+	// A3: a new message touching the channel is the moment to reclaim its
+	// expired siblings (no background goroutine; cheap — entries-per-channel
+	// is small and nothing expires under normal operation).
+	s.evictChannelExpiredLocked(channel, now)
 	entries, ok := s.channels[channel]
 	if !ok {
 		entries = make(map[string]*materializedEntry)
@@ -67,7 +133,11 @@ func (s *materializedStore) create(channel string, msg *protocol.Message) {
 	}
 	// The create is itself the first version (RSL14: getMessageVersions
 	// returns the create alongside subsequent ops — action message.create).
-	entries[msg.Serial] = &materializedEntry{state: *msg, versions: []protocol.Message{*msg}}
+	entries[msg.Serial] = &materializedEntry{
+		state:     *msg,
+		versions:  []protocol.Message{*msg},
+		expiresAt: retentionExpiryMS(channel, now),
+	}
 	s.order[channel] = append(s.order[channel], msg.Serial)
 }
 
@@ -139,6 +209,10 @@ func (s *materializedStore) mutate(channel, serial string, action int, data any,
 	}
 	entry.state.Version = version
 	entry.versions = append(entry.versions, entry.state)
+	// A3: bound the per-entry version history (the AIT O(N²) fix) and
+	// refresh the entry's retention deadline — an active message stays live.
+	capVersionsLocked(entry)
+	entry.expiresAt = retentionExpiryMS(channel, time.Now().UnixMilli())
 
 	op := protocol.Message{
 		Name:     entry.state.Name,
@@ -161,7 +235,7 @@ func (s *materializedStore) get(channel, serial string) (protocol.Message, bool)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry, ok := s.channels[channel][serial]
-	if !ok {
+	if !ok || s.expireEntryLocked(channel, serial, entry, time.Now().UnixMilli()) {
 		return protocol.Message{}, false
 	}
 	return entry.state, true
@@ -172,7 +246,7 @@ func (s *materializedStore) versions(channel, serial string) ([]protocol.Message
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	entry, ok := s.channels[channel][serial]
-	if !ok {
+	if !ok || s.expireEntryLocked(channel, serial, entry, time.Now().UnixMilli()) {
 		return nil, false
 	}
 	out := make([]protocol.Message, len(entry.versions))
@@ -186,10 +260,11 @@ func (s *materializedStore) versions(channel, serial string) ([]protocol.Message
 func (s *materializedStore) latestWindow(channel string, cutoffMS int64) []protocol.Message {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UnixMilli()
 	serials := s.order[channel]
 	var out []protocol.Message
 	for _, serial := range serials {
-		if entry, ok := s.channels[channel][serial]; ok && entry.state.Timestamp >= cutoffMS {
+		if entry, ok := s.channels[channel][serial]; ok && !entryExpired(entry, now) && entry.state.Timestamp >= cutoffMS {
 			out = append(out, entry.state)
 		}
 	}
@@ -208,11 +283,77 @@ func (s *materializedStore) latest(channel string, n int) []protocol.Message {
 	if n > len(serials) {
 		n = len(serials)
 	}
+	now := time.Now().UnixMilli()
 	out := make([]protocol.Message, 0, n)
 	for _, serial := range serials[len(serials)-n:] {
-		if entry, ok := s.channels[channel][serial]; ok {
+		if entry, ok := s.channels[channel][serial]; ok && !entryExpired(entry, now) {
 			out = append(out, entry.state)
 		}
 	}
 	return out
+}
+
+// --- A3 TTL eviction helpers (all assume s.mu held) ---
+
+// entryExpired reports whether an entry's retention deadline has passed.
+func entryExpired(entry *materializedEntry, now int64) bool {
+	return entry.expiresAt != 0 && now >= entry.expiresAt
+}
+
+// expireEntryLocked drops the entry if expired, reporting true when it did
+// (so the caller treats the read as a miss).
+func (s *materializedStore) expireEntryLocked(channel, serial string, entry *materializedEntry, now int64) bool {
+	if !entryExpired(entry, now) {
+		return false
+	}
+	s.removeEntryLocked(channel, serial)
+	return true
+}
+
+// evictChannelExpiredLocked reclaims every expired entry on one channel.
+func (s *materializedStore) evictChannelExpiredLocked(channel string, now int64) {
+	for serial, entry := range s.channels[channel] {
+		if entryExpired(entry, now) {
+			s.removeEntryLocked(channel, serial)
+		}
+	}
+}
+
+// removeEntryLocked deletes one entry and its order record, cleaning up the
+// channel's maps once empty.
+func (s *materializedStore) removeEntryLocked(channel, serial string) {
+	if entries, ok := s.channels[channel]; ok {
+		delete(entries, serial)
+		if len(entries) == 0 {
+			delete(s.channels, channel)
+		}
+	}
+	order := s.order[channel]
+	for i, ser := range order {
+		if ser == serial {
+			s.order[channel] = append(order[:i], order[i+1:]...)
+			break
+		}
+	}
+	if len(s.order[channel]) == 0 {
+		delete(s.order, channel)
+	}
+}
+
+// sweepExpired reclaims expired entries across all channels. Cheap to call
+// periodically; also the unit-test entry point for TTL eviction. Returns
+// the number of entries evicted.
+func (s *materializedStore) sweepExpired(now int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	evicted := 0
+	for channel, entries := range s.channels {
+		for serial, entry := range entries {
+			if entryExpired(entry, now) {
+				s.removeEntryLocked(channel, serial)
+				evicted++
+			}
+		}
+	}
+	return evicted
 }
