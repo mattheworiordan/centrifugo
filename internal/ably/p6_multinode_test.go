@@ -22,10 +22,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
+	"github.com/centrifugal/centrifugo/v6/internal/ably/serial"
 	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 	"github.com/stretchr/testify/require"
 )
@@ -174,6 +176,85 @@ func TestMultiNodeCrossNodeRevocation_P6_2(t *testing.T) {
 	refused := readFrame(t, connB2)
 	require.Equal(t, protocol.ActionError, refused.Action)
 	require.Equal(t, 40141, refused.Error.Code)
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
+// P6.3 — serial-order audit (verify, don't rewrite). Channel serials embed a
+// per-process seriesId and each node mints independently, so cross-node a
+// serial's LEXICOGRAPHIC order need not match broker OFFSET order. The audit
+// proved every consumer is offset-driven (delivery = broker offset order;
+// resume/untilAttach resolve a serial to its offset by EXACT-MATCH tag
+// lookup, never a lexicographic compare). This test publishes alternately via
+// both nodes and asserts (1) history/delivery order == offset order
+// regardless of minting node, and (2) a serial minted on node A resolves
+// correctly on node B (cross-node cursor).
+func TestMultiNodeSerialOrder_P6_3(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p63ord-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+	ch := "persisted:" + uniq + "-order"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+
+	// Publish 6 messages ALTERNATING nodes (even→A, odd→B).
+	const n = 6
+	for i := 0; i < n; i++ {
+		node := nodeA
+		if i%2 == 1 {
+			node = nodeB
+		}
+		d7Publish(t, node, ch, fmt.Sprintf(`{"name":"m","data":"msg-%d"}`, i))
+	}
+
+	// (1) History on node B, forwards = broker OFFSET order = publish order,
+	// regardless of which node minted each serial.
+	resp := restRequest(t, nodeB, http.MethodGet, "/channels/"+ch+"/messages?limit=100&direction=forwards", nil, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var msgs []protocol.Message
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&msgs))
+	require.Len(t, msgs, n)
+	for i := 0; i < n; i++ {
+		require.Equal(t, fmt.Sprintf("msg-%d", i), msgs[i].Data,
+			"history (offset) order matches publish order regardless of minting node")
+	}
+
+	// Sanity that this really is cross-node minting (not all on one node):
+	// each node mints with its OWN per-process seriesId, so even-index
+	// (node A) and odd-index (node B) serials must carry different seriesIds.
+	seriesOf := func(messageSerial string) string {
+		cs, _, e := serial.ParseMessageSerial(messageSerial)
+		require.NoError(t, e)
+		_, after, found := strings.Cut(cs, "@")
+		require.True(t, found, "channelSerial carries a @seriesId")
+		return after
+	}
+	seriesA, seriesB := seriesOf(msgs[0].Serial), seriesOf(msgs[1].Serial)
+	require.NotEqual(t, seriesA, seriesB, "node A and node B mint with distinct seriesIds")
+	require.Equal(t, seriesA, seriesOf(msgs[2].Serial), "node A's serials share a seriesId")
+	require.Equal(t, seriesB, seriesOf(msgs[3].Serial), "node B's serials share a seriesId")
+
+	// (2) Cross-node cursor: msg[2] was minted on node A (even index); resolve
+	// its channelSerial on node B via untilAttach (from_serial). Exact-match
+	// serial→offset lookup must bound the read at msg-2 inclusive — proving
+	// resolution is offset-driven, not dependent on serial lexicographic order.
+	cs2, _, err := serial.ParseMessageSerial(msgs[2].Serial)
+	require.NoError(t, err)
+	resp2 := restRequest(t, nodeB, http.MethodGet,
+		"/channels/"+ch+"/messages?direction=forwards&from_serial="+url.QueryEscape(cs2), nil, nil)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	var bounded []protocol.Message
+	require.NoError(t, json.NewDecoder(resp2.Body).Decode(&bounded))
+	got := make(map[string]bool)
+	for _, m := range bounded {
+		got[m.Data.(string)] = true
+	}
+	require.True(t, got["msg-0"] && got["msg-1"] && got["msg-2"],
+		"untilAttach with a node-A serial, resolved on node B, includes msg-0..2")
+	require.False(t, got["msg-3"] || got["msg-4"] || got["msg-5"],
+		"untilAttach bounds at the resolved offset — later messages excluded")
 
 	nodeA.stop()
 	nodeB.stop()

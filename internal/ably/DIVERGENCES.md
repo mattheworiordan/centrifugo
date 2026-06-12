@@ -61,6 +61,21 @@ Features of the Ably service this PoC simply does not implement:
 - **Presence SYNC pages at exactly 100 members** with channelSerial
   cursors `presence:<offset>` / final `presence:`; single-page syncs
   omit channelSerial. Both forms complete SDK syncs.
+- **Multi-node: a channelSerial's lexicographic order need not match
+  broker offset order (P6.3 audit).** Each node mints with its own
+  per-process seriesId from its own per-channel generator, so two nodes
+  publishing the same channel concurrently — or one node minting under
+  clock skew relative to another — can emit serials whose string order
+  disagrees with the order the broker assigns offsets. This is cosmetic:
+  the adapter never compares serials lexicographically to order or filter
+  — delivery is broker-offset order, and resume/untilAttach resolve a
+  serial to its offset by EXACT-MATCH tag lookup (resolveCursor /
+  resolveSerialOffset), so cross-node continuity and ordering are correct
+  regardless. The residual (the channelSerial VALUE a client observes may
+  be non-monotonic across a node boundary) is bounded by same-region
+  NTP-synced clocks (skew ≪ 100ms) and D3's seed-from-history, which
+  clamps a cold node's generator past the channel high-water on its first
+  publish. Verified by TestMultiNodeSerialOrder_P6_3.
 
 ### Recovery & auth
 
