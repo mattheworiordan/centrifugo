@@ -28,8 +28,21 @@ package ably
 
 import (
 	"sync"
+	"time"
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/serial"
+)
+
+const (
+	// genEvictIdle is how long a channel may go without a publish before its
+	// serial generator + lock are evicted (A4b), bounding the channel-keyed
+	// maps under high-cardinality / long-soak load. A re-publish to an
+	// evicted channel recreates the generator and reseeds it from the broker
+	// high-water (D3), so eviction never regresses serials.
+	genEvictIdle = 10 * time.Minute
+	// genSweepInterval caps how often lockChannel runs the O(channels)
+	// eviction sweep, amortizing it to O(1) per publish.
+	genSweepInterval = time.Minute
 )
 
 // pubTagSerial is the publication tag carrying the publication's
@@ -50,6 +63,14 @@ type serialMint struct {
 	mu    sync.Mutex
 	gens  map[string]*serial.Generator
 	locks map[string]*sync.Mutex
+	// refs counts in-flight lockChannel holders per channel; lastUsed is the
+	// ms of the last lockChannel. A channel is evictable only when refs==0
+	// AND idle past genEvictIdle — refs protects a channel whose lock is held
+	// (or about to be acquired) from having its *sync.Mutex swapped out from
+	// under a publisher, which would silently break mint+append atomicity (A4b).
+	refs      map[string]int
+	lastUsed  map[string]int64
+	lastSweep int64
 }
 
 func newSerialMint(seed func(channel string) (ts int64, counter int, ok bool)) *serialMint {
@@ -58,6 +79,8 @@ func newSerialMint(seed func(channel string) (ts int64, counter int, ok bool)) *
 		seed:     seed,
 		gens:     make(map[string]*serial.Generator),
 		locks:    make(map[string]*sync.Mutex),
+		refs:     make(map[string]int),
+		lastUsed: make(map[string]int64),
 	}
 }
 
@@ -68,15 +91,59 @@ func newSerialMint(seed func(channel string) (ts int64, counter int, ok bool)) *
 // presence-store mutex is never held under it at all), and no path ever
 // holds two channel locks at once.
 func (m *serialMint) lockChannel(channel string) func() {
+	now := time.Now().UnixMilli()
 	m.mu.Lock()
 	l, ok := m.locks[channel]
 	if !ok {
 		l = &sync.Mutex{}
 		m.locks[channel] = l
 	}
+	// A4b: mark this channel in-flight (refs) and recently-used BEFORE the
+	// sweep runs, so neither this channel nor any concurrently-acquiring one
+	// is evicted under us. The sweep is amortized (genSweepInterval-gated).
+	m.refs[channel]++
+	m.lastUsed[channel] = now
+	m.evictIdleLocked(now)
 	m.mu.Unlock()
 	l.Lock()
-	return l.Unlock
+	return func() {
+		l.Unlock()
+		m.mu.Lock()
+		m.refs[channel]--
+		if m.refs[channel] <= 0 {
+			delete(m.refs, channel)
+		}
+		m.mu.Unlock()
+	}
+}
+
+// evictIdleLocked drops generators + locks for channels idle past
+// genEvictIdle, at most once per genSweepInterval. Assumes m.mu is held. A
+// channel with refs>0 (a publisher holding or acquiring its lock) is never
+// evicted — swapping its *sync.Mutex would break mint+append atomicity.
+func (m *serialMint) evictIdleLocked(now int64) {
+	if m.lastSweep != 0 && now-m.lastSweep < genSweepInterval.Milliseconds() {
+		return
+	}
+	m.lastSweep = now
+	for ch, used := range m.lastUsed {
+		if m.refs[ch] == 0 && now-used > genEvictIdle.Milliseconds() {
+			delete(m.gens, ch)
+			delete(m.locks, ch)
+			delete(m.lastUsed, ch)
+		}
+	}
+}
+
+// sweepGenerators forces an eviction sweep at the given clock and reports how
+// many generators were evicted — the test entry point for A4b.
+func (m *serialMint) sweepGenerators(now int64) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	before := len(m.gens)
+	m.lastSweep = 0 // bypass the interval gate
+	m.evictIdleLocked(now)
+	return before - len(m.gens)
 }
 
 // Mint returns the next channelSerial for channel.
