@@ -51,6 +51,11 @@ type Handler struct {
 	upgrade      *websocket.Upgrader
 	nonces       *nonceCache
 	presence     *presenceStore
+	// multiNode is true on the Redis engine (a shared broker → more than one
+	// adapter node is possible), gating the cross-node fan-out features
+	// (P6.1 presence refresh, P6.2a revocation sync). Derived from whether a
+	// cross-node presence manager was wired (mux.go sets both together).
+	multiNode bool
 }
 
 // NewHandler creates new Handler. The adapter is unusable without API keys
@@ -102,6 +107,7 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, presenceMgr centrifuge.P
 		upgrade:      upgrade,
 		nonces:       newNonceCache(),
 		presence:     newPresenceStoreWithManager(presenceMgr),
+		multiNode:    presenceMgr != nil,
 	}
 	if err := h.seedPresenceFixtures(c.KeysFile); err != nil {
 		return nil, err
@@ -110,6 +116,10 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, presenceMgr centrifuge.P
 	// (Redis) and stop refreshing on node shutdown so a dead node's members
 	// expire. No-op on the memory engine (presenceMgr == nil).
 	h.presence.startRefresh(n.NotifyShutdown())
+	// P6.2a: pull revocations issued on OTHER nodes from the broker feed and
+	// apply them locally (connect-time store + live-disconnect). No-op
+	// single-node (the revoking node enforces synchronously).
+	h.startRevocationSync(n.NotifyShutdown())
 	return h, nil
 }
 

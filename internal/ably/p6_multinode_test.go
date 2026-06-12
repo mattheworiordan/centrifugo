@@ -129,6 +129,56 @@ func TestMultiNodeCrossNodeIdempotency_P6_2(t *testing.T) {
 	nodeB.stop()
 }
 
+// P6.2(a) — cross-node revocation. A revoke accepted on node A must
+// live-disconnect the matching session on node B AND make node B refuse the
+// revoked token's new connections — via the broker revocation feed + each
+// node's sweep.
+func TestMultiNodeCrossNodeRevocation_P6_2(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p62rev-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+
+	clientID := "victim-" + uniq
+	token := mintSessionJWTWithKey(t, "poc.key4", "secret_key4_0123456789abcdef", clientID, time.Now().Add(time.Hour))
+
+	// A live token session on NODE B.
+	params := defaultDialParams()
+	params.Del("key")
+	params.Set("access_token", token)
+	connB := dialRealtime(t, nodeB.wsURL, params)
+	require.Equal(t, protocol.ActionConnected, readFrame(t, connB).Action)
+
+	// Revoke the clientId on NODE A.
+	resp := restRequestWithKey(t, nodeA, revocableKey, http.MethodPost,
+		"/keys/poc.key4/revokeTokens", revokeBody(t, []string{"clientId:" + clientID}, nil))
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// NODE B live-disconnects the matching session with 40141 — applied from
+	// the feed by B's sweep (the per-read deadline covers the sync interval).
+	var disconnected *protocol.ProtocolMessage
+	for i := 0; i < 4 && disconnected == nil; i++ {
+		f := readNonHeartbeatFrame(t, connB)
+		if f.Action == protocol.ActionDisconnected {
+			disconnected = f
+		}
+	}
+	require.NotNil(t, disconnected, "node B disconnects the session revoked on node A")
+	require.Equal(t, 40141, disconnected.Error.Code)
+
+	// Connect-time: the revoked token cannot establish a NEW connection on
+	// node B either (its store now carries the synced revoke).
+	connB2 := dialRealtime(t, nodeB.wsURL, params)
+	refused := readFrame(t, connB2)
+	require.Equal(t, protocol.ActionError, refused.Action)
+	require.Equal(t, 40141, refused.Error.Code)
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
 func TestMultiNodeCrossNode_P6_0(t *testing.T) {
 	requireRedisOrSkip(t)
 	uniq := fmt.Sprintf("p60-%d", time.Now().UnixNano())

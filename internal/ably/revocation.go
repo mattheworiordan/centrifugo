@@ -249,6 +249,8 @@ func (h *Handler) serveRevokeTokens(rw http.ResponseWriter, r *http.Request, key
 		}
 		h.revocations.add(entry)
 		h.scheduleRevocationEnforcement(entry)
+		// P6.2a: fan the revoke out to the other nodes (no-op single-node).
+		h.publishRevocation(entry)
 		successCount++
 		results = append(results, map[string]any{
 			"target": target, "issuedBefore": issuedBefore, "appliesAt": appliesAt,
