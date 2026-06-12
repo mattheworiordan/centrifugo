@@ -164,7 +164,9 @@ func (h *Handler) serveRequestToken(rw http.ResponseWriter, r *http.Request) {
 	}
 	// RSA9d: the request timestamp must be within tolerance of server
 	// time; nonce reuse within the window is rejected (replay protection,
-	// pinned by rest/auth "duplicate nonce" → 401).
+	// pinned at the HTTP layer by rest_test.go TestRequestToken_RSA8
+	// "replayed nonce rejected 40101", and at the unit layer by
+	// noncecache_test.go).
 	if skew := time.Since(time.UnixMilli(int64(req.Timestamp))); skew > timestampTolerance || skew < -timestampTolerance {
 		h.writeError(rw, r, http.StatusUnauthorized, errCodeInvalidCredentials, "token request timestamp out of range")
 		return

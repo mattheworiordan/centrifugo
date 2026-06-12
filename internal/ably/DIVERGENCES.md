@@ -114,18 +114,30 @@ Features of the Ably service this PoC simply does not implement:
   resource prefixes in capabilities match loosely; TM2h connectionKeys
   are attributed without verifying the connection exists.
 - **RSA9d hygiene** (timestamp ±15min, nonce burn, 24h ttl cap) is
-  implemented but the nonce cache is in-memory per node.
-- **Token revocation** (RSA17) is in-memory per node;
-  `revocationKey:` targeting is accepted but ineffective (tokens here
-  never carry the claim — `clientId:` is the effective specifier).
-  Sessions adopting a clientId via mid-connection AUTH are not
-  re-indexed for live disconnect; connect-time enforcement still
-  applies.
+  implemented; same-node replay rejection is pinned end-to-end on the
+  HTTP requestToken path by `TestRequestToken_RSA8` ("replayed nonce
+  rejected 40101"), not just at the unit layer. The nonce cache is still
+  in-memory per node, so cross-node replay within the tolerance window
+  remains possible (P6.2b bound, detailed in the `nonceCache` comment).
+- **Token revocation** (RSA17): on the Redis engine a revoke is fanned
+  out cross-node over a reserved broker feed — every node applies it to
+  its local store and live-disconnects matching sessions (P6.2a); on the
+  memory engine it is single-node. `revocationKey:` targeting is accepted
+  but ineffective (tokens here never carry the claim — `clientId:` is the
+  effective specifier). Sessions adopting a clientId via mid-connection
+  AUTH are not re-indexed for live disconnect; connect-time enforcement
+  still applies.
 
 ### Presence
 
-- **The presence member store is adapter-owned, single-node**
-  (centrifuge's node-level presence mutators are unexported).
+- **The presence member store is adapter-owned.** On the Redis engine it
+  is cross-node — Redis-backed via a centrifuge presence manager, so
+  HAS_PRESENCE/SYNC on one node reflect members entered on another (P6.1);
+  on the memory engine it is single-node in-process. (The adapter rolls its
+  own store because centrifuge's node-level presence mutators are
+  unexported.) A dead node's members leave the shared set within the
+  manager TTL (~60s); grace-window re-entry suppression is node-local
+  (a redundant LEAVE event is possible across nodes — see presence.go).
 - **Presence history rides a client-unreachable shadow channel**
   (`:presence:<ch>`), REST-only, no pagination Link headers.
 

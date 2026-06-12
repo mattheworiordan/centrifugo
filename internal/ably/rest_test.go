@@ -317,6 +317,25 @@ func TestRequestToken_RSA8(t *testing.T) {
 		resp := post(t, fmt.Sprintf(`{"keyName":"poc.key1","timestamp":%d,"nonce":"nonce-4","mac":%q}`, ts1, mac))
 		require.Equal(t, http.StatusUnauthorized, resp.StatusCode)
 	})
+
+	// RSA9d replay protection at the HTTP layer: the SAME signed
+	// TokenRequest (identical nonce+timestamp+mac) mints once, burning the
+	// nonce; a re-POST within the tolerance window is rejected 401. The nonce
+	// is burned only AFTER the mac verifies (resttoken.go), so this exercises
+	// nonceCache.use() on the live requestToken path — not just the unit test
+	// in noncecache_test.go. This pins the replay-rejection claim in
+	// resttoken.go.
+	t.Run("replayed nonce rejected 40101", func(t *testing.T) {
+		mac := sign("", "", "replay-bob", tsStr, "nonce-replay")
+		body := fmt.Sprintf(`{"keyName":%q,"clientId":"replay-bob","timestamp":%d,"nonce":"nonce-replay","mac":%q}`, keyName, ts1, mac)
+
+		first := post(t, body)
+		require.Equal(t, http.StatusOK, first.StatusCode, "fresh nonce mints a token")
+
+		replay := post(t, body)
+		require.Equal(t, http.StatusUnauthorized, replay.StatusCode, "same nonce within the window is a replay")
+		require.Equal(t, "40101", replay.Header.Get("X-Ably-Errorcode"))
+	})
 }
 
 // REST presence: the member set as a bare array (fixture members seeded
