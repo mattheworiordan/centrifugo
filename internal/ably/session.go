@@ -279,6 +279,40 @@ type session struct {
 	modesMu       sync.Mutex
 	attachedModes map[string]int64
 
+	// subscribeWaiters coalesces duplicate in-flight ATTACHes per channel. A
+	// channel's KEY PRESENCE marks an opSubscribe in flight (the
+	// SubscribeRequest was dispatched by attach() but its reply has not landed,
+	// so attachedModes does not carry the channel yet); the SLICE holds the
+	// later ATTACHes that arrived while it was in flight. A second ATTACH for
+	// an in-flight channel is COALESCED — attach() queues it here instead of
+	// dispatching a duplicate SubscribeRequest. When the in-flight reply lands,
+	// the opSubscribe handler confirms the primary (writeAttached) and then
+	// serves each waiter (serveCoalescedAttach) — reproducing the D2 105 path
+	// byte-for-byte (each waiter's own ATTACHED with its params/modes and any
+	// materialized rewind backlog) MINUS the wasted broker round-trip the
+	// duplicate Subscribe would have cost. The waiter MUST be replayed, not
+	// dropped: ably-js's setOptions({rewind})-driven re-attach races the
+	// channel.subscribe() auto-attach, so the coalesced ATTACH can be the one
+	// carrying rewind — dropping it loses the backlog (the updates-deletes
+	// "append over realtime" hang on Redis).
+	//
+	// On the synchronous memory engine the first subscribe reply lands inside
+	// attach() #1, so a second ATTACH sees attachedModes already set and never
+	// coalesces. The D2 105 "already subscribed"-as-success handling stays as a
+	// defensive net for any duplicate this does not catch (e.g. a cross-node
+	// Subscribe).
+	//
+	// Guarded by modesMu, the SAME lock as attachedModes. attach() reads
+	// attachedModes (alreadyAttached) and the in-flight marker under ONE hold —
+	// alreadyAttached takes precedence — so the snapshot is consistent against
+	// the centrifuge-writer goroutine's "in-flight → attached" transition: the
+	// success handler sets attachedModes (writeAttached) BEFORE it clears this
+	// marker, so once attached is observable no new waiter is queued and no
+	// duplicate Subscribe is dispatched, and any waiter queued earlier is still
+	// captured. The marker is also cleared on the opSubscribe error and
+	// dispatch-failure paths (dropSubscribeInFlight).
+	subscribeWaiters map[string][]pendingOp
+
 	// authMu guards the token-expiry timers: armed at connect, re-armed by
 	// a successful AUTH (its handler runs on the frame-reader goroutine,
 	// the timers fire on their own goroutines).
@@ -350,17 +384,18 @@ func (s *session) checkMsgSerial(serial int64) bool {
 
 func newSession(node *centrifuge.Node, conn frameConn, params sessionParams, presence *presenceStore, mint *serialMint, materialized *materializedStore) *session {
 	return &session{
-		node:          node,
-		mint:          mint,
-		materialized:  materialized,
-		conn:          conn,
-		params:        params,
-		presence:      presence,
-		pending:       make(map[uint32]pendingOp),
-		attachedModes: make(map[string]int64),
-		connected:     make(chan error, 1),
-		closeCh:       make(chan struct{}),
-		inboundRate:   newRateLimiter(maxInboundRate),
+		node:             node,
+		mint:             mint,
+		materialized:     materialized,
+		conn:             conn,
+		params:           params,
+		presence:         presence,
+		pending:          make(map[uint32]pendingOp),
+		attachedModes:    make(map[string]int64),
+		subscribeWaiters: make(map[string][]pendingOp),
+		connected:        make(chan error, 1),
+		closeCh:          make(chan struct{}),
+		inboundRate:      newRateLimiter(maxInboundRate),
 	}
 }
 
@@ -1322,9 +1357,32 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	// params/modes and resolves on the fresh ATTACHED). The centrifuge
 	// subscription already exists — and re-subscribing would be rejected
 	// as a duplicate — so the new grant is confirmed directly.
+	//
+	// A second ATTACH that arrives while the channel's FIRST Subscribe is
+	// still in flight (attachedModes not yet set) is COALESCED rather than
+	// dispatching a duplicate SubscribeRequest — see subscribeWaiters. Both
+	// flags are read under ONE modesMu hold for a snapshot consistent with the
+	// centrifuge-writer goroutine's in-flight→attached transition, and the
+	// queue/claim happens under the same hold so the dispatch below cannot race
+	// a concurrent duplicate. alreadyAttached takes precedence (a lingering
+	// in-flight marker is harmless once attached is observable).
 	s.modesMu.Lock()
 	_, alreadyAttached := s.attachedModes[channel]
+	_, subscribeInFlight := s.subscribeWaiters[channel]
+	coalesced := subscribeInFlight && !alreadyAttached
+	if coalesced {
+		s.subscribeWaiters[channel] = append(s.subscribeWaiters[channel], s.attachWaiterOp(m))
+	} else if !alreadyAttached {
+		s.subscribeWaiters[channel] = nil // claim the in-flight marker (no waiters yet)
+	}
 	s.modesMu.Unlock()
+	if coalesced {
+		// Queued against the in-flight Subscribe: its reply will confirm this
+		// ATTACH too (serveCoalescedAttach replays the ATTACHED with this
+		// request's params/modes and any rewind backlog). Nothing goes on the
+		// wire here, and no duplicate SubscribeRequest is dispatched.
+		return
+	}
 	if alreadyAttached {
 		// Options update on a live attachment: continuity was never broken,
 		// which RTL12 semantics signal with RESUMED. A rewind param
@@ -1365,8 +1423,7 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 	// (divergence noted for M9: a genuinely-new channel attached after
 	// recovery is also granted RESUMED). With a cursor, the resolved
 	// recovery below decides RESUMED honestly.
-	claimResume := m.ChannelSerial == "" &&
-		(m.Flags&protocol.FlagAttachResume != 0 || s.params.recoverID != "")
+	claimResume := s.attachClaimsResume(m)
 	switch {
 	case m.ChannelSerial != "":
 		if pos, ok := s.resolveCursor(channel, m.ChannelSerial); ok {
@@ -1438,9 +1495,91 @@ func (s *session) attach(m *protocol.ProtocolMessage) {
 		// post-dispatch context check); only report failure when the pending
 		// entry was NOT already consumed by a reply.
 		if _, ok := s.takePending(cmd.Id); ok {
+			// Dispatch failed before any reply: drop the in-flight marker so a
+			// later ATTACH can retry (when the reply WAS consumed, the opSubscribe
+			// handler cleared it), then fail the channel. No waiters can exist yet
+			// — they are only queued by later ATTACH frames, which this
+			// single-goroutine frame reader has not processed.
+			s.dropSubscribeInFlight(channel)
 			s.writeAttachError(channel, nil)
 		}
 	}
+}
+
+// attachClaimsResume reports whether a cursor-less ATTACH claims a prior
+// attachment — an ATTACH_RESUME flag, or any bare ATTACH on a RECOVERED
+// connection — which the PoC grants RESUMED on the claim alone (RTN16-lite,
+// see attach). Shared by the fresh-attach path and the coalesced-waiter
+// derivation so both agree.
+func (s *session) attachClaimsResume(m *protocol.ProtocolMessage) bool {
+	return m.ChannelSerial == "" &&
+		(m.Flags&protocol.FlagAttachResume != 0 || s.params.recoverID != "")
+}
+
+// attachMaterializedRewindSpec returns the materialized-rewind spec a fresh
+// ATTACH requests on a MUTABLE channel (RTL2i: rewind on a cursor-less,
+// non-resume attach), or "" when none. Mirrors the mutable branch of attach()'s
+// recovery switch (ordinary-channel rewinds ride broker recovery instead and
+// are not materialized) — kept here so the coalesced-waiter derivation cannot
+// drift from the fresh-attach path.
+func (s *session) attachMaterializedRewindSpec(m *protocol.ProtocolMessage, channel string) string {
+	if m.ChannelSerial == "" && m.Params["rewind"] != "" &&
+		m.Flags&protocol.FlagAttachResume == 0 && s.params.recoverID == "" &&
+		mutableChannel(channel) {
+		return m.Params["rewind"]
+	}
+	return ""
+}
+
+// attachWaiterOp captures the fields of a COALESCED ATTACH needed to confirm it
+// when the in-flight Subscribe's reply lands (serveCoalescedAttach). A waiter
+// never rides a broker recovery subscribe of its own — exactly like the 105
+// "already subscribed" reply, which carries no reply.Subscribe — so it records
+// only the materialized-rewind and claim-resume intent, never resuming/rewinding
+// (those drive broker replay, which a waiter has none of).
+func (s *session) attachWaiterOp(m *protocol.ProtocolMessage) pendingOp {
+	return pendingOp{
+		kind:        opSubscribe,
+		channel:     m.Channel,
+		params:      m.Params,
+		modes:       modesFromAttach(m),
+		claimResume: s.attachClaimsResume(m),
+		rewindSpec:  s.attachMaterializedRewindSpec(m, m.Channel),
+	}
+}
+
+// serveCoalescedAttach confirms a coalesced ATTACH that did NOT dispatch its
+// own SubscribeRequest: the primary in-flight subscribe's reply already
+// subscribed the channel. Reproduces the D2 105 path exactly — a materialized
+// rewind backlog (HAS_BACKLOG) for op.rewindSpec, RESUMED for op.claimResume,
+// then the ATTACHED and the backlog delivery. No broker replay: a coalesced
+// attach rode no recovery subscribe (just as a 105 reply carries no Subscribe).
+func (s *session) serveCoalescedAttach(op pendingOp) {
+	var extraFlags int64
+	var materialized []protocol.Message
+	if op.rewindSpec != "" {
+		materialized = s.materializedRewind(op.channel, op.rewindSpec)
+		if len(materialized) > 0 {
+			extraFlags |= protocol.FlagHasBacklog
+		}
+	}
+	if op.claimResume {
+		extraFlags |= protocol.FlagResumed
+	}
+	s.writeAttached(op.channel, op.params, op.modes, extraFlags)
+	for i := range materialized {
+		s.deliverMaterialized(op.channel, &materialized[i])
+	}
+}
+
+// dropSubscribeInFlight clears a channel's in-flight-subscribe marker and any
+// queued waiters (see subscribeWaiters). Used on the opSubscribe error and
+// dispatch-failure paths, where the channel fails (a channel-scoped ERROR
+// settles every coalesced attach at once, so waiters need no individual reply).
+func (s *session) dropSubscribeInFlight(channel string) {
+	s.modesMu.Lock()
+	delete(s.subscribeWaiters, channel)
+	s.modesMu.Unlock()
 }
 
 func (s *session) detach(channel string) {
@@ -1586,6 +1725,12 @@ func (s *session) handleReply(reply *cproto.Reply) {
 			// drive it to FAILED and abandon the live subscription. The 105 reply
 			// carries no reply.Subscribe, so recovery/replay below is nil-guarded.
 			if reply.Error != nil && reply.Error.Code != centrifuge.ErrorAlreadySubscribed.Code {
+				// Genuine subscribe failure: drop the in-flight marker and any
+				// coalesced waiters. The channel-scoped ERROR fails the channel for
+				// every pending attach at once (ably-js resolves all coalesced
+				// attaches off one channel ERROR), so waiters need no individual
+				// reply.
+				s.dropSubscribeInFlight(op.channel)
 				s.writeAttachError(op.channel, reply.Error)
 				return
 			}
@@ -1619,11 +1764,24 @@ func (s *session) handleReply(reply *cproto.Reply) {
 				}
 			}
 			s.writeAttached(op.channel, op.params, op.modes, extraFlags)
+			// writeAttached set attachedModes, so attach() now takes the
+			// options-update branch and queues no further waiters. Capture and
+			// clear the coalesced waiters under one hold — every waiter queued
+			// before this point is here; none can arrive after.
+			s.modesMu.Lock()
+			waiters := s.subscribeWaiters[op.channel]
+			delete(s.subscribeWaiters, op.channel)
+			s.modesMu.Unlock()
 			for _, pub := range replay {
 				s.deliverPublication(op.channel, pub)
 			}
 			for i := range materialized {
 				s.deliverMaterialized(op.channel, &materialized[i])
+			}
+			// Confirm each coalesced ATTACH with its OWN request's params/modes
+			// and rewind backlog — the round-trip the duplicate Subscribe saved.
+			for _, w := range waiters {
+				s.serveCoalescedAttach(w)
 			}
 		case opUnsubscribeSilent:
 			// Teardown after a capability downgrade: the ERROR already
