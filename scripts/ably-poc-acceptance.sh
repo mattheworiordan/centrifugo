@@ -26,11 +26,29 @@ REDIS_ADDR="127.0.0.1:6399"
 if [ "${REDIS:-0}" = "1" ]; then
 	SRC_CONFIG="$ROOT/config.ably-dev-redis.json"
 	echo "REDIS=1: running the acceptance sweep against the Redis engine ($REDIS_ADDR)"
-	if ! (exec 3<>"/dev/tcp/${REDIS_ADDR%:*}/${REDIS_ADDR##*:}") 2>/dev/null; then
+	REDIS_HOST="${REDIS_ADDR%:*}"
+	REDIS_PORT="${REDIS_ADDR##*:}"
+	if ! (exec 3<>"/dev/tcp/$REDIS_HOST/$REDIS_PORT") 2>/dev/null; then
 		echo "Redis not reachable at $REDIS_ADDR — start it (docker compose -f deploy/ably-poc/docker-compose.yml up -d redis) then re-run."
 		echo "ABLY-POC ACCEPTANCE: SKIPPED (Redis engine, no Redis)"
 		exit 0
 	fi
+	# Clean-slate the broker: each acceptance run must start from an empty
+	# world, exactly as the memory engine does. A persistent Redis otherwise
+	# accumulates fixed-channel history across runs (the ably-js suites
+	# publish to stable channel names), double-counting history/presence
+	# assertions. The D7 restart suite manages its own Redis lifecycle inside
+	# the Go test and is unaffected by this.
+	if command -v redis-cli >/dev/null 2>&1; then
+		redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" flushall >/dev/null
+	else
+		# Dependency-free RESP FLUSHALL over /dev/tcp (consume the +OK reply).
+		exec 3<>"/dev/tcp/$REDIS_HOST/$REDIS_PORT"
+		printf 'FLUSHALL\r\n' >&3
+		head -c 5 <&3 >/dev/null
+		exec 3>&- 3<&-
+	fi
+	echo "REDIS=1: flushed Redis at $REDIS_ADDR for a clean-slate run"
 fi
 
 mkdir -p "$ROOT/tmp"
