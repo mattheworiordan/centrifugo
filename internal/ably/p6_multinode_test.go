@@ -44,6 +44,56 @@ func readUntilMessage(t *testing.T, conn *websocket.Conn, channel string) *proto
 	return nil
 }
 
+// presenceMembersREST reads the current presence member set via REST.
+func presenceMembersREST(t *testing.T, ts *realtimeTestServer, channel string) []protocol.PresenceMessage {
+	t.Helper()
+	resp := restRequest(t, ts, http.MethodGet, "/channels/"+channel+"/presence", nil, nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var members []protocol.PresenceMessage
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&members))
+	return members
+}
+
+// P6.1 — cross-node presence. A member entered on node A must be visible in
+// node B's presence (HAS_PRESENCE/SYNC/REST), via the shared Redis presence
+// manager. This is the assertion P6.0 deliberately left failing.
+func TestMultiNodeCrossNodePresence_P6_1(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p61-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+	presChan := "persisted:" + uniq + "-pres"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+
+	// Enter presence on node A via a realtime connection.
+	params := defaultDialParams()
+	params.Set("clientId", "alice-p61")
+	connA := dialRealtime(t, nodeA.wsURL, params)
+	require.Equal(t, protocol.ActionConnected, readFrame(t, connA).Action)
+	writeFrame(t, connA, &protocol.ProtocolMessage{
+		Action:    protocol.ActionPresence,
+		Channel:   presChan,
+		MsgSerial: 0,
+		Presence:  []*protocol.PresenceMessage{{Action: protocol.PresenceEnter, Data: "hi from A"}},
+	})
+	require.Equal(t, protocol.ActionAck, readNonHeartbeatFrame(t, connA).Action)
+
+	// node B reflects the member entered on node A (cross-node, from Redis).
+	require.Eventually(t, func() bool {
+		members := presenceMembersREST(t, nodeB, presChan)
+		return len(members) == 1 && members[0].ClientID == "alice-p61"
+	}, 3*time.Second, 50*time.Millisecond, "node B must reflect the member entered on node A")
+
+	// And node A sees its own member (single-node read still works under Redis).
+	membersA := presenceMembersREST(t, nodeA, presChan)
+	require.Len(t, membersA, 1)
+	require.Equal(t, "alice-p61", membersA[0].ClientID)
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
 func TestMultiNodeCrossNode_P6_0(t *testing.T) {
 	requireRedisOrSkip(t)
 	uniq := fmt.Sprintf("p60-%d", time.Now().UnixNano())

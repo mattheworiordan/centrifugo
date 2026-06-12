@@ -45,7 +45,7 @@ func newTestHandler(t *testing.T) *Handler {
 	// Production ordering: node.Run() precedes handler construction, and
 	// fixture seeding publishes presence history at startup.
 	require.NoError(t, node.Run())
-	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, func(r *http.Request) bool { return true })
+	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, nil, func(r *http.Request) bool { return true })
 	require.NoError(t, err)
 	return h
 }
@@ -314,10 +314,10 @@ func TestNewHandlerRequiresKeysFile(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = node.Shutdown(context.Background()) })
 
-	_, err = NewHandler(node, configtypes.Ably{Enabled: true}, nil)
+	_, err = NewHandler(node, configtypes.Ably{Enabled: true}, nil, nil)
 	require.ErrorContains(t, err, "keys_file")
 
-	_, err = NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/does-not-exist.json"}, nil)
+	_, err = NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/does-not-exist.json"}, nil, nil)
 	require.Error(t, err)
 }
 
@@ -372,7 +372,7 @@ func newRealtimeServer(t *testing.T) *realtimeTestServer {
 		})
 	})
 
-	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, func(r *http.Request) bool { return true })
+	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, nil, func(r *http.Request) bool { return true })
 	require.NoError(t, err)
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)

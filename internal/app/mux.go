@@ -15,6 +15,8 @@ import (
 	"github.com/centrifugal/centrifugo/v6/internal/admin"
 	"github.com/centrifugal/centrifugo/v6/internal/api"
 	"github.com/centrifugal/centrifugo/v6/internal/config"
+	"github.com/centrifugal/centrifugo/v6/internal/confighelpers"
+	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
 	"github.com/centrifugal/centrifugo/v6/internal/conninit"
 	"github.com/centrifugal/centrifugo/v6/internal/devpage"
 	"github.com/centrifugal/centrifugo/v6/internal/health"
@@ -204,7 +206,36 @@ func Mux(
 		if flags&HandlerAdmin != 0 && strings.TrimRight(cfg.Admin.HandlerPrefix, "/") == "" {
 			log.Fatal().Msg("ably adapter claims the web root and conflicts with admin on the same port: set admin.handler_prefix or serve admin on a separate internal port")
 		}
-		ablyHandler, err := ably.NewHandler(n, cfg.Ably, getCheckOrigin(cfg))
+		// P6.1: on the Redis engine give the adapter a cross-node presence
+		// manager so HAS_PRESENCE/SYNC reflect members entered on other nodes.
+		// A DISTINCT key prefix (".ably") keeps Ably presence separate from
+		// centrifuge's own broker/presence keys. On the memory engine the
+		// manager is nil and the adapter's in-process member set is used
+		// (single-node, unchanged).
+		var ablyPresenceMgr centrifuge.PresenceManager
+		if cfg.Engine.Type == "redis" {
+			shards, _, shErr := confighelpers.CentrifugeRedisShards(n, cfg.Engine.Redis.Redis)
+			if shErr != nil {
+				log.Fatal().Err(shErr).Msg("error creating ably presence Redis shards")
+			}
+			pm, pmErr := confighelpers.CentrifugeRedisPresenceManager(
+				n, cfg.Engine.Redis.Prefix+".ably", shards, configtypes.RedisPresenceManagerCommon{})
+			if pmErr != nil {
+				log.Fatal().Err(pmErr).Msg("error creating ably presence manager")
+			}
+			ablyPresenceMgr = pm
+		}
+		// Don't let cross-node presence silently fall back to single-node: the
+		// adapter wires it from the Redis ENGINE (the PoC's multi-node path,
+		// D6). If a deployment instead uses the broker/presence-manager split
+		// with a Redis presence manager, ablyPresenceMgr stays nil here and
+		// Ably presence would be single-node — warn so it is never silent.
+		if ablyPresenceMgr == nil &&
+			((cfg.PresenceManager.Enabled && cfg.PresenceManager.Type == "redis") ||
+				(cfg.Broker.Enabled && cfg.Broker.Type == "redis")) {
+			log.Warn().Msg("ably adapter: cross-node presence is wired from engine.type=redis only; under a Redis broker/presence_manager split config Ably presence stays single-node (set engine.type=redis for multi-node presence)")
+		}
+		ablyHandler, err := ably.NewHandler(n, cfg.Ably, ablyPresenceMgr, getCheckOrigin(cfg))
 		if err != nil {
 			log.Fatal().Err(err).Msg("error creating ably handler")
 		}

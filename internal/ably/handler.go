@@ -56,7 +56,7 @@ type Handler struct {
 // NewHandler creates new Handler. The adapter is unusable without API keys
 // to authenticate against (RSA11 Basic auth), so an enabled adapter with no
 // keys_file — or one that fails to load — is a startup error.
-func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http.Request) bool) (*Handler, error) {
+func NewHandler(n *centrifuge.Node, c configtypes.Ably, presenceMgr centrifuge.PresenceManager, checkOrigin func(r *http.Request) bool) (*Handler, error) {
 	if c.KeysFile == "" {
 		return nil, errors.New("ably adapter is enabled but ably.keys_file is not set")
 	}
@@ -101,11 +101,15 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 		keys:         keys,
 		upgrade:      upgrade,
 		nonces:       newNonceCache(),
-		presence:     newPresenceStore(),
+		presence:     newPresenceStoreWithManager(presenceMgr),
 	}
 	if err := h.seedPresenceFixtures(c.KeysFile); err != nil {
 		return nil, err
 	}
+	// P6.1: keep this node's members alive in the cross-node presence manager
+	// (Redis) and stop refreshing on node shutdown so a dead node's members
+	// expire. No-op on the memory engine (presenceMgr == nil).
+	h.presence.startRefresh(n.NotifyShutdown())
 	return h, nil
 }
 

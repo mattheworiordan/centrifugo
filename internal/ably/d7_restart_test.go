@@ -110,7 +110,22 @@ func buildEngineServer(t *testing.T, redisPrefix string) *realtimeTestServer {
 	})
 	require.NoError(t, node.Run())
 
-	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, func(r *http.Request) bool { return true })
+	// Cross-node presence (P6.1): in Redis mode give the handler a Redis
+	// presence manager sharing the same Redis + a prefix derived from the
+	// run prefix, so two nodes built with the same redisPrefix see each
+	// other's members — mirroring production wiring (mux.go).
+	var presenceMgr centrifuge.PresenceManager
+	if redisPrefix != "" {
+		shard, err := centrifuge.NewRedisShard(node, centrifuge.RedisShardConfig{Address: d7RedisAddr})
+		require.NoError(t, err)
+		presenceMgr, err = centrifuge.NewRedisPresenceManager(node, centrifuge.RedisPresenceManagerConfig{
+			Shards: []*centrifuge.RedisShard{shard},
+			Prefix: redisPrefix + "ablypres",
+		})
+		require.NoError(t, err)
+	}
+
+	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, presenceMgr, func(r *http.Request) bool { return true })
 	require.NoError(t, err)
 	srv := httptest.NewServer(h)
 
