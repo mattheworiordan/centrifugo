@@ -239,6 +239,20 @@ const nonceSweepInterval = 2 * timestampTolerance
 // nonceCache rejects nonce reuse within the timestamp tolerance window —
 // together with the timestamp check this bounds replay of a captured
 // signed TokenRequest.
+//
+// MULTI-NODE BOUND (P6.2b, documented divergence): this cache is per-node
+// and in-process. With more than one adapter node behind a load balancer, a
+// captured signed TokenRequest can be replayed against a DIFFERENT node
+// (whose cache has not seen the nonce) within the timestamp tolerance window,
+// yielding a second token with the same capabilities. Same-node replay stays
+// blocked, and the single-node deployment (the current fly target, count=1)
+// has NO exposure. Exploiting it requires capturing an already-signed request
+// (the attacker never holds the key secret) and is bounded to the tolerance
+// window. The production fix is a shared nonce set — Redis SETNX with a TTL of
+// 2*timestampTolerance — keyed by nonce; it is deferred because it needs a raw
+// Redis client wired into the adapter (the engine's broker/presence-manager
+// abstractions don't expose SETNX). Decided per the Phase-6 plan: document the
+// bound rather than drift.
 type nonceCache struct {
 	mu        sync.Mutex
 	seen      map[string]time.Time
