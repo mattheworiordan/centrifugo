@@ -260,6 +260,47 @@ func TestMultiNodeSerialOrder_P6_3(t *testing.T) {
 	nodeB.stop()
 }
 
+// P6.4 — comet cross-node affinity. WebSocket needs nothing multi-node
+// (long-lived to one node; message/presence/revocation fan-out via Redis).
+// But comet per-key state (the cometConn + its connectionKey registry entry)
+// is in-process PER-NODE — NOT shared via Redis — so a /comet/<key>/* request
+// that lands on a node other than the one that established the session finds
+// no such key and returns 410 GONE (graceful: the SDK treats it as nonfatal
+// transport death and reconnects). The PoC therefore PINS comet to one node
+// via an LB rule on /comet/* (documented in DIVERGENCES.md + the deploy
+// README); this test proves the affinity and the graceful failure that makes
+// the fallback safe. (Lifting the pin would need the fly-replay routing — a
+// node identity in the connectionKey + a fly-replay response — which is fly
+// infrastructure and not locally testable.)
+func TestMultiNodeCometAffinity_P6_4(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p64comet-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+
+	// A comet session established on node A (valid connectionKey, registered
+	// in node A's in-process registry).
+	key := cometConnect(t, nodeA)
+	require.NotEmpty(t, key)
+
+	// The key is genuinely live on node A but absent on node B — comet state
+	// is per-node in-process, NOT shared via Redis (unlike messages/presence/
+	// revocations). This is the affinity, not a malformed key.
+	require.NotNil(t, nodeA.handler.registry.lookupKey(key), "node A holds the comet session")
+	require.Nil(t, nodeB.handler.registry.lookupKey(key), "node B has no record of it (comet state is not Redis-shared)")
+
+	// The SAME key, addressed to node B over HTTP, is 410 GONE — graceful
+	// (the SDK reconnects), which is what makes the LB-pinning fallback safe.
+	respB := cometGet(t, nodeB, "/comet/"+key+"/recv")
+	require.Equal(t, http.StatusGone, respB.StatusCode,
+		"comet is node-affine: a per-key request to the wrong node is 410 (LB must pin /comet/*)")
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
 func TestMultiNodeCrossNode_P6_0(t *testing.T) {
 	requireRedisOrSkip(t)
 	uniq := fmt.Sprintf("p60-%d", time.Now().UnixNano())

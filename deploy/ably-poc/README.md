@@ -114,6 +114,17 @@ Notes:
   connection-scoped by design; presence *history* is durable on the shadow
   channel); other in-process caches (nonce dedup window, stats fixtures)
   reset on restart — documented divergences, not data loss.
+- **Scaling to multiple machines (Phase 6, the `count=2` step is P6.5):**
+  on the Redis engine WebSocket is cross-node — message fan-out, history,
+  presence (P6.1), revocation (P6.2) and serial ordering (P6.3) all work
+  across nodes. **Comet MUST be pinned to a single machine**, because its
+  per-key state is in-process per-node (not Redis-shared): add a
+  load-balancer rule routing `/comet/*` consistently to one machine (e.g. a
+  fly [[http_service]] / fly-replay or a sticky route). Without the pin a
+  comet per-key request can hit the wrong machine and get a `410 GONE` (the
+  SDK then reconnects — functional but churny). WebSocket needs no such
+  rule. This is a documented PoC limitation (DIVERGENCES.md → comet pinned
+  to a single node); the nonce replay window (P6.2b) is likewise per-node.
 - Logs: `flyctl logs -a rt-poc-demo`.
 
 ## 2. Demo → Vercel
