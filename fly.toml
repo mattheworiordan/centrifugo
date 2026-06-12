@@ -16,11 +16,12 @@ primary_region = "lhr"
 [http_service]
   internal_port = 8080
   force_https = true
-  # A demo box that must answer the moment someone clicks a link:
-  # exactly one machine, never scaled to zero.
+  # A demo that must answer the moment someone clicks a link — and prove
+  # multi-node (P6.5): two machines, never scaled to zero. Cross-node
+  # comet works via survey forwarding (P6.4b), so no LB pinning is needed.
   auto_stop_machines = "off"
   auto_start_machines = true
-  min_machines_running = 1
+  min_machines_running = 2
 
   [[http_service.checks]]
     interval = "30s"

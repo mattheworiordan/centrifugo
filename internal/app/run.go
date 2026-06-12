@@ -300,7 +300,7 @@ func Run(cmd *cobra.Command, configFile string) {
 		}
 	}
 
-	httpServers, err := runHTTPServers(node, cfgContainer, httpAPIExecutor, keepHeadersInContext)
+	httpServers, err := runHTTPServers(node, cfgContainer, httpAPIExecutor, keepHeadersInContext, surveyCaller)
 	if err != nil {
 		log.Fatal().Err(err).Msg("error running HTTP server")
 	}

@@ -7,11 +7,12 @@ REST on the same host.
 
 > **Current live state (2026-06-12):** `rt-poc-demo` is deployed
 > Redis-backed (engine=redis, `rt-poc-redis` Upstash in lhr, eviction
-> disabled) and scaled to `count=2`. Durability and cross-node reads were
-> verified live. Two caveats: comet is **not** yet LB-pinned, so it churns
-> at count=2 (WebSocket is fine — see the scaling note below); and
-> `fly.toml` still declares `min_machines_running = 1` (the 2 machines are
-> a live CLI scale). The steps below are the reproducible runbook.
+> disabled) at `count=2` (now codified: `min_machines_running = 2`).
+> Durability and cross-node reads were verified live. Comet is fully
+> cross-node via survey forwarding (P6.4b) — no LB pinning needed; a
+> per-key request landing on the non-owning machine is forwarded to the
+> owner over the broker control channel (see the scaling note below).
+> The steps below are the reproducible runbook.
 
 ## One-time prerequisites (interactive logins)
 
@@ -125,14 +126,17 @@ Notes:
 - **Scaling to multiple machines (Phase 6, the `count=2` step is P6.5):**
   on the Redis engine WebSocket is cross-node — message fan-out, history,
   presence (P6.1), revocation (P6.2) and serial ordering (P6.3) all work
-  across nodes. **Comet MUST be pinned to a single machine**, because its
-  per-key state is in-process per-node (not Redis-shared): add a
-  load-balancer rule routing `/comet/*` consistently to one machine (e.g. a
-  fly [[http_service]] / fly-replay or a sticky route). Without the pin a
-  comet per-key request can hit the wrong machine and get a `410 GONE` (the
-  SDK then reconnects — functional but churny). WebSocket needs no such
-  rule. This is a documented PoC limitation (DIVERGENCES.md → comet pinned
-  to a single node); the nonce replay window (P6.2b) is likewise per-node.
+  across nodes. **Comet is cross-node too (P6.4b)** — no pinning or sticky
+  routing required: the connectionKey embeds the owning node id, and a
+  per-key request (`recv/send/close/disconnect`) landing on another
+  machine is forwarded to the owner over the broker control channel
+  (`node.Survey`, the same mechanism centrifuge's emulation layer uses).
+  A dead/restarted owner keeps the graceful `410 GONE` → SDK
+  reconnect+resume contract. Operators MAY still add LB affinity on
+  `/comet/*` as an optimization (it cuts forwarding hops); it is never
+  required for correctness. Design: research/14-multinode-comet.md;
+  divergence notes: DIVERGENCES.md. The nonce replay window (P6.2b)
+  remains per-node.
 
   ```sh
   # P6.5 — scale to two machines (needs REDIS_URL already set; see step 3b).

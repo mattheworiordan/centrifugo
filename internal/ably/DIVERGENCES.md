@@ -65,14 +65,17 @@ Features of the Ably service this PoC simply does not implement:
   placement into opaque connectionKeys with internal routing — same idea,
   different plumbing. Pinned by `TestMultiNodeCometCrossNode_P6_4`,
   `TestMultiNodeCometDeadOwner_P6_4`,
-  `TestMultiNodeCometForeignIdentity_P6_4`. **Wiring caveat:** a node's
-  `OnSurvey` slot must dispatch the `ably_comet_*` ops
-  (`Handler.RegisterCometSurvey` claims the slot directly when free — the
-  test harness path; the production app must mux these ops into
-  `survey.NewCaller`, the documented follow-up — until then a deployment
-  keeps the pre-P6.4 410-churn behaviour, no worse). Operators MAY layer
-  LB session affinity on `/comet/*` as an optimization (cuts forwarding
-  rate); it is never load-bearing for correctness.
+  `TestMultiNodeCometForeignIdentity_P6_4`. **Wiring:** a node's
+  `OnSurvey` slot must dispatch the `ably_comet_*` ops. The production app
+  muxes them into `survey.NewCaller` via
+  `Handler.RegisterCometSurveyWith(surveyCaller.RegisterAsyncHandler)`
+  (mux.go), so the channels survey API and comet forwarding share the
+  slot; standalone embeddings/the test harness claim the free slot
+  directly with `Handler.RegisterCometSurvey`. An embedding that wires
+  neither keeps the pre-P6.4 410-reconnect behaviour (fail-fast, no
+  hang). Operators MAY layer LB session affinity on `/comet/*` as an
+  optimization (cuts forwarding rate); it is never load-bearing for
+  correctness.
 - **Multi-message publishes are delivered as N single-message frames**,
   each with its own channelSerial (`Message.serial` is always
   `<cs>:000`). Real Ably delivers one frame per atomic batch with

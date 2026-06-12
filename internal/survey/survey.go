@@ -3,6 +3,7 @@ package survey
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/centrifugal/centrifugo/v6/internal/apiproto"
 
@@ -17,6 +18,9 @@ type Handler func(node *centrifuge.Node, data []byte) centrifuge.SurveyReply
 type Caller struct {
 	node     *centrifuge.Node
 	handlers map[string]Handler
+
+	asyncMu sync.RWMutex
+	async   map[string]centrifuge.SurveyHandler
 }
 
 func NewCaller(node *centrifuge.Node) *Caller {
@@ -25,16 +29,37 @@ func NewCaller(node *centrifuge.Node) *Caller {
 		handlers: map[string]Handler{
 			"channels": respondChannelsSurvey,
 		},
+		async: map[string]centrifuge.SurveyHandler{},
 	}
 	c.node.OnSurvey(func(event centrifuge.SurveyEvent, cb centrifuge.SurveyCallback) {
-		h, ok := c.handlers[event.Op]
-		if !ok {
-			cb(centrifuge.SurveyReply{Code: MethodNotFound})
+		if h, ok := c.handlers[event.Op]; ok {
+			cb(h(c.node, event.Data))
 			return
 		}
-		cb(h(c.node, event.Data))
+		c.asyncMu.RLock()
+		ah, ok := c.async[event.Op]
+		c.asyncMu.RUnlock()
+		if ok {
+			ah(event, cb)
+			return
+		}
+		cb(centrifuge.SurveyReply{Code: MethodNotFound})
 	})
 	return c
+}
+
+// RegisterAsyncHandler registers a raw survey handler for one op. The
+// handler receives the survey callback directly so it may reply from its
+// own goroutine — required for handlers that block (the Ably adapter's
+// comet cross-node forwarding ops park a long-poll for seconds, which must
+// never run on the control-plane goroutine). Registration happens during
+// startup wiring; the lock makes it safe against in-flight surveys, which
+// see MethodNotFound until the op is registered (callers treat that as
+// node-unreachable and degrade).
+func (c *Caller) RegisterAsyncHandler(op string, h centrifuge.SurveyHandler) {
+	c.asyncMu.Lock()
+	defer c.asyncMu.Unlock()
+	c.async[op] = h
 }
 
 const (

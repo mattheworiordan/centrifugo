@@ -148,16 +148,33 @@ func (h *Handler) forwardComet(ctx context.Context, op, nodeID string, req comet
 	return res.Code, res.Data
 }
 
+// cometSurveyDispatch is the survey-slot entrypoint for the comet ops; an
+// op outside the comet family answers bad-request (this dispatcher should
+// only ever see ops registered for it).
+func (h *Handler) cometSurveyDispatch(e centrifuge.SurveyEvent, cb centrifuge.SurveyCallback) {
+	if !h.HandleCometSurvey(e, cb) {
+		cb(centrifuge.SurveyReply{Code: cometForwardBadRequest})
+	}
+}
+
 // RegisterCometSurvey claims the node's OnSurvey slot with the comet
 // forwarding dispatcher. For the test harness and standalone embeddings
-// ONLY: the production app's slot is owned by survey.NewCaller — these ops
-// must be muxed into that handler instead (the documented follow-up).
+// ONLY: the production app's slot is owned by survey.NewCaller — use
+// RegisterCometSurveyWith to mux the ops into it instead.
 func (h *Handler) RegisterCometSurvey() {
-	h.node.OnSurvey(func(e centrifuge.SurveyEvent, cb centrifuge.SurveyCallback) {
-		if !h.HandleCometSurvey(e, cb) {
-			cb(centrifuge.SurveyReply{Code: cometForwardBadRequest})
-		}
-	})
+	h.node.OnSurvey(h.cometSurveyDispatch)
+}
+
+// RegisterCometSurveyWith hands the comet forwarding ops to an external
+// per-op survey dispatcher that owns the node's OnSurvey slot — the
+// production app's survey.Caller (RegisterAsyncHandler). The handler may
+// reply asynchronously from its own goroutine (HandleCometSurvey's
+// contract), so the dispatcher must pass the survey callback through
+// rather than expect a synchronous reply.
+func (h *Handler) RegisterCometSurveyWith(register func(op string, handler centrifuge.SurveyHandler)) {
+	for _, op := range []string{cometSurveyRecvOp, cometSurveySendOp, cometSurveyCloseOp} {
+		register(op, h.cometSurveyDispatch)
+	}
 }
 
 // HandleCometSurvey dispatches one comet forward op, reporting false for

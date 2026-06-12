@@ -21,6 +21,7 @@ import (
 	"github.com/centrifugal/centrifugo/v6/internal/devpage"
 	"github.com/centrifugal/centrifugo/v6/internal/health"
 	"github.com/centrifugal/centrifugo/v6/internal/middleware"
+	"github.com/centrifugal/centrifugo/v6/internal/survey"
 	"github.com/centrifugal/centrifugo/v6/internal/swaggerui"
 	"github.com/centrifugal/centrifugo/v6/internal/tools"
 	"github.com/centrifugal/centrifugo/v6/internal/unihttpstream"
@@ -115,7 +116,7 @@ func (flags HandlerFlag) String() string {
 
 // Mux returns a mux including set of default handlers for Centrifugo server.
 func Mux(
-	n *centrifuge.Node, cfgContainer *config.Container, apiExecutor *api.Executor, flags HandlerFlag, keepHeadersInContext bool, wtServer *webtransport.Server,
+	n *centrifuge.Node, cfgContainer *config.Container, apiExecutor *api.Executor, flags HandlerFlag, keepHeadersInContext bool, wtServer *webtransport.Server, surveyCaller *survey.Caller,
 ) *http.ServeMux {
 	mux := http.NewServeMux()
 	cfg := cfgContainer.Config()
@@ -238,6 +239,13 @@ func Mux(
 		ablyHandler, err := ably.NewHandler(n, cfg.Ably, ablyPresenceMgr, getCheckOrigin(cfg))
 		if err != nil {
 			log.Fatal().Err(err).Msg("error creating ably handler")
+		}
+		// P6.4(b): comet cross-node forwarding rides the node's survey slot,
+		// which the app's survey.Caller owns — mux the ably_comet_* ops into
+		// it so a per-key comet request landing on a non-owning node reaches
+		// the owner (without this, cross-node comet degrades to 410-reconnect).
+		if surveyCaller != nil {
+			ablyHandler.RegisterCometSurveyWith(surveyCaller.RegisterAsyncHandler)
 		}
 		mux.Handle("/", connChain.Then(ablyHandler))
 	}
@@ -421,7 +429,7 @@ func emulationHandlerConfig(cfg config.Config) centrifuge.EmulationConfig {
 }
 
 func runHTTPServers(
-	n *centrifuge.Node, cfgContainer *config.Container, apiExecutor *api.Executor, keepHeadersInContext bool,
+	n *centrifuge.Node, cfgContainer *config.Container, apiExecutor *api.Executor, keepHeadersInContext bool, surveyCaller *survey.Caller,
 ) ([]*http.Server, error) {
 	cfg := cfgContainer.Config()
 
@@ -569,7 +577,7 @@ func runHTTPServers(
 			}
 		}
 
-		mux := Mux(n, cfgContainer, apiExecutor, handlerFlags, keepHeadersInContext, wtServer)
+		mux := Mux(n, cfgContainer, apiExecutor, handlerFlags, keepHeadersInContext, wtServer, surveyCaller)
 
 		var h3Server *http3.Server
 		if useHTTP3 {
