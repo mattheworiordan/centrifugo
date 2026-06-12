@@ -19,6 +19,7 @@ import (
 
 	"github.com/centrifugal/centrifugo/v6/internal/ably/auth"
 	"github.com/centrifugal/centrifugo/v6/internal/ably/protocol"
+	"github.com/centrifugal/centrifugo/v6/internal/ably/serial"
 	"github.com/centrifugal/centrifugo/v6/internal/configtypes"
 	"github.com/centrifugal/centrifugo/v6/internal/websocket"
 
@@ -67,8 +68,29 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, checkOrigin func(r *http
 	if checkOrigin != nil {
 		upgrade.CheckOrigin = checkOrigin
 	}
+	// D3: seed a cold channel's serial generator from the broker high-water
+	// (the latest retained publication's channelSerial tag), so after a
+	// restart — or an A4b generator eviction — the next serial is strictly
+	// greater than any prior one and continuity never regresses. On the
+	// memory engine history is empty after a restart (fresh world), so the
+	// seed is a no-op there; on the Redis engine it recovers the sequence.
+	seed := func(channel string) (int64, int, bool) {
+		res, err := n.History(brokerChannel(channel), centrifuge.WithLimit(1), centrifuge.WithReverse(true))
+		if err != nil || len(res.Publications) == 0 {
+			return 0, 0, false
+		}
+		cs := res.Publications[0].Tags[pubTagSerial]
+		if cs == "" {
+			return 0, 0, false
+		}
+		ts, counter, err := serial.ParseChannelSerial(cs)
+		if err != nil {
+			return 0, 0, false
+		}
+		return ts, counter, true
+	}
 	h := &Handler{
-		mint:         newSerialMint(),
+		mint:         newSerialMint(seed),
 		materialized: newMaterializedStore(),
 		revocations:  newRevocationStore(),
 		registry:     newSessionRegistry(),

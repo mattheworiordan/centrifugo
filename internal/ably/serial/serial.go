@@ -146,6 +146,36 @@ func ParseMessageSerial(s string) (channelSerial string, idx int, err error) {
 	return channelSerial, idx, nil
 }
 
+// ParseChannelSerial splits a channelSerial `<ts>-<ctr>@<series>` into its
+// timestamp and counter — used by persistent backends to seed a generator
+// on a cold channel (Restore) so the next mint is strictly greater than the
+// stored high-water. The seriesId tail is intentionally ignored: a recovered
+// generator mints under THIS process's seriesId, so only the ts/counter need
+// restoring for monotonicity.
+func ParseChannelSerial(s string) (ts int64, counter int, err error) {
+	at := strings.IndexByte(s, '@')
+	if at < 0 {
+		return 0, 0, fmt.Errorf("serial: %q is not a channelSerial (no '@')", s)
+	}
+	tsCtr := s[:at]
+	dash := strings.IndexByte(tsCtr, '-')
+	if dash < 0 {
+		return 0, 0, fmt.Errorf("serial: %q is not a channelSerial (no '-')", s)
+	}
+	ts, err = strconv.ParseInt(tsCtr[:dash], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("serial: %q has non-integer timestamp: %w", s, err)
+	}
+	counter, err = strconv.Atoi(tsCtr[dash+1:])
+	if err != nil {
+		return 0, 0, fmt.Errorf("serial: %q has non-integer counter: %w", s, err)
+	}
+	if ts < 0 || counter < 0 {
+		return 0, 0, fmt.Errorf("serial: %q has a negative component", s)
+	}
+	return ts, counter, nil
+}
+
 // TimestampBounds maps an inclusive ms-since-epoch range to a
 // half-open lex range over channelSerials. Useful for backends that
 // implement timestamp-bounded history reads via prefix/range scans on

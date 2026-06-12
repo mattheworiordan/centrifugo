@@ -40,15 +40,22 @@ const pubTagSerial = "s"
 // concurrent use.
 type serialMint struct {
 	seriesID string
+	// seed recovers a channel's high-water (ts, counter) from durable
+	// storage when a generator is created cold — a fresh process (D3,
+	// restart survival) or an evicted generator (A4b). Returns ok=false
+	// when there is no prior serial (empty/aged-out history). nil disables
+	// recovery (memory-only callers that never restart).
+	seed func(channel string) (ts int64, counter int, ok bool)
 
 	mu    sync.Mutex
 	gens  map[string]*serial.Generator
 	locks map[string]*sync.Mutex
 }
 
-func newSerialMint() *serialMint {
+func newSerialMint(seed func(channel string) (ts int64, counter int, ok bool)) *serialMint {
 	return &serialMint{
 		seriesID: serial.NewSeriesID(),
+		seed:     seed,
 		gens:     make(map[string]*serial.Generator),
 		locks:    make(map[string]*sync.Mutex),
 	}
@@ -73,13 +80,31 @@ func (m *serialMint) lockChannel(channel string) func() {
 }
 
 // Mint returns the next channelSerial for channel.
+//
+// On a COLD channel (no in-memory generator — a fresh process after a
+// restart, or a generator evicted by A4b), the generator is seeded from the
+// broker high-water (D3) so the first post-restart serial is strictly
+// greater than any pre-restart serial and continuity never regresses. The
+// seed read happens OUTSIDE m.mu: every Mint caller holds the channel's
+// publish lock (lockChannel), so at most one goroutine mints a given channel
+// at a time — there is no concurrent creator to race, and holding m.mu
+// (which lockChannel also takes) across the broker read would stall every
+// other channel's publishers.
 func (m *serialMint) Mint(channel string) string {
 	m.mu.Lock()
 	gen, ok := m.gens[channel]
-	if !ok {
-		gen = serial.NewGenerator(m.seriesID, nil)
-		m.gens[channel] = gen
+	m.mu.Unlock()
+	if ok {
+		return gen.Mint()
 	}
+	gen = serial.NewGenerator(m.seriesID, nil)
+	if m.seed != nil {
+		if ts, counter, ok := m.seed(channel); ok {
+			gen.Restore(ts, counter)
+		}
+	}
+	m.mu.Lock()
+	m.gens[channel] = gen
 	m.mu.Unlock()
 	return gen.Mint()
 }
