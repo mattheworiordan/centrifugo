@@ -1,5 +1,12 @@
 # Centrifugo
 
+> **This is a fork with an experiment on top.** It teaches Centrifugo to
+> speak the **Ably wire protocol**, so unmodified Ably SDKs connect to it as
+> if it were Ably. If that's why you're here, start with
+> [`internal/ably/README.md`](internal/ably/README.md) — what it is, what
+> works, what we learned about build-vs-adapt, and where it falls short.
+> Everything below this note is upstream Centrifugo's own README.
+
 _Scalable real-time messaging server in a language-agnostic way._
 
 [![CI](https://github.com/centrifugal/centrifugo/actions/workflows/test.yml/badge.svg)](https://github.com/centrifugal/centrifugo/actions/workflows/test.yml)

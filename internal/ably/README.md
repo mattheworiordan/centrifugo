@@ -4,10 +4,10 @@ If you arrived here after playing with the demo at
 [rt-poc-chat-demo.vercel.app](https://rt-poc-chat-demo.vercel.app): the
 "Ably" service behind it isn't Ably. It's
 [Centrifugo](https://github.com/centrifugal/centrifugo) — an open-source
-realtime server — with an Ably-protocol adapter bolted on, running on a
-single small fly.io machine at `rt-poc-demo.fly.dev`. The demo is the
-official AIT (Ably AI Transport) browser demo, completely unmodified,
-talking to it with the stock `ably-js` SDK.
+realtime server — with an Ably-protocol adapter bolted on, running
+Redis-backed across two small fly.io machines at `rt-poc-demo.fly.dev`.
+The demo is the official AIT (Ably AI Transport) browser demo, completely
+unmodified, talking to it with the stock `ably-js` SDK.
 
 ## What this was
 
@@ -55,6 +55,18 @@ run against this server (`make ably-poc-test` reproduces it):
 - REST error surface aligned with the real service (same envelope
   shape, headers, help links, and the browser courtesy page —
   `serverId`/`X-Ably-Cluster` make it obvious which stack answered).
+- **Durable and multi-node** (the later hardening + Redis work): on the
+  Redis engine, message history, channel serials, and materialized
+  mutable-message state survive a restart/redeploy, and the adapter runs
+  across multiple nodes. Cross-node messaging, presence, token
+  revocation, idempotent publish, connection resume, and the AIT chat all
+  work across nodes; comet's per-key requests forward to their owning node
+  over the broker control channel (no load-balancer pinning needed).
+  **Deployed live at two machines** and verified there: a message survived
+  a full restart of every machine, a publish on one machine was read on
+  the other, and a comet session was driven end-to-end across machines.
+  The single-node test gate stays green (481 tests) on **both** the memory
+  and Redis engines.
 
 Numbers, spec-point citations, and the per-suite breakdown live in
 [SCORECARD.md](SCORECARD.md).
@@ -63,14 +75,62 @@ Numbers, spec-point citations, and the per-suite breakdown live in
 
 The honest list is in [DIVERGENCES.md](DIVERGENCES.md). Headlines:
 
-- **Single node, in-memory** — no clustering, no durable storage; a
-  restart is a fresh world. Message history retention mimics Ably's
-  tiers but lives in RAM.
-- **No push notifications, LiveObjects, annotations/summaries, delta
-  compression (vcdiff), server-side message filtering, or channel
-  enumeration/metachannels.**
+- **Not production availability — this is the big one.** The Redis
+  engine makes state durable and multi-node, but that proves the
+  *sharding and delivery* architecture, not the Four Pillars. There is no
+  failover-without-message-loss on node death, no connection rebalancing,
+  no multi-region, and durability rests on Redis's own persistence
+  config; a single Redis is a SPOF. This is the expensive, unproven half,
+  and the real next decision for the build-vs-adapt question.
+- **It's a subset of the spec** — roughly 35–45% of Ably's addressable
+  surface (the audit's estimate). **No push notifications, LiveObjects,
+  annotations/summaries, delta compression (vcdiff), server-side message
+  filtering, or channel enumeration/metachannels.**
 - Auth is verify-only (no token minting service beyond `requestToken`),
   and several recovery/identity edges are softer than the real service.
+- Smaller documented divergences (each bounded, none hidden) include a
+  per-node nonce-replay window, per-node stats, and cosmetic cross-node
+  serial ordering — see [DIVERGENCES.md](DIVERGENCES.md).
+
+## What we learned
+
+On the build-vs-adapt question, the experiment is a qualified **yes for
+de-risking**, with one large caveat.
+
+- **The cheap wins stayed cheap.** Pub/sub, history, presence, and —
+  critically — *cross-node messaging* came almost for free from
+  Centrifugo's Redis broker. Publish on one node, subscribe on another,
+  shared history, idempotent publish: all from the library, not from us.
+  That is the bulk of what makes a realtime server multi-node, and it's
+  the strongest signal that "adapt" is a viable way to de-risk.
+- **The Ably-specific surface was net-new but bounded.** Connection
+  resume, presence SYNC, capability auth, msgpack, message serials,
+  mutable messages, and the comet transport are all things Centrifugo
+  doesn't model. Each became an adapter layer *on top* — Centrifugo is
+  unmodified apart from mounting the adapter, not forked. The serial
+  design proved forward-compatible: cursors resolve by offset lookup, not
+  serial arithmetic, so going multi-node needed no serial rewrite.
+- **Comet was the one genuinely awkward fit, and it's instructive.** Its
+  per-request state can't live where WebSocket's does. The fix reused
+  Centrifugo's own emulation trick — forward the request to the owning
+  node over the control channel — which is the same shape real Ably uses
+  (placement encoded in an opaque connectionKey). That it could be solved
+  *within the stack* and portably is a good sign.
+- **An LLM built all of it, unattended.** No human wrote or edited a line
+  of adapter code; the agent used the public spec and the official SDK
+  suites as its oracle and gated every commit through an independent
+  review agent. The hardening, durability, and multi-node phases were
+  also run as unattended loops. That is a data point about *how* such a
+  thing can be built, independent of whether to ship it.
+
+**The honest verdict:** adapting Centrifugo de-risks the *protocol
+fidelity* and *sharding/delivery* claims convincingly and cheaply. It does
+**not** de-risk *availability* — the Four Pillars — at all; that was
+deliberately out of scope and is the harder, more expensive half. The open
+question this PoC sets up but does not answer: does the path from here
+(≈35–45% of spec, single-Redis, demo-grade availability) to a production
+service stay cheaper than a greenfield build, once the availability work
+and the long tail of spec divergences are paid for?
 
 ## Where to look
 
@@ -106,4 +166,9 @@ Centrifugo's protocol, escapes Ably channel names into Centrifugo-safe
 broker names, mints Ably-style message serials atomically with broker
 appends so serial order always equals stream order, and keeps adapter-
 owned stores for presence, materialized mutable messages, tokens, and
-stats. Centrifugo itself is unmodified apart from mounting the adapter.
+stats. On the Redis engine these go multi-node: the broker fans messages
+across nodes, message history / serials / materialized state become
+durable, presence and token revocation are Redis-backed or broadcast over
+the control channel, and comet per-key requests are forwarded to their
+owning node. Centrifugo itself is unmodified apart from mounting the
+adapter.
