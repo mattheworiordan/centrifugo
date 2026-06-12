@@ -56,7 +56,7 @@ const d7RedisAddr = "127.0.0.1:6399"
 func requireRedisOrSkip(t *testing.T) {
 	t.Helper()
 	if os.Getenv("ABLY_REDIS_TEST") != "1" {
-		t.Skip("set ABLY_REDIS_TEST=1 (with Redis on " + d7RedisAddr + ") to run the restart-durability suite")
+		t.Skip("set ABLY_REDIS_TEST=1 (with Redis on " + d7RedisAddr + ") to run the Redis integration suites (D5/D7 durability, P6 multi-node)")
 	}
 	conn, err := net.DialTimeout("tcp", d7RedisAddr, time.Second)
 	if err != nil {
