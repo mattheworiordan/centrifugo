@@ -94,6 +94,41 @@ func TestMultiNodeCrossNodePresence_P6_1(t *testing.T) {
 	nodeB.stop()
 }
 
+// P6.2(c) — cross-node idempotent publish. A republish carrying the same
+// client-supplied message id (RSL1k2 → centrifuge WithIdempotencyKey) is
+// deduplicated by the Redis broker's idempotency cache ACROSS nodes: publish
+// id X on node A and again on node B → history holds exactly ONE copy. This
+// is free from the Redis broker (D1); the test locks it in.
+func TestMultiNodeCrossNodeIdempotency_P6_2(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p62idem-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+	ch := "persisted:" + uniq + "-idem"
+	id := uniq + ":0" // client-supplied id = idempotency key (RSL1k2)
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+
+	body := `{"id":"` + id + `","name":"x","data":"once"}`
+	// Same id published on BOTH nodes.
+	d7Publish(t, nodeA, ch, body)
+	d7Publish(t, nodeB, ch, body)
+
+	// History (shared Redis stream) holds exactly one copy — the second
+	// publish was deduped cross-node by the broker idempotency cache.
+	require.Equal(t, 1, d7HistoryCount(t, nodeA, ch),
+		"the same idempotency key published on two nodes yields ONE message (cross-node dedup)")
+	require.Equal(t, 1, d7HistoryCount(t, nodeB, ch))
+
+	// Control: a DISTINCT id is NOT deduped — proves the dedup is keyed, not
+	// the channel trivially capping at one.
+	d7Publish(t, nodeB, ch, `{"id":"`+uniq+`:1","name":"x","data":"twice"}`)
+	require.Equal(t, 2, d7HistoryCount(t, nodeA, ch), "a distinct id adds a second message")
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
 func TestMultiNodeCrossNode_P6_0(t *testing.T) {
 	requireRedisOrSkip(t)
 	uniq := fmt.Sprintf("p60-%d", time.Now().UnixNano())
