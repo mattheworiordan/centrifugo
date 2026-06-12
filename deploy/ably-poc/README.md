@@ -148,6 +148,36 @@ Notes:
   # (TestMultiNode*_P6_* with ABLY_REDIS_TEST=1) already proves delivery,
   # presence, revocation, serial order, cross-node resume and AIT rewind.
   ```
+
+- **Testing comet (HTTP long-polling) on the live deployment:** the
+  simplest check is the browser demo forced onto the comet transport —
+  open `https://rt-poc-chat-demo.vercel.app/?transport=xhr_polling` and
+  watch the Network tab fill with `/comet/connect`, `/recv` and `/send`
+  requests (round-robined across both machines by fly; forwarding makes
+  that safe). To prove the cross-node path explicitly from a shell, pin
+  each request to a machine (ids from `flyctl machines list -a rt-poc-demo`):
+
+  ```sh
+  AUTH="<keyName>:<keySecret>"        # the deployed app key
+  URL=https://rt-poc-demo.fly.dev
+  MA=<machine-a-id>; MB=<machine-b-id>
+
+  # 1. comet connect on machine A → note connectionDetails.connectionKey
+  curl -s -u "$AUTH" -H "fly-force-instance-id: $MA" "$URL/comet/connect"
+  # 2. ATTACH via machine B — forwarded to the owner, answers 204 (not 410)
+  curl -s -u "$AUTH" -H "fly-force-instance-id: $MB" -X POST \
+    -H "Content-Type: application/json" \
+    -d '[{"action":10,"channel":"x-node-test"}]' "$URL/comet/<key>/send"
+  # 3. long-poll via machine B — returns the ATTACHED frame (action 11)
+  curl -s -u "$AUTH" -H "fly-force-instance-id: $MB" "$URL/comet/<key>/recv"
+  # 4. clean close via machine B — 204; the key then answers 410 everywhere
+  curl -s -u "$AUTH" -H "fly-force-instance-id: $MB" "$URL/comet/<key>/close"
+  ```
+
+  The `x-ably-serverid` response header names the machine that served each
+  request (`centrifugo-adapter.<machine-id>`), so the cross-machine hop is
+  visible per response. In an Ably SDK, comet is forced with
+  `transports: ['xhr_polling']` in ClientOptions.
 - Logs: `flyctl logs -a rt-poc-demo`.
 
 ## 2. Demo → Vercel

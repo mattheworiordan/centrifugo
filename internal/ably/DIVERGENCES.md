@@ -7,9 +7,10 @@
 > memory engine (single-node, ephemeral — the default for the conformance
 > gate) or the Redis engine (durable message history / channel serials /
 > materialized mutable-message state across a restart, and multi-node —
-> Phase 5/6). The multi-node bounds below (comet pinning, per-node nonce,
-> per-node stats, cosmetic cross-node serial ordering) apply only on the
-> Redis engine with more than one node.
+> Phase 5/6). The multi-node bounds below (per-node nonce, per-node
+> stats, cosmetic cross-node serial ordering) apply only on the Redis
+> engine with more than one node; comet is fully cross-node via survey
+> forwarding (P6.4b).
 
 ## Not supported
 
