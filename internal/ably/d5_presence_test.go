@@ -75,15 +75,19 @@ func TestPresenceDurability_D5(t *testing.T) {
 	n2 := buildRedisServer(t, prefix)
 
 	// DURABLE: the presence enter event survived in Redis (shadow channel).
+	// This is D5's enduring concern — presence HISTORY (the enter/leave event
+	// log) is durable across a restart, distinct from the live member set.
 	require.GreaterOrEqual(t, d5PresenceHistoryCount(t, n2, presChan), 1,
 		"presence HISTORY survived the restart via the Redis shadow channel")
 
-	// DIVERGENCE (intentional, accepted): the live presence set is NOT rebuilt
-	// from history — members re-sync on reconnect (the SDK re-enters). A node
-	// restart dropped every connection, so the empty live set is correct, not
-	// a loss; rebuilding it would manufacture ghost members.
-	require.Empty(t, n2.handler.presence.members(presChan),
-		"live presence set is intentionally empty post-restart — re-syncs on reconnect (D5 decision)")
+	// NOTE: D5 originally deferred Redis-backing the live member set and
+	// asserted it was empty post-restart (re-synced on reconnect). P6.1
+	// SUPERSEDED that deferral — the live set is now cross-node Redis-backed
+	// (a separate presence manager, NOT a replay of shadow history, so no
+	// ghosts), so a member entered on a node persists in the shared set until
+	// the owning node's TTL expires (the documented dead-node-cleanup bound).
+	// The live-set behaviour is therefore exercised by
+	// TestMultiNodeCrossNodePresence_P6_1, not by an "empty" assertion here.
 
 	n2.stop()
 }
