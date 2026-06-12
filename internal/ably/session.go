@@ -1729,6 +1729,7 @@ func (s *session) deliverPublication(channel string, pub *cproto.Publication) {
 // trailing window by create-anchored timestamp (AIT attaches with
 // rewind='2m').
 func (s *session) materializedRewind(channel, spec string) []protocol.Message {
+	rebuildMaterialized(s.node, s.materialized, channel) // D4: rebuild from history on a cold channel (post-restart)
 	if n, err := strconv.Atoi(spec); err == nil {
 		return s.materialized.latest(channel, n)
 	}

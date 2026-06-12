@@ -300,6 +300,7 @@ func (h *Handler) serveGetMessage(rw http.ResponseWriter, r *http.Request, chann
 		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit history")
 		return
 	}
+	rebuildMaterialized(h.node, h.materialized, channel) // D4: rebuild from history on a cold channel (post-restart)
 	msg, ok := h.materialized.get(channel, serial)
 	if !ok {
 		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "message not found")
@@ -324,6 +325,7 @@ func (h *Handler) serveMessageVersions(rw http.ResponseWriter, r *http.Request, 
 		h.writeError(rw, r, http.StatusUnauthorized, errCodeOperationNotPermitted, "capability does not permit history")
 		return
 	}
+	rebuildMaterialized(h.node, h.materialized, channel) // D4: rebuild from history on a cold channel (post-restart)
 	versions, ok := h.materialized.versions(channel, serial)
 	if !ok {
 		h.writeError(rw, r, http.StatusNotFound, errCodeNotFound, "message not found")

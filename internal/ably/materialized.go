@@ -60,6 +60,11 @@ type materializedStore struct {
 	channels map[string]map[string]*materializedEntry // channel → serial → entry
 	// order tracks creation order per channel for rewind (last N).
 	order map[string][]string
+	// loaded marks channels whose materialized state has been reconciled
+	// with broker history once in this process (D4) — so the lazy
+	// rebuild-from-history runs at most once per channel and a single
+	// goroutine owns the replay (concurrent replays would double-apply ops).
+	loaded map[string]bool
 }
 
 type materializedEntry struct {
@@ -111,7 +116,38 @@ func newMaterializedStore() *materializedStore {
 	return &materializedStore{
 		channels: make(map[string]map[string]*materializedEntry),
 		order:    make(map[string][]string),
+		loaded:   make(map[string]bool),
 	}
+}
+
+// markLoadedIfAbsent claims the one-time history rebuild for a channel (D4).
+// It returns true when no rebuild is needed — the channel is already loaded,
+// or already holds entries from live traffic (current, no rebuild). It
+// returns false (and marks the channel loaded) for exactly one caller, which
+// then owns the replay; clearLoaded reverts the claim if that replay cannot
+// proceed (e.g. history unavailable).
+//
+// loaded is intentionally NOT cleared when A3 TTL-evicts a channel's entries:
+// the materialized TTL (persistedHistoryTTL) is aligned with the broker
+// WithHistory TTL, so when an entry expires the history it would rebuild from
+// has expired too — there is no recoverable state to reload, and skipping the
+// rebuild (returning a clean 404) is correct.
+func (s *materializedStore) markLoadedIfAbsent(channel string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.loaded[channel] || len(s.channels[channel]) > 0 {
+		s.loaded[channel] = true
+		return true
+	}
+	s.loaded[channel] = true
+	return false
+}
+
+// clearLoaded reverts a load claim so a later read retries the rebuild.
+func (s *materializedStore) clearLoaded(channel string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.loaded, channel)
 }
 
 // create registers a freshly published message as materialized state.
