@@ -3,8 +3,13 @@
 > What this adapter does differently from (or not at all compared to)
 > the production Ably service, as it stands today. This is a snapshot of
 > the current state, not a change log: gaps that get closed are removed
-> from this document. Single-node PoC throughout — the broker is
-> centrifuge's memory engine.
+> from this document. The adapter runs on either centrifuge engine: the
+> memory engine (single-node, ephemeral — the default for the conformance
+> gate) or the Redis engine (durable message history / channel serials /
+> materialized mutable-message state across a restart, and multi-node —
+> Phase 5/6). The multi-node bounds below (comet pinning, per-node nonce,
+> per-node stats, cosmetic cross-node serial ordering) apply only on the
+> Redis engine with more than one node.
 
 ## Not supported
 
@@ -18,15 +23,20 @@ Features of the Ably service this PoC simply does not implement:
   incompatible; the `delta` channel param is accepted and ignored.
 - **Server-side message filtering** (filtered channel subscriptions).
 - **Channel enumeration, metachannels, and channel lifecycle metadata.**
-- **Clustering / multi-node / durable storage.** One node, all state in
-  memory: message history, presence, materialized mutable messages,
-  token nonces, revocations, stats. A restart or redeploy is a fresh
-  world. History retention mimics Ably's tiers (persistent channels
-  1000 msgs / 24h; everything else ~2 min) but in RAM.
+- **Production durability / availability guarantees.** The Redis engine
+  makes message history, channel serials and materialized mutable-message
+  state durable across a restart/redeploy and serves them across nodes
+  (Phase 5/6), but this is a PoC of the *sharding & delivery* architecture,
+  not the Four Pillars: no failover-without-loss on node death, no
+  connection rebalancing, no multi-region, and Redis data loss (AOF/RDB) is
+  out of scope (Upstash's concern). On the memory engine all state is in
+  RAM and a restart is a fresh world.
 - **Stats are fixture-backed, not metered.** The server never records
   its own usage; `GET /stats` serves what `POST /stats` injected (the
   sandbox fixture mechanism the SDK test harness uses). Re-injecting an
-  intervalId replaces its record.
+  intervalId replaces its record. **Multi-node:** the stats fixture store
+  is per-node, so `GET /stats` reflects whichever node the load balancer
+  routes to — an accepted PoC divergence (P6.5).
 
 ## Behavioral differences
 

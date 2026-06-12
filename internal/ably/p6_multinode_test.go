@@ -301,6 +301,100 @@ func TestMultiNodeCometAffinity_P6_4(t *testing.T) {
 	nodeB.stop()
 }
 
+// P6.5 assertion (3) — cross-node resume (the headline). A connection on
+// node A notes a channelSerial; the connection drops; a NEW connection on
+// node B re-attaches with that serial and resumes cleanly — RESUMED, with the
+// gap published meanwhile replayed in order, no loss. The cursor minted on
+// node A resolves on node B because resolveCursor reads the SHARED Redis
+// history by exact-match tag lookup (P6.3).
+func TestMultiNodeResumeCrossNode_P6_5(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p65resume-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+	ch := "persisted:" + uniq + "-resume"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+
+	// On node A: attach, publish msg-0, take its channelSerial as the resume
+	// cursor, then DROP the connection.
+	connA := connectRealtime(t, nodeA)
+	writeFrame(t, connA, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: ch})
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, connA).Action)
+	cursor := publishAndTakeSerial(t, connA, ch, "msg-0", 0)
+	_ = connA.Close() // the connection drops (node A loses it)
+
+	// The gap is published via node B while the client is away.
+	connB1 := connectRealtime(t, nodeB)
+	writeFrame(t, connB1, &protocol.ProtocolMessage{Action: protocol.ActionAttach, Channel: ch})
+	require.Equal(t, protocol.ActionAttached, readNonHeartbeatFrame(t, connB1).Action)
+	publishAndTakeSerial(t, connB1, ch, "gap-1", 0)
+	publishAndTakeSerial(t, connB1, ch, "gap-2", 1)
+
+	// Resume on NODE B with node A's cursor → RESUMED + the two gap messages
+	// in order. Cross-node continuity, no loss.
+	connB2 := connectRealtime(t, nodeB)
+	writeFrame(t, connB2, &protocol.ProtocolMessage{
+		Action:        protocol.ActionAttach,
+		Channel:       ch,
+		ChannelSerial: cursor,
+	})
+	attached := readNonHeartbeatFrame(t, connB2)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.Equal(t, protocol.FlagResumed, attached.Flags&protocol.FlagResumed,
+		"cross-node continuity: a cursor minted on node A resumes RESUMED on node B")
+	first := readNonHeartbeatFrame(t, connB2)
+	require.Equal(t, protocol.ActionMessage, first.Action)
+	require.Equal(t, "gap-1", first.Messages[0].Name, "gap replayed on the other node, no loss")
+	second := readNonHeartbeatFrame(t, connB2)
+	require.Equal(t, protocol.ActionMessage, second.Action)
+	require.Equal(t, "gap-2", second.Messages[0].Name)
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
+// P6.5 assertion (5) — AIT cross-node: create+append a mutable message via
+// node A, then a realtime rewind on node B reconstructs the materialized
+// state byte-exact (D4 is cross-node by construction — node B rebuilds from
+// the shared Redis op stream).
+func TestMultiNodeAITRewindCrossNode_P6_5(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p65ait-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+	mutChan := "mutable:" + uniq + "-ait"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+
+	// Create + append on node A.
+	createSerials := d7Publish(t, nodeA, mutChan, `{"name":"orig","data":"Hello"}`)
+	require.Len(t, createSerials, 1)
+	patchResp := restRequest(t, nodeA, http.MethodPatch, "/channels/"+mutChan+"/messages/"+url.PathEscape(createSerials[0]),
+		[]byte(`{"action":5,"data":" World","version":{"clientId":"op"}}`),
+		map[string]string{"Content-Type": "application/json"})
+	require.Equal(t, http.StatusOK, patchResp.StatusCode)
+
+	// Realtime rewind on node B reconstructs the materialized message.
+	conn := connectRealtime(t, nodeB)
+	writeFrame(t, conn, &protocol.ProtocolMessage{
+		Action:  protocol.ActionAttach,
+		Channel: mutChan,
+		Params:  map[string]string{"rewind": "1"},
+	})
+	attached := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionAttached, attached.Action)
+	require.Equal(t, protocol.FlagHasBacklog, attached.Flags&protocol.FlagHasBacklog)
+	backlog := readNonHeartbeatFrame(t, conn)
+	require.Equal(t, protocol.ActionMessage, backlog.Action)
+	require.Len(t, backlog.Messages, 1)
+	require.Equal(t, "Hello World", backlog.Messages[0].Data,
+		"node B's realtime rewind reconstructs the materialized state created on node A (D4 cross-node)")
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
 func TestMultiNodeCrossNode_P6_0(t *testing.T) {
 	requireRedisOrSkip(t)
 	uniq := fmt.Sprintf("p60-%d", time.Now().UnixNano())

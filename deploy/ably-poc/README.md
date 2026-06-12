@@ -125,6 +125,17 @@ Notes:
   SDK then reconnects — functional but churny). WebSocket needs no such
   rule. This is a documented PoC limitation (DIVERGENCES.md → comet pinned
   to a single node); the nonce replay window (P6.2b) is likewise per-node.
+
+  ```sh
+  # P6.5 — scale to two machines (needs REDIS_URL already set; see step 3b).
+  flyctl scale count=2 -a rt-poc-demo
+  # Browser-verify cross-node: open the demo in two tabs and confirm chat
+  # streams between them; force the tabs onto DIFFERENT machines to prove the
+  # cross-node path (fly routes by `fly-force-instance=<machine-id>` header,
+  # or open from two regions). The local two-node validation suite
+  # (TestMultiNode*_P6_* with ABLY_REDIS_TEST=1) already proves delivery,
+  # presence, revocation, serial order, cross-node resume and AIT rewind.
+  ```
 - Logs: `flyctl logs -a rt-poc-demo`.
 
 ## 2. Demo → Vercel
