@@ -47,18 +47,22 @@ Features of the Ably service this PoC simply does not implement:
   long-poll responses are complete `[...]\n` bodies, which node's
   streaming-mode client consumes as single chunks. Comet is JSON-only
   by SDK design.
-- **Multi-node: comet is pinned to a single node (P6.4).** WebSocket is
-  fully multi-node (long-lived to one node; message/presence/revocation
-  fan-out via Redis), but comet per-key state (the `cometConn` and its
+- **Multi-node: comet has single-node affinity and is NOT yet pinned in
+  production (P6.4; fix under investigation).** WebSocket is fully
+  multi-node (long-lived to one node; message/presence/revocation fan-out
+  via Redis), but comet per-key state (the `cometConn` and its
   connectionKey registry entry) is in-process per-node and NOT shared via
   Redis, so a `/comet/<key>/{recv,send,close,disconnect}` request that
   lands on a different node than the one that established the session
-  returns `410 GONE` (graceful — the SDK reconnects). The PoC therefore
-  pins `/comet/*` to one node with a load-balancer rule (see the deploy
-  README). Lifting the pin would need fly-replay routing (a node id in the
-  connectionKey + a `fly-replay` response on a foreign key), which is fly
-  infrastructure and out of PoC scope. Affinity + the graceful 410 are
-  pinned by `TestMultiNodeCometAffinity_P6_4`.
+  returns `410 GONE` (graceful — the SDK reconnects). **On the live
+  `count=2` deployment comet is currently un-pinned, so it churns**
+  (per-key requests round-robin → intermittent 410 → reconnect); WebSocket,
+  the SDK's default transport, is unaffected. The intended fix is to make
+  comet reliable across nodes (a reliable, stack-portable approach — Redis
+  state-sharing or reusing centrifuge's cross-node command forwarding — is
+  being investigated; fly-replay routing is one option but is fly-specific
+  and out of scope). Affinity + the graceful 410 are pinned by
+  `TestMultiNodeCometAffinity_P6_4`.
 - **Multi-message publishes are delivered as N single-message frames**,
   each with its own channelSerial (`Message.serial` is always
   `<cs>:000`). Real Ably delivers one frame per atomic batch with

@@ -5,6 +5,14 @@ use-chat demo** on Vercel pointed at it. Unmodified Ably SDKs connect to
 the fly URL exactly as they would to Ably — TLS on 443, WebSocket and
 REST on the same host.
 
+> **Current live state (2026-06-12):** `rt-poc-demo` is deployed
+> Redis-backed (engine=redis, `rt-poc-redis` Upstash in lhr, eviction
+> disabled) and scaled to `count=2`. Durability and cross-node reads were
+> verified live. Two caveats: comet is **not** yet LB-pinned, so it churns
+> at count=2 (WebSocket is fine — see the scaling note below); and
+> `fly.toml` still declares `min_machines_running = 1` (the 2 machines are
+> a live CLI scale). The steps below are the reproducible runbook.
+
 ## One-time prerequisites (interactive logins)
 
 ```sh
