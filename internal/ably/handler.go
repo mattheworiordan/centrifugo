@@ -197,16 +197,27 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Every REST response carries the same identity and CORS surface the
-	// real service does (verified against realtime.ably.io /time):
-	// Allow-Origin is a constant `*` — overriding the centrifugo CORS
-	// middleware's origin echo, which emits an EMPTY header to clients
-	// that send no Origin — with the credentials flag dropped (`*` plus
-	// credentials is an invalid CORS combination; Ably uses header auth,
-	// not cookies). Serverid/Cluster on every response make the serving
-	// stack identifiable on success, not just on errors.
+	// real service does (verified against rest.ably.io BOTH ways): a
+	// request carrying an Origin gets that origin ECHOED plus
+	// Access-Control-Allow-Credentials: true; an Origin-less request gets
+	// the constant `*`. The echo+credentials pair is load-bearing, not
+	// cosmetic: ably-js's browser XHR sets withCredentials whenever it
+	// sends an Authorization header (xhrrequest.ts), which puts the
+	// request in credentials mode 'include' — and browsers REJECT a
+	// wildcard Allow-Origin in that mode. A constant `*` here silently
+	// broke every credentialed cross-origin REST call from browser SDKs
+	// (history hydration in the live demo — comet/querystring-auth
+	// requests carried no Authorization header and kept working, masking
+	// it). Serverid/Cluster on every response make the serving stack
+	// identifiable on success, not just on errors.
 	hdr := rw.Header()
-	hdr.Set("Access-Control-Allow-Origin", "*")
-	hdr.Del("Access-Control-Allow-Credentials")
+	if origin := r.Header.Get("Origin"); origin != "" {
+		hdr.Set("Access-Control-Allow-Origin", origin)
+		hdr.Set("Access-Control-Allow-Credentials", "true")
+	} else {
+		hdr.Set("Access-Control-Allow-Origin", "*")
+		hdr.Del("Access-Control-Allow-Credentials")
+	}
 	hdr.Set("Access-Control-Expose-Headers", corsExposedHeaders)
 	hdr.Set("Vary", "Origin")
 	hdr.Set("X-Ably-Serverid", h.serverID)
@@ -216,11 +227,16 @@ func (h *Handler) ServeHTTP(rw http.ResponseWriter, r *http.Request) {
 	// sends the real request — a 401 here silently broke every
 	// cross-origin REST call from web SDKs (history hydration in the
 	// browser demo) while same-origin and non-browser clients worked.
-	// Allow-Origin comes from the common block above; Allow-Headers is
-	// echoed by the wrapping CORS middleware.
+	// Allow-Origin/credentials come from the common block above;
+	// Allow-Headers echoes the request so the handler is self-sufficient
+	// when served without the wrapping centrifugo CORS middleware (tests,
+	// standalone embeddings).
 	if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 		rw.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		rw.Header().Set("Access-Control-Max-Age", "86400")
+		if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
+			rw.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+		}
 		rw.WriteHeader(http.StatusNoContent)
 		return
 	}
