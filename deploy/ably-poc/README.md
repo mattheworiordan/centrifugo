@@ -34,10 +34,30 @@ flyctl apps create rt-poc-demo
 #    shell history.
 flyctl secrets set ABLY_KEYS_JSON=- -a rt-poc-demo < /tmp/minted-keys.json
 
+# 3b. DURABLE STORAGE (D6) — provision managed Redis so message history,
+#     channel serials and materialized mutable-message state survive a
+#     redeploy. Without this the server runs the in-process memory engine
+#     (a fresh world on every push). Create Upstash Redis in the SAME region
+#     as the app (lhr) and wire its connection string as the REDIS_URL
+#     secret — the entrypoint flips the engine to Redis when it is present
+#     (rediss:// TLS strings work too).
+flyctl redis create                       # Upstash; pick region lhr, eviction DISABLED
+# Take the connection string it prints (redis[s]://default:<pw>@<host>:<port>):
+flyctl secrets set REDIS_URL='redis://default:<pw>@<host>:<port>' -a rt-poc-demo
+#
+#     IMPORTANT — eviction policy: managed Redis MUST run maxmemory-policy
+#     noeviction. An LRU/volatile eviction policy can silently drop a
+#     centrifuge history STREAM key mid-window, falsifying the durability
+#     headline (a gap with no error). `flyctl redis create` defaults to
+#     eviction DISABLED — confirm with `flyctl redis status <name>` and do
+#     not enable eviction. Note the persistence mode for the record.
+
 # 4. Build (on fly's remote builders — no local docker needed) + deploy.
-#    --ha=false is REQUIRED: fly otherwise creates a second machine for
-#    high availability, and the PoC's stores are in-memory per-node —
-#    two machines would round-robin requests between two separate worlds.
+#    --ha=false is REQUIRED: fly otherwise creates a second machine, and the
+#    adapter's cross-node coordination (serial minting, in-process presence)
+#    is not multi-node-safe until Phase 6 — two machines would diverge even
+#    though they share the Redis broker. Single-node + Redis gives the
+#    redeploy-durability outcome; multi-node is Phase 6.
 flyctl deploy --ha=false
 ```
 
@@ -63,11 +83,37 @@ export ABLY_TEST_STATIC_APP=1 \
 npx mocha test/realtime/connection.test.js --reporter min
 ```
 
+### Verify durability across a redeploy (with Redis)
+
+The point of D6: a redeploy no longer starts from a fresh world.
+
+```sh
+KEY="<appXXXX>.key0:<secret>"
+# Publish, then force a redeploy, then read history — the message persists.
+curl -u "$KEY" -H 'Content-Type: application/json' \
+  -d '{"name":"before","data":"survives redeploy"}' \
+  https://rt-poc-demo.fly.dev/channels/persisted:durable-smoke/messages
+flyctl deploy --ha=false                  # new machine, fresh process memory
+curl -u "$KEY" https://rt-poc-demo.fly.dev/channels/persisted:durable-smoke/messages
+# → still returns the "before" message (it would have vanished pre-Redis).
+```
+
+Then repeat with the AIT chat demo: start a conversation, redeploy, reload —
+the conversation (mutable-message state) is still there (D4 rebuilds it from
+the Redis op stream). Browser-verify via the demo URL.
+
 Notes:
 - `fly.toml` keeps exactly one machine running (`auto_stop_machines =
-  "off"`, `min_machines_running = 1`): all PoC stores are in-memory and
-  per-node — a second machine or a restart is a fresh world. Fine for a
-  demo; it is one of the documented divergences.
+  "off"`, `min_machines_running = 1`) and deploys use `--ha=false`.
+  Single-node is required until Phase 6: the Redis engine makes message
+  history, channel serials (D3 seed-from-history) and materialized
+  mutable-message state (D4) durable across a restart/redeploy, but the
+  adapter's cross-node coordination is not yet multi-node-safe.
+- Durability scope with Redis: history, serials and materialized state
+  survive a redeploy. The live presence SET re-syncs on reconnect (D5 —
+  connection-scoped by design; presence *history* is durable on the shadow
+  channel); other in-process caches (nonce dedup window, stats fixtures)
+  reset on restart — documented divergences, not data loss.
 - Logs: `flyctl logs -a rt-poc-demo`.
 
 ## 2. Demo → Vercel
