@@ -56,6 +56,11 @@ type Handler struct {
 	// (P6.1 presence refresh, P6.2a revocation sync). Derived from whether a
 	// cross-node presence manager was wired (mux.go sets both together).
 	multiNode bool
+	// forwardRecvTimeout/forwardOpTimeout bound cross-node comet surveys
+	// (comet_forward.go) — per-instance so the dead-owner test can shorten
+	// them. recv must outlive the remote park window (forwardRecvPark).
+	forwardRecvTimeout time.Duration
+	forwardOpTimeout   time.Duration
 }
 
 // NewHandler creates new Handler. The adapter is unusable without API keys
@@ -108,6 +113,9 @@ func NewHandler(n *centrifuge.Node, c configtypes.Ably, presenceMgr centrifuge.P
 		nonces:       newNonceCache(),
 		presence:     newPresenceStoreWithManager(presenceMgr),
 		multiNode:    presenceMgr != nil,
+
+		forwardRecvTimeout: defaultForwardRecvTimeout,
+		forwardOpTimeout:   defaultForwardOpTimeout,
 	}
 	if err := h.seedPresenceFixtures(c.KeysFile); err != nil {
 		return nil, err

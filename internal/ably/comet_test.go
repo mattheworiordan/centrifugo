@@ -60,7 +60,8 @@ func TestCometConnectDeliversConnected(t *testing.T) {
 	t.Parallel()
 	ts := newRealtimeServer(t)
 	key := cometConnect(t, ts)
-	// The key is URL-path-safe by construction (uuid!uuid) — the SDK
+	// The key is URL-path-safe by construction (uuid!uuid.uuid — the
+	// trailing uuid is the owning node id, comet_forward.go) — the SDK
 	// concatenates it RAW into per-key paths.
 	require.NotContains(t, key, "/")
 	require.Contains(t, key, "!")

@@ -260,42 +260,150 @@ func TestMultiNodeSerialOrder_P6_3(t *testing.T) {
 	nodeB.stop()
 }
 
-// P6.4 — comet cross-node affinity. WebSocket needs nothing multi-node
-// (long-lived to one node; message/presence/revocation fan-out via Redis).
-// But comet per-key state (the cometConn + its connectionKey registry entry)
-// is in-process PER-NODE — NOT shared via Redis — so a /comet/<key>/* request
-// that lands on a node other than the one that established the session finds
-// no such key and returns 410 GONE (graceful: the SDK treats it as nonfatal
-// transport death and reconnects). The PoC therefore PINS comet to one node
-// via an LB rule on /comet/* (documented in DIVERGENCES.md + the deploy
-// README); this test proves the affinity and the graceful failure that makes
-// the fallback safe. (Lifting the pin would need the fly-replay routing — a
-// node identity in the connectionKey + a fly-replay response — which is fly
-// infrastructure and not locally testable.)
-func TestMultiNodeCometAffinity_P6_4(t *testing.T) {
+// waitClusterVisible blocks until ts's node sees n cluster members. Node
+// info is broadcast on Run and every 3s thereafter; comet forwarding only
+// targets nodes the forwarder can SEE, so tests must not race discovery.
+func waitClusterVisible(t *testing.T, ts *realtimeTestServer, n int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		info, err := ts.handler.node.Info()
+		return err == nil && len(info.Nodes) >= n
+	}, 10*time.Second, 100*time.Millisecond, "cluster never reached %d visible nodes", n)
+}
+
+// P6.4 — comet cross-node forwarding (research/14-multinode-comet.md;
+// supersedes the affinity-pinning assertion this test previously made,
+// the way P6.1 superseded P6.0's deliberate-fail presence assertion).
+// Comet per-key state stays in-process on the owning node — that is the
+// design, asserted below — but a per-key request landing on ANOTHER node
+// is now FORWARDED to the owner over the broker control channel
+// (node.Survey, the centrifuge emulation-layer mechanism) instead of
+// failing 410. The whole comet lifecycle — attach, publish, ACK + echo,
+// close — is driven through the WRONG node here.
+func TestMultiNodeCometCrossNode_P6_4(t *testing.T) {
 	requireRedisOrSkip(t)
 	uniq := fmt.Sprintf("p64comet-%d", time.Now().UnixNano())
 	prefix := uniq + ":"
+	ch := uniq + "-comet"
 
 	nodeA := buildRedisServer(t, prefix)
 	nodeB := buildRedisServer(t, prefix)
+	// B can only forward to a node it can see.
+	waitClusterVisible(t, nodeB, 2)
 
 	// A comet session established on node A (valid connectionKey, registered
 	// in node A's in-process registry).
 	key := cometConnect(t, nodeA)
 	require.NotEmpty(t, key)
 
-	// The key is genuinely live on node A but absent on node B — comet state
-	// is per-node in-process, NOT shared via Redis (unlike messages/presence/
-	// revocations). This is the affinity, not a malformed key.
+	// The per-node locality is unchanged by forwarding: the session lives on
+	// node A only (comet state is still NOT Redis-shared — by design).
 	require.NotNil(t, nodeA.handler.registry.lookupKey(key), "node A holds the comet session")
 	require.Nil(t, nodeB.handler.registry.lookupKey(key), "node B has no record of it (comet state is not Redis-shared)")
 
-	// The SAME key, addressed to node B over HTTP, is 410 GONE — graceful
-	// (the SDK reconnects), which is what makes the LB-pinning fallback safe.
-	respB := cometGet(t, nodeB, "/comet/"+key+"/recv")
-	require.Equal(t, http.StatusGone, respB.StatusCode,
-		"comet is node-affine: a per-key request to the wrong node is 410 (LB must pin /comet/*)")
+	// ATTACH via send on the WRONG node: forwarded to node A, 204.
+	resp := cometSend(t, nodeB, key, `[{"action":10,"channel":"`+ch+`"}]`)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode,
+		"send on the wrong node must forward to the owner, not 410")
+
+	// ATTACHED rides a recv on the WRONG node (forwarded park).
+	attached := recvUntil(t, nodeB, key, 10*time.Second, func(m *protocol.ProtocolMessage) bool {
+		return m.Action == protocol.ActionAttached
+	})
+	require.Equal(t, ch, attached.Channel)
+
+	// Publish via send on B; the ACK and the echoed MESSAGE ride recv on B.
+	resp = cometSend(t, nodeB, key,
+		`[{"action":15,"channel":"`+ch+`","msgSerial":0,"messages":[{"name":"ev","data":"cross-node"}]}]`)
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	sawAck, sawMsg := false, false
+	recvUntil(t, nodeB, key, 10*time.Second, func(m *protocol.ProtocolMessage) bool {
+		switch m.Action {
+		case protocol.ActionAck:
+			sawAck = true
+		case protocol.ActionMessage:
+			require.Equal(t, ch, m.Channel)
+			require.Equal(t, "ev", m.Messages[0].Name)
+			sawMsg = true
+		}
+		return sawAck && sawMsg
+	})
+
+	// Clean close via the WRONG node: 204, and the session dies on node A —
+	// the key goes 410 everywhere (on A locally; on B the forward finds the
+	// owner has no such session).
+	respClose := cometGet(t, nodeB, "/comet/"+key+"/close")
+	require.Equal(t, http.StatusNoContent, respClose.StatusCode)
+	require.Eventually(t, func() bool {
+		return nodeA.handler.registry.lookupKey(key) == nil
+	}, 5*time.Second, 100*time.Millisecond, "close forwarded from B must tear the session down on A")
+	require.Equal(t, http.StatusGone, cometGet(t, nodeA, "/comet/"+key+"/recv").StatusCode)
+	require.Equal(t, http.StatusGone, cometGet(t, nodeB, "/comet/"+key+"/recv").StatusCode)
+
+	nodeA.stop()
+	nodeB.stop()
+}
+
+// P6.4 — a dead owner keeps the 410 contract. When the node named in the
+// connectionKey is no longer a live cluster member (stop/restart — a
+// restarted node has a NEW id), per-key requests are an immediate-or-bounded
+// 410 and the SDK reconnects fresh; close stays 204 (closing a dead
+// transport is success). This is the self-healing edge of the forwarding
+// design — no pinning, no replay, no stuck clients.
+func TestMultiNodeCometDeadOwner_P6_4(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p64dead-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+	waitClusterVisible(t, nodeB, 2)
+
+	key := cometConnect(t, nodeA)
+
+	// Shorten B's forward timeouts: until A's node info ages out of B's
+	// registry (~7s), a forward to the dead node would wait the full survey
+	// window; the test bounds that to keep the suite fast.
+	nodeB.handler.forwardRecvTimeout = 1500 * time.Millisecond
+	nodeB.handler.forwardOpTimeout = 1500 * time.Millisecond
+
+	nodeA.stop()
+
+	require.Equal(t, http.StatusGone, cometGet(t, nodeB, "/comet/"+key+"/recv").StatusCode,
+		"recv for a dead owner is 410 (SDK reconnects fresh)")
+	respSend := cometSend(t, nodeB, key, `[{"action":10,"channel":"x"}]`)
+	require.Equal(t, http.StatusGone, respSend.StatusCode, "send for a dead owner is 410")
+	require.Equal(t, http.StatusNoContent, cometGet(t, nodeB, "/comet/"+key+"/disconnect").StatusCode,
+		"closing a dead transport is success (204), exactly as single-node")
+
+	nodeB.stop()
+}
+
+// P6.4 — A1 holds cross-node. A caller authenticated with a DIFFERENT app
+// key driving a forwarded per-key request is refused exactly as a dead key
+// (410, no liveness oracle): the forwarding node passes the RESOLVED
+// identity and the OWNING node runs the same ownsSession bind as the local
+// paths.
+func TestMultiNodeCometForeignIdentity_P6_4(t *testing.T) {
+	requireRedisOrSkip(t)
+	uniq := fmt.Sprintf("p64a1-%d", time.Now().UnixNano())
+	prefix := uniq + ":"
+
+	nodeA := buildRedisServer(t, prefix)
+	nodeB := buildRedisServer(t, prefix)
+	waitClusterVisible(t, nodeB, 2)
+
+	key := cometConnect(t, nodeA) // owned by poc.key0
+
+	// poc.key1 (a different key, same app config) addressing the key via the
+	// WRONG node: forwarded, and refused by the owner's identity bind.
+	resp := cometGetAs(t, nodeB, "/comet/"+key+"/recv", "poc.key1", "secret_key1_0123456789abcdef")
+	require.Equal(t, http.StatusGone, resp.StatusCode,
+		"a non-owner identity must be indistinguishable from a dead key across nodes")
+
+	// The owner still works end-to-end through the wrong node.
+	respOwner := cometGet(t, nodeB, "/comet/"+key+"/disconnect")
+	require.Equal(t, http.StatusNoContent, respOwner.StatusCode)
 
 	nodeA.stop()
 	nodeB.stop()

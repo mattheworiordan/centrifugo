@@ -272,14 +272,33 @@ func (h *Handler) serveCometSend(rw http.ResponseWriter, r *http.Request, key st
 		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
 		return
 	}
-	_, cc, ok := h.cometSession(rw, r, key, identity)
-	if !ok {
-		return
-	}
-	// The WS read limit's comet analogue (CD2d): cap the send body.
+	// The WS read limit's comet analogue (CD2d): cap the send body. Read
+	// before the session lookup so a forwarded send carries the same capped
+	// body (the foreign node enforces the limit; the owning node parses).
 	body, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, maxFrameSize))
 	if err != nil {
 		h.writeError(rw, r, http.StatusRequestEntityTooLarge, 40000, "send body too large")
+		return
+	}
+	// P6.4: a key owned by another LIVE node is forwarded, not 410'd.
+	if h.registry.lookupKey(key) == nil {
+		if nodeID, ok := h.cometForwardTarget(key); ok {
+			code, _ := h.forwardComet(r.Context(), cometSurveySendOp, nodeID, cometForwardReq{
+				Key: key, KeyName: identity.keyName, ClientID: identity.clientID, Body: body,
+			}, h.forwardOpTimeout)
+			switch code {
+			case cometForwardOK:
+				rw.WriteHeader(http.StatusNoContent)
+			case cometForwardBadRequest:
+				h.writeError(rw, r, http.StatusBadRequest, 40000, "invalid send body: expected a JSON array of protocol messages")
+			default:
+				h.writeError(rw, r, http.StatusGone, 80016, "Unable to find connection "+key)
+			}
+			return
+		}
+	}
+	_, cc, ok := h.cometSession(rw, r, key, identity)
+	if !ok {
 		return
 	}
 	var frames []*protocol.ProtocolMessage
@@ -316,9 +335,16 @@ func (h *Handler) serveCometClose(rw http.ResponseWriter, r *http.Request, key s
 	}
 	sess := h.registry.lookupKey(key)
 	if sess == nil {
-		// Already gone — closing a dead transport is success, not error
-		// (the SDK calls disconnect on dispose paths where the server may
-		// have reaped first).
+		// P6.4: a key owned by another LIVE node is forwarded best-effort —
+		// the response is 204 either way (closing a dead transport is
+		// success, not error: the SDK calls disconnect on dispose paths
+		// where the server may have reaped first, and it never reads the
+		// body of a 2xx).
+		if nodeID, ok := h.cometForwardTarget(key); ok {
+			_, _ = h.forwardComet(r.Context(), cometSurveyCloseOp, nodeID, cometForwardReq{
+				Key: key, KeyName: identity.keyName, ClientID: identity.clientID, Action: int(action),
+			}, h.forwardOpTimeout)
+		}
 		rw.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -415,6 +441,19 @@ func writeCometBatch(rw http.ResponseWriter, frames [][]byte) {
 	_, _ = rw.Write([]byte("]\n"))
 }
 
+// writeCometBatchBody writes a pre-rendered batch body (a forwarded recv
+// reply, already in writeCometBatch's wire shape) — 204 when empty, like
+// the local path's empty poll.
+func writeCometBatchBody(rw http.ResponseWriter, body []byte) {
+	if len(body) == 0 {
+		rw.WriteHeader(http.StatusNoContent)
+		return
+	}
+	rw.Header().Set("Content-Type", contentTypeJSON)
+	rw.WriteHeader(http.StatusOK)
+	_, _ = rw.Write(body)
+}
+
 // serveCometConnect implements GET /comet/connect: authenticate, build
 // the session exactly as the WS path does, then serve the connect
 // request AS the first recv — its response carries CONNECTED (plus
@@ -494,6 +533,23 @@ func (h *Handler) serveCometRecv(rw http.ResponseWriter, r *http.Request, key st
 	if authErr != nil {
 		h.writeError(rw, r, authErr.statusCode, authErr.code, authErr.message)
 		return
+	}
+	// P6.4: a key owned by another LIVE node is forwarded — the owning node
+	// parks the poll (bounded by forwardRecvPark; the ≤10s heartbeat always
+	// completes it) and replies with the ready-to-write batch body.
+	if h.registry.lookupKey(key) == nil {
+		if nodeID, ok := h.cometForwardTarget(key); ok {
+			code, body := h.forwardComet(r.Context(), cometSurveyRecvOp, nodeID, cometForwardReq{
+				Key: key, KeyName: identity.keyName, ClientID: identity.clientID,
+				WaitMS: forwardRecvPark.Milliseconds(),
+			}, h.forwardRecvTimeout)
+			if code != cometForwardOK {
+				h.writeError(rw, r, http.StatusGone, 80016, "Unable to find connection "+key)
+				return
+			}
+			writeCometBatchBody(rw, body)
+			return
+		}
 	}
 	_, cc, ok := h.cometSession(rw, r, key, identity)
 	if !ok {

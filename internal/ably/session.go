@@ -829,7 +829,12 @@ func (s *session) writeConnected() error {
 	// happens-before any deregistration in run()'s defers, so the index
 	// can never leak a dead session's key.
 	if s.connKey == "" {
-		s.connKey = connectionID + "!" + s.client.ID()
+		// The token half carries the owning node id after a '.' so a comet
+		// per-key request landing on ANOTHER node can forward here
+		// (comet_forward.go). Invisible to every other consumer: TM2h
+		// attribution and the recover param read only up to the first '!',
+		// and the SDK echoes the key verbatim.
+		s.connKey = connectionID + "!" + s.client.ID() + "." + s.node.ID()
 		if s.params.onConnected != nil {
 			s.params.onConnected(s.connKey, s)
 		}
@@ -840,11 +845,12 @@ func (s *session) writeConnected() error {
 		Error:        connectErr,
 		ConnectionDetails: &protocol.ConnectionDetails{ // TR4o, CD1
 			ClientID: detailsClientID, // CD2a
-			// CD2b: "<connectionId>!<token>". The token is the per-session
-			// centrifuge id, so a recovered connection keeps its
-			// connectionId but gets a FRESH key (RTN16d asserts the key
-			// changes across recovery). REST TM2h attribution strips at
-			// the first '!'.
+			// CD2b: "<connectionId>!<token>". The token is
+			// "<centrifugeId>.<nodeId>" — the per-session centrifuge id, so
+			// a recovered connection keeps its connectionId but gets a
+			// FRESH key (RTN16d asserts the key changes across recovery),
+			// plus the owning node id for cross-node comet forwarding.
+			// REST TM2h attribution strips at the first '!'.
 			ConnectionKey:      s.connKey,
 			MaxMessageSize:     maxMessageSize,     // CD2c
 			MaxFrameSize:       maxFrameSize,       // CD2d

@@ -127,6 +127,10 @@ func buildEngineServer(t *testing.T, redisPrefix string) *realtimeTestServer {
 
 	h, err := NewHandler(node, configtypes.Ably{Enabled: true, KeysFile: "auth/testdata/static-app.json"}, presenceMgr, func(r *http.Request) bool { return true })
 	require.NoError(t, err)
+	// P6.4: the harness node's OnSurvey slot is free, so the comet
+	// cross-node forwarding ops claim it directly (the production app muxes
+	// them into survey.NewCaller instead — research/14-multinode-comet.md).
+	h.RegisterCometSurvey()
 	srv := httptest.NewServer(h)
 
 	ts := &realtimeTestServer{

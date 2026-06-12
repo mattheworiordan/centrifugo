@@ -47,22 +47,32 @@ Features of the Ably service this PoC simply does not implement:
   long-poll responses are complete `[...]\n` bodies, which node's
   streaming-mode client consumes as single chunks. Comet is JSON-only
   by SDK design.
-- **Multi-node: comet has single-node affinity and is NOT yet pinned in
-  production (P6.4; fix under investigation).** WebSocket is fully
-  multi-node (long-lived to one node; message/presence/revocation fan-out
-  via Redis), but comet per-key state (the `cometConn` and its
-  connectionKey registry entry) is in-process per-node and NOT shared via
-  Redis, so a `/comet/<key>/{recv,send,close,disconnect}` request that
-  lands on a different node than the one that established the session
-  returns `410 GONE` (graceful — the SDK reconnects). **On the live
-  `count=2` deployment comet is currently un-pinned, so it churns**
-  (per-key requests round-robin → intermittent 410 → reconnect); WebSocket,
-  the SDK's default transport, is unaffected. The intended fix is to make
-  comet reliable across nodes (a reliable, stack-portable approach — Redis
-  state-sharing or reusing centrifuge's cross-node command forwarding — is
-  being investigated; fly-replay routing is one option but is fly-specific
-  and out of scope). Affinity + the graceful 410 are pinned by
-  `TestMultiNodeCometAffinity_P6_4`.
+- **Multi-node: comet works cross-node by forwarding per-key requests to
+  the owning node (P6.4; see research/14-multinode-comet.md).** Comet
+  per-key state (the `cometConn` and its connectionKey registry entry)
+  stays in-process on the node that served `/comet/connect` — by design.
+  The connectionKey embeds the owning node id
+  (`<connectionId>!<centrifugeId>.<nodeId>`; opaque to the SDK, and TM2h
+  attribution and the `recover` param read only up to the first `!`), and
+  a `/comet/<key>/{recv,send,close,disconnect}` request landing on a
+  DIFFERENT node is forwarded to the owner over the broker control
+  channel — `node.Survey`, the same mechanism centrifuge's own emulation
+  layer uses for its multi-node HTTP transports. No LB pinning is
+  required; round-robin works. Failure edges keep the production 410
+  contract: a dead/restarted owner (its node id is no longer a cluster
+  member) or a forward timeout is `410 GONE`, the SDK reconnects fresh,
+  and cross-node resume recovers continuity. Real Ably instead encodes
+  placement into opaque connectionKeys with internal routing — same idea,
+  different plumbing. Pinned by `TestMultiNodeCometCrossNode_P6_4`,
+  `TestMultiNodeCometDeadOwner_P6_4`,
+  `TestMultiNodeCometForeignIdentity_P6_4`. **Wiring caveat:** a node's
+  `OnSurvey` slot must dispatch the `ably_comet_*` ops
+  (`Handler.RegisterCometSurvey` claims the slot directly when free — the
+  test harness path; the production app must mux these ops into
+  `survey.NewCaller`, the documented follow-up — until then a deployment
+  keeps the pre-P6.4 410-churn behaviour, no worse). Operators MAY layer
+  LB session affinity on `/comet/*` as an optimization (cuts forwarding
+  rate); it is never load-bearing for correctness.
 - **Multi-message publishes are delivered as N single-message frames**,
   each with its own channelSerial (`Message.serial` is always
   `<cs>:000`). Real Ably delivers one frame per atomic batch with
