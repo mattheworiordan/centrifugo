@@ -46,6 +46,24 @@ Legend: **✅** works · **⚠️** works with a documented caveat · **❌** no
 implemented. *Source* shows the build-vs-adapt split — what came free from
 Centrifugo vs what the adapter adds on top.
 
+### Tested against (unmodified SDK suites)
+
+The evidence basis — every suite below runs the **stock, unmodified** SDK
+against this server, no adapter-aware shims:
+
+| SDK | Version | Coverage |
+|---|---|---|
+| ably-js | 2.22.1 (pinned) | 32 suites · 481 tests · JSON + msgpack · WebSocket + comet |
+| ably-go | v1.4.1 | conformance mirrors (green) |
+| @ably/ai-transport | 0.2.0 | its own integration suites 45/45 + e2e token-stream demo |
+
+A substantial but deliberately **incomplete** subset. Suites for surface
+the adapter doesn't implement are excluded (push, LiveObjects, server-side
+message filtering, delta/vcdiff); `stats` exercises only the SDK's fixture
+mechanism, not real metering; and a few order-dependent or external-infra
+tests are categorized rather than run. The per-suite list and every
+categorization are in [SCORECARD.md](SCORECARD.md).
+
 ### Transports & encodings
 
 | Capability | Status | Source | Notes |
@@ -63,6 +81,19 @@ Centrifugo vs what the adapter adds on top.
 | Batch publish (REST, RSC22) | ✅ | Adapter | |
 | Channel encryption (AES) | ✅ | Passthrough | adapter never inspects payloads |
 | Multi-message publish | ⚠️ | Adapter | delivered as N single-message frames |
+
+### Message actions & payload types
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| `message.create` (publish) | ✅ | Centrifugo + adapter | normal publication |
+| `message.update` | ✅ | Adapter | replaces data + extras wholesale |
+| `message.append` | ✅ | Adapter | concatenates string deltas; materializes as `update` (AIT token streaming) |
+| `message.delete` | ✅ | Adapter | materializes as `delete` |
+| Materialized state + `…/versions` (RSL14) | ✅ | Adapter | latest state per serial; entries never evict; versions single page (≤50 snapshots) |
+| Annotations / summaries | ❌ | — | out of scope; mutable messages cover the AIT need |
+| Payloads — string · JSON · binary (base64) | ✅ | Adapter | |
+| Encrypted payloads (e.g. AES-128-CBC) | ✅ | Passthrough | adapter never decrypts; rides the encoding segment |
 
 ### History & serials
 
@@ -100,14 +131,16 @@ Centrifugo vs what the adapter adds on top.
 | Resume — gap replay, rewind, untilAttach | ✅ | Adapter | |
 | Recover (RTN16-lite) | ⚠️ | Adapter | unverified — no connection registry |
 
-### AI Transport (mutable messages)
+### AI Transport (mutable-message flows)
+
+The message-action primitives above (`append`/`update`/`delete` +
+materialized `versions`) are what AIT rides on. End-to-end:
 
 | Capability | Status | Source | Notes |
 |---|---|---|---|
-| Message update / delete | ✅ | Adapter | |
-| Message append (token streaming) | ✅ | Adapter | plain-string concat |
-| Materialized reads / `…/versions` | ✅ | Adapter | store never evicts; versions single-page |
-| AIT SDK integration suites | ✅ 45/45 | — | incl. mid-stream transport-drop reassembly |
+| AIT SDK integration suites | ✅ 45/45 | @ably/ai-transport 0.2.0 | unmodified SDK, no AIT-specific shimming |
+| e2e token stream w/ mid-stream drop | ✅ | Adapter | byte-exact reassembly across a transport drop |
+| Demo flows — suspend/resume, cancel, branch, multi-tab | ✅ | AIT SDK over adapter | verified in the live browser demo |
 
 ### REST & operations
 
