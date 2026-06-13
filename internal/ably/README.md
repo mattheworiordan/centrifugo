@@ -33,6 +33,113 @@ An experiment with two questions:
 This is a proof of concept. It is not a product, not a roadmap
 commitment, and very deliberately not production software.
 
+## Capability support matrix
+
+A capability-level view of what the adapter does — an index over the test
+evidence in [SCORECARD.md](SCORECARD.md) and the caveats in
+[DIVERGENCES.md](DIVERGENCES.md), not new claims. **Both transports carry
+the entire surface below**: **WebSocket** (default, full-duplex) and
+**comet / HTTP long-polling** (`?transport=xhr_polling`), each in **both**
+wire encodings — JSON and msgpack.
+
+Legend: **✅** works · **⚠️** works with a documented caveat · **❌** not
+implemented. *Source* shows the build-vs-adapt split — what came free from
+Centrifugo vs what the adapter adds on top.
+
+### Transports & encodings
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| WebSocket | ✅ | Centrifugo | default, full-duplex |
+| Comet / HTTP long-polling | ✅ | Adapter | poll-only (matches prod), JSON-only, cross-node via survey forwarding |
+| JSON + msgpack encodings | ✅ | Adapter | both pass the full 481-test gate |
+
+### Messaging (Pub/Sub)
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| Attach/detach, publish/subscribe | ✅ | Centrifugo | core broker pub/sub |
+| Idempotent publish | ✅ | Centrifugo | |
+| Batch publish (REST, RSC22) | ✅ | Adapter | |
+| Channel encryption (AES) | ✅ | Passthrough | adapter never inspects payloads |
+| Multi-message publish | ⚠️ | Adapter | delivered as N single-message frames |
+
+### History & serials
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| History + pagination | ✅ | Centrifugo + adapter | offset-scan, ≤1000 deep |
+| Message serials / resume cursors | ✅ | Adapter | cosmetic cross-node ordering only |
+| Durable across restart/redeploy | ✅ Redis / ❌ memory | Adapter + Redis | memory engine = fresh world on restart |
+
+### Presence
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| Enter/leave/update + join/leave events | ✅ | Adapter | adapter-owned member store |
+| Presence SYNC (paged) | ✅ | Adapter | 100 members/page |
+| Cross-node presence | ✅ Redis | Adapter | dead-node members clear within ~60s TTL |
+| Presence history | ⚠️ | Adapter | REST-only shadow channel, no Link headers |
+
+### Auth
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| Key (Basic) auth | ✅ | Adapter | |
+| Ably-JWT | ✅ | Adapter | exp-less tokens never expire |
+| requestToken | ✅ | Adapter | verify + mint; no broader token-minting service |
+| Capability enforcement | ✅ | Adapter | loose `x*` resource-prefix match |
+| Reauth (AUTH frames, RTN22) | ✅ | Adapter | |
+| Token revocation (RSA17) | ✅ Redis cross-node | Adapter | `clientId:` targeting; `revocationKey:` ineffective |
+
+### Connection & continuity
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| Connection lifecycle + heartbeats | ✅ | Centrifugo + adapter | |
+| Resume — gap replay, rewind, untilAttach | ✅ | Adapter | |
+| Recover (RTN16-lite) | ⚠️ | Adapter | unverified — no connection registry |
+
+### AI Transport (mutable messages)
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| Message update / delete | ✅ | Adapter | |
+| Message append (token streaming) | ✅ | Adapter | plain-string concat |
+| Materialized reads / `…/versions` | ✅ | Adapter | store never evicts; versions single-page |
+| AIT SDK integration suites | ✅ 45/45 | — | incl. mid-stream transport-drop reassembly |
+
+### REST & operations
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| REST publish / history / presence / time | ✅ | Adapter | |
+| Error envelope, headers, provenance | ✅ | Adapter | mirrors the real service |
+| CORS incl. credentialed requests | ✅ | Adapter | echoes Origin + `Allow-Credentials` |
+| Stats | ⚠️ | Adapter | fixture-backed, not metered; per-node |
+
+### Multi-node (Redis engine, ≥2 nodes)
+
+| Capability | Status | Source | Notes |
+|---|---|---|---|
+| Cross-node messaging | ✅ | Centrifugo broker | publish on A, receive on B |
+| Cross-node presence / revocation / resume | ✅ | Adapter | |
+| Cross-node comet | ✅ | Adapter | survey forwarding; no LB pinning |
+
+### Not implemented ❌
+
+Push notifications · LiveObjects · annotations & summaries · delta
+compression (vcdiff) · server-side message filtering · channel
+enumeration / metachannels · **production availability (the Four
+Pillars)** — see [DIVERGENCES.md](DIVERGENCES.md).
+
+**In Ably product terms:** AI Transport is the proven target — its own SDK
+suites pass end-to-end. The Pub/Sub primitives that Chat and Spaces build
+on (channels, presence, history, message interactions) are largely
+present, but those product SDKs were not themselves run against the
+adapter, and Spaces locking and LiveObjects depend on surface this PoC
+does not implement.
+
 ## What works
 
 Everything below is verified by *unmodified official SDK test suites*
